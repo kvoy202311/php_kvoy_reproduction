@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<robot name="motion_matching_platform">
+  <link name="platform_link">
+    <visual>
+      <origin xyz="-0.950000000 -0.100000000 0.300000000" rpy="0 0 -0.000000000"/>
+      <geometry><box size="0.460000000 0.600000000 0.600000000"/></geometry>
+      <material name="platform_blue"><color rgba="0.25 0.55 0.90 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.950000000 -0.100000000 0.300000000" rpy="0 0 -0.000000000"/>
+      <geometry><box size="0.460000000 0.600000000 0.600000000"/></geometry>
+    </collision>
+  </link>
+</robot>
