@@ -40,5 +40,12 @@ _build
 *.zarr
 *.npz
 
-**/assets/
+  !data/
+  !data/processed_motions/
+  !data/processed_motions/elf3/
+  !data/processed_motions/elf3/climb_50hz/
+  !data/processed_motions/elf3/climb_50hz/*.npz
+  !data/processed_motions/elf3/down_roll_50hz/
+  !data/processed_motions/elf3/down_roll_50hz/*.npz
+
 artifacts/
