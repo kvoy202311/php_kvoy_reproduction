@@ -507,7 +507,7 @@ class ELF3ClimbRewardsCfg:
     )
     platform_foot_contact = RewTerm(
         func=mdp.platform_foot_contact,
-        weight=1.0,
+        weight=5.0,
         params={
             "command_name": "motion",
             "platform_cfg": SceneEntityCfg("platform"),
@@ -526,7 +526,7 @@ class ELF3ClimbRewardsCfg:
     )
     final_standing_stability = RewTerm(
         func=mdp.final_standing_stability,
-        weight=1.0,
+        weight=10.0,
         params={
             "command_name": "motion",
             "platform_cfg": SceneEntityCfg("platform"),
