@@ -155,6 +155,12 @@ ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
+ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 0.75
+ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD = 0.08
+ELF3_CLIMB_ROOT_LINEAR_SPEED_REWARD_STD = 0.15
+ELF3_CLIMB_ROOT_ANGULAR_SPEED_REWARD_STD = 0.5
+ELF3_CLIMB_JOINT_SPEED_REWARD_STD = 0.5
+ELF3_CLIMB_TORSO_TILT_REWARD_STD = 0.35
 ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR = 0.15
 ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED = 0.15
 ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
@@ -493,6 +499,48 @@ class ELF3ClimbRewardsCfg:
         func=mdp.motion_global_body_angular_velocity_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
+    )
+    platform_foot_contact = RewTerm(
+        func=mdp.platform_foot_contact,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+        },
+    )
+    final_standing_stability = RewTerm(
+        func=mdp.final_standing_stability,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+            "root_linear_speed_std": ELF3_CLIMB_ROOT_LINEAR_SPEED_REWARD_STD,
+            "root_angular_speed_std": ELF3_CLIMB_ROOT_ANGULAR_SPEED_REWARD_STD,
+            "joint_speed_std": ELF3_CLIMB_JOINT_SPEED_REWARD_STD,
+            "torso_tilt_std": ELF3_CLIMB_TORSO_TILT_REWARD_STD,
+        },
     )
     final_default_joint_pose = RewTerm(
         func=mdp.final_default_joint_position_error_exp,
