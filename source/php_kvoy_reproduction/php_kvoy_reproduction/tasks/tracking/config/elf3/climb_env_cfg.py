@@ -683,5 +683,7 @@ class ELF3ClimbEnvCfg(TrackingEnvCfg):
 
         # Viewer settings.
         self.viewer.eye = (1.5, 1.5, 1.5)
-        self.viewer.origin_type = "asset_root"
-        self.viewer.asset_name = "robot"
+        # self.viewer.origin_type = "asset_root"
+        self.viewer.origin_type = "world"
+        # self.viewer.asset_name = "robot"
+        self.viewer.asset_name = "None"
