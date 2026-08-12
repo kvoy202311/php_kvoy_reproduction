@@ -238,8 +238,16 @@ def final_standing_stability(
     root_angular_speed_std: float,
     joint_speed_std: float,
     torso_tilt_std: float,
+    stability_weights: tuple[float, float, float, float],
 ) -> torch.Tensor:
-    """Reward a quiet upright stand after the feet contact the platform."""
+    """Reward a quiet upright stand after the feet contact the platform.
+
+    The platform contact score gates the reward, while the four stability
+    scores are combined as a weighted average. Multiplying all four scores
+    made this shaping term effectively disappear when one signal (most often
+    residual joint speed) was temporarily poor, which gave the policy no
+    useful gradient to settle the remaining motion.
+    """
 
     for name, value in (
         ("root_linear_speed_std", root_linear_speed_std),
@@ -249,6 +257,14 @@ def final_standing_stability(
     ):
         if value <= 0.0:
             raise ValueError(f"{name} must be positive, got {value}.")
+    if len(stability_weights) != 4 or any(weight < 0.0 for weight in stability_weights):
+        raise ValueError(
+            "stability_weights must contain four non-negative values ordered as "
+            "root linear speed, root angular speed, joint speed, torso tilt."
+        )
+    weight_sum = float(sum(stability_weights))
+    if weight_sum <= 0.0:
+        raise ValueError("stability_weights must contain at least one positive value.")
 
     command: MotionCommand = env.command_manager.get_term(command_name)
     gate = _final_phase_gate(command, terminal_window_time_s, env.step_dt)
@@ -278,11 +294,14 @@ def final_standing_stability(
     def gaussian_score(value: torch.Tensor, std: float) -> torch.Tensor:
         return torch.exp(-0.5 * torch.square(value / std))
 
-    stability_score = (
-        gaussian_score(root_linear_speed, root_linear_speed_std)
-        * gaussian_score(root_angular_speed, root_angular_speed_std)
-        * gaussian_score(joint_speed, joint_speed_std)
-        * gaussian_score(torso_tilt, torso_tilt_std)
+    stability_scores = (
+        gaussian_score(root_linear_speed, root_linear_speed_std),
+        gaussian_score(root_angular_speed, root_angular_speed_std),
+        gaussian_score(joint_speed, joint_speed_std),
+        gaussian_score(torso_tilt, torso_tilt_std),
+    )
+    stability_score = sum(
+        (weight / weight_sum) * score for weight, score in zip(stability_weights, stability_scores, strict=True)
     )
     return gate * contact_score * stability_score
 

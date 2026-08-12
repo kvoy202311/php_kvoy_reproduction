@@ -146,21 +146,26 @@ ELF3_CLIMB_HEIGHT_SCAN_OFFSET = (0.4, 0.0, 20.0)
 ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET = 0.5
 
 
-# The source clips already contain a motionless 0.5 s tail. Add another 0.5 s
-# hold of the exact NPZ final frame so sustained functional stability can be
-# measured without introducing a second, kinematically inconsistent target.
-ELF3_CLIMB_FINAL_HOLD_TIME_S = 0.5
-ELF3_CLIMB_MIN_STABLE_TIME_S = 0.25
+# The source clips already contain a motionless 0.5 s tail. Add a further
+# 1.0 s hold of the exact NPZ final frame so the policy has enough control time
+# to dissipate residual motion and learn to remain stable. This does not alter
+# the NPZ data or create a second kinematic target.
+ELF3_CLIMB_FINAL_HOLD_TIME_S = 1.0
+ELF3_CLIMB_MIN_STABLE_TIME_S = 0.5
 ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
-ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 0.75
+ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
 ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD = 0.08
 ELF3_CLIMB_ROOT_LINEAR_SPEED_REWARD_STD = 0.15
 ELF3_CLIMB_ROOT_ANGULAR_SPEED_REWARD_STD = 0.5
 ELF3_CLIMB_JOINT_SPEED_REWARD_STD = 0.5
 ELF3_CLIMB_TORSO_TILT_REWARD_STD = 0.35
+# Ordered as root linear speed, root angular speed, joint speed, torso tilt.
+# The weighted average keeps a temporarily poor individual signal from
+# collapsing the complete settling reward to zero.
+ELF3_CLIMB_STABILITY_REWARD_WEIGHTS = (0.20, 0.35, 0.35, 0.10)
 ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR = 0.15
 ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED = 0.15
 ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
@@ -540,6 +545,7 @@ class ELF3ClimbRewardsCfg:
             "root_angular_speed_std": ELF3_CLIMB_ROOT_ANGULAR_SPEED_REWARD_STD,
             "joint_speed_std": ELF3_CLIMB_JOINT_SPEED_REWARD_STD,
             "torso_tilt_std": ELF3_CLIMB_TORSO_TILT_REWARD_STD,
+            "stability_weights": ELF3_CLIMB_STABILITY_REWARD_WEIGHTS,
         },
     )
     final_default_joint_pose = RewTerm(
