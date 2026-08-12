@@ -80,13 +80,11 @@ def final_default_joint_position_error_exp(
     asset_cfg: SceneEntityCfg,
     std: float,
 ) -> torch.Tensor:
-    """Reward a smooth transition from the final reference to the robot's default pose.
+    """Optional diagnostic reward for default-pose proximity in the final hold.
 
-    This term is exactly zero during the source motion.  During the additional
-    final-frame hold, its target moves linearly from the NPZ final joint pose to
-    the articulation default joint pose.  Consequently, the source data and
-    the main motion-tracking objective are unchanged before the clip reaches
-    its final frame.
+    The task currently assigns this term zero weight. It remains available for
+    controlled experiments, but it does not alter the immutable NPZ command or
+    determine whether a climb is functionally successful.
     """
 
     if std <= 0.0:
@@ -98,14 +96,12 @@ def final_default_joint_position_error_exp(
 
     asset = env.scene[asset_cfg.name]
     joint_ids = asset_cfg.joint_ids
-    target_joint_pos = command.joint_pos[:, joint_ids]
+    target_joint_pos = asset.data.default_joint_pos[:, joint_ids]
     robot_joint_pos = asset.data.joint_pos[:, joint_ids]
     hold_progress = command.final_hold_progress.to(dtype=robot_joint_pos.dtype)
     mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
 
-    # Scaling by progress prevents this term from duplicating the source-motion
-    # objective on the first final frame and gradually introduces the stand-up
-    # target over the configured hold interval.
+    # Scaling by progress confines this optional objective to the extra hold.
     return hold_progress * torch.exp(-mean_squared_error / std**2)
 
 

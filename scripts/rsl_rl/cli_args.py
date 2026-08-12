@@ -21,11 +21,20 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
     # -- load arguments
-    arg_group.add_argument(
+    load_mode_group = arg_group.add_mutually_exclusive_group()
+    load_mode_group.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Whether to resume from a checkpoint (use --resume or --no-resume).",
+    )
+    load_mode_group.add_argument(
+        "--warm_start",
+        action="store_true",
+        help=(
+            "Start a new run from checkpoint actor/critic and observation-normalizer weights. "
+            "Optimizer, adaptive sampler, curriculum, and iteration state are reset."
+        ),
     )
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
@@ -76,6 +85,10 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.experiment_name = args_cli.experiment_name
     if args_cli.resume is not None:
         agent_cfg.resume = args_cli.resume
+    if getattr(args_cli, "warm_start", False):
+        # A warm start deliberately overrides a configuration whose default may
+        # request a full resume. argparse prevents selecting both CLI modes.
+        agent_cfg.resume = False
     if args_cli.load_run is not None:
         agent_cfg.load_run = args_cli.load_run
     if args_cli.checkpoint is not None:

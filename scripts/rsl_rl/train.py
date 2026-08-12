@@ -173,13 +173,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume:
-        # get path to previous checkpoint
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+    # Resolve checkpoint paths against the source experiment. The new log
+    # directory remains separate for both resume and warm-start modes.
+    if agent_cfg.resume or args_cli.warm_start:
+        checkpoint_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        if args_cli.warm_start:
+            print(f"[INFO]: Warm-starting policy/value/normalizers from: {checkpoint_path}")
+            print("[INFO]: Optimizer, adaptive sampler, curriculum, and iteration state will start fresh.")
+            runner.load_policy_only(checkpoint_path)
+        else:
+            print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
+            runner.load(checkpoint_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

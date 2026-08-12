@@ -60,6 +60,7 @@ class climb_box_pose_curriculum(ManagerTermBase):
         env_ids: Sequence[int],
         event_term_name: str,
         success_term_name: str,
+        command_name: str,
         full_position_range: dict[str, tuple[float, float]],
         full_yaw_range: tuple[float, float],
         stage_scales: tuple[float, ...],
@@ -74,9 +75,11 @@ class climb_box_pose_curriculum(ManagerTermBase):
                 selected_env_ids = torch.arange(env.num_envs, device=env.device)[env_ids]
             else:
                 selected_env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
-            successful = env.termination_manager.get_term(success_term_name)[selected_env_ids]
+            command = env.command_manager.get_term(command_name)
+            complete_trials = command.episode_started_at_motion_beginning[selected_env_ids]
+            successful = env.termination_manager.get_term(success_term_name)[selected_env_ids] & complete_trials
             self._window_successes += int(torch.count_nonzero(successful).item())
-            self._window_episodes += int(selected_env_ids.numel())
+            self._window_episodes += int(torch.count_nonzero(complete_trials).item())
 
         if self._window_episodes >= min_evaluated_episodes:
             success_rate = self._window_successes / self._window_episodes

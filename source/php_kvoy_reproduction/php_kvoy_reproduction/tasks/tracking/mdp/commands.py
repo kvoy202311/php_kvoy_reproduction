@@ -111,6 +111,9 @@ class MotionCommand(CommandTerm):
         self.motion_switch_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.motion_final_hold_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.episode_started_at_motion_beginning = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self._has_sampled_motion = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
@@ -134,6 +137,8 @@ class MotionCommand(CommandTerm):
         self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
@@ -164,11 +169,15 @@ class MotionCommand(CommandTerm):
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        """Observable joint target, blended toward the default pose only in the final hold."""
+        """Observable joint target taken directly from the immutable motion data.
 
-        source_joint_pos = self.source_joint_pos
-        progress = self.final_hold_progress
-        return torch.lerp(source_joint_pos, self.robot.data.default_joint_pos, progress.unsqueeze(1))
+        The final-frame hold must preserve one kinematically consistent
+        reference. Moving only the joint target toward the articulation
+        default while body targets remain at the NPZ final frame creates two
+        incompatible objectives and makes a settled robot move again.
+        """
+
+        return self.source_joint_pos
 
     @property
     def joint_vel(self) -> torch.Tensor:
@@ -373,6 +382,9 @@ class MotionCommand(CommandTerm):
         self.motion_switch_count[env_ids] += (had_motion & (old_motion_ids != sampled_motion_ids)).long()
         self.motion_ids[env_ids] = sampled_motion_ids
         self.time_steps[env_ids] = sampled_time_steps
+        self.episode_started_at_motion_beginning[env_ids] = sampled_time_steps == self.motion.motion_start_idx[
+            sampled_motion_ids
+        ]
         self.motion_finished[env_ids] = False
         self.motion_final_hold_count[env_ids] = 0
         self._has_sampled_motion[env_ids] = True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,7 +12,7 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
 from php_kvoy_reproduction.tasks.tracking.mdp.commands import MotionCommand
@@ -80,7 +81,7 @@ def motion_clip_end(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
 
 
-def _valid_climb_standing(
+def _climb_standing_conditions(
     env: ManagerBasedRLEnv,
     command: MotionCommand,
     platform_cfg: SceneEntityCfg,
@@ -96,8 +97,7 @@ def _valid_climb_standing(
     max_root_angular_speed: float,
     max_joint_speed: float,
     max_torso_tilt: float,
-    max_default_joint_pos_rms: float,
-) -> torch.Tensor:
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     if not foot_body_names:
         raise ValueError("foot_body_names must contain at least one body.")
     if footprint_inset < 0.0:
@@ -111,7 +111,6 @@ def _valid_climb_standing(
         ("max_root_linear_speed", max_root_linear_speed),
         ("max_root_angular_speed", max_root_angular_speed),
         ("max_joint_speed", max_joint_speed),
-        ("max_default_joint_pos_rms", max_default_joint_pos_rms),
     ):
         if value < 0.0:
             raise ValueError(f"{name} must be non-negative, got {value}.")
@@ -168,105 +167,131 @@ def _valid_climb_standing(
     default_joint_pos_rms = torch.sqrt(
         torch.mean(torch.square(command.robot_joint_pos - command.robot.data.default_joint_pos), dim=1)
     )
-    default_joint_pos_valid = default_joint_pos_rms <= max_default_joint_pos_rms
+    conditions = {
+        "feet_inside": torch.all(inside, dim=1),
+        "foot_height_valid": torch.all(height_valid, dim=1),
+        "foot_contact_valid": torch.all(contact_valid, dim=1),
+        "upright": upright,
+        "root_height_valid": root_height_valid,
+        "root_linear_speed_valid": root_linear_speed_valid,
+        "root_angular_speed_valid": root_angular_speed_valid,
+        "joint_speed_valid": joint_speed_valid,
+    }
+    return conditions, default_joint_pos_rms
 
-    feet_valid = torch.all(inside & height_valid & contact_valid, dim=1)
-    return (
-        feet_valid
-        & upright
-        & root_height_valid
-        & root_linear_speed_valid
-        & root_angular_speed_valid
-        & joint_speed_valid
-        & default_joint_pos_valid
-    )
 
+class motion_end_success(ManagerTermBase):
+    """Classify a clip as successful only after a continuous stable final stand.
 
-def motion_end_success(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    platform_cfg: SceneEntityCfg,
-    contact_sensor_cfg: SceneEntityCfg,
-    base_size: tuple[float, float, float],
-    foot_body_names: list[str],
-    footprint_inset: float,
-    foot_height_range: tuple[float, float],
-    min_foot_contact_force: float,
-    min_foot_contact_time: float,
-    max_root_height_error: float,
-    max_root_linear_speed: float,
-    max_root_angular_speed: float,
-    max_joint_speed: float,
-    max_torso_tilt: float,
-    max_default_joint_pos_rms: float,
-) -> torch.Tensor:
-    """Classify a completed clip as a stable upright stand on the platform."""
+    The default articulation pose is deliberately diagnostic-only.  A climb is
+    complete when the robot is functionally stable on the platform; requiring
+    an unrelated nominal pose would reject valid reproductions of the expert's
+    stationary final frame.
+    """
 
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    if not command.cfg.terminate_on_motion_end:
-        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    standing_valid = _valid_climb_standing(
-        env,
-        command,
-        platform_cfg,
-        contact_sensor_cfg,
-        base_size,
-        foot_body_names,
-        footprint_inset,
-        foot_height_range,
-        min_foot_contact_force,
-        min_foot_contact_time,
-        max_root_height_error,
-        max_root_linear_speed,
-        max_root_angular_speed,
-        max_joint_speed,
-        max_torso_tilt,
-        max_default_joint_pos_rms,
-    )
-    clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
-    return clip_timeout & standing_valid
+    _METRIC_PREFIX = "final_standing_"
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._stable_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self._required_stable_steps = max(1, math.ceil(float(cfg.params["min_stable_time"]) / env.step_dt - 1.0e-9))
+
+        command: MotionCommand = env.command_manager.get_term(cfg.params["command_name"])
+        metric_names = (
+            "feet_inside",
+            "foot_height_valid",
+            "foot_contact_valid",
+            "upright",
+            "root_height_valid",
+            "root_linear_speed_valid",
+            "root_angular_speed_valid",
+            "joint_speed_valid",
+            "default_joint_pos_rms",
+            "stable_time",
+        )
+        for name in metric_names:
+            command.metrics.setdefault(self._METRIC_PREFIX + name, torch.zeros(env.num_envs, device=env.device))
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self._stable_steps[env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        platform_cfg: SceneEntityCfg,
+        contact_sensor_cfg: SceneEntityCfg,
+        base_size: tuple[float, float, float],
+        foot_body_names: list[str],
+        footprint_inset: float,
+        foot_height_range: tuple[float, float],
+        min_foot_contact_force: float,
+        min_foot_contact_time: float,
+        max_root_height_error: float,
+        max_root_linear_speed: float,
+        max_root_angular_speed: float,
+        max_joint_speed: float,
+        max_torso_tilt: float,
+        min_stable_time: float,
+    ) -> torch.Tensor:
+        if min_stable_time <= 0.0:
+            raise ValueError(f"min_stable_time must be positive, got {min_stable_time}.")
+
+        command: MotionCommand = env.command_manager.get_term(command_name)
+        if not command.cfg.terminate_on_motion_end:
+            return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+        conditions, default_joint_pos_rms = _climb_standing_conditions(
+            env,
+            command,
+            platform_cfg,
+            contact_sensor_cfg,
+            base_size,
+            foot_body_names,
+            footprint_inset,
+            foot_height_range,
+            min_foot_contact_force,
+            min_foot_contact_time,
+            max_root_height_error,
+            max_root_linear_speed,
+            max_root_angular_speed,
+            max_joint_speed,
+            max_torso_tilt,
+        )
+        final_frames = command.motion.motion_end_idx[command.motion_ids] - 1
+        at_final_frame = command.time_steps >= final_frames
+        standing_valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        for value in conditions.values():
+            standing_valid &= value
+        valid_final_stand = at_final_frame & standing_valid
+        self._stable_steps = torch.where(valid_final_stand, self._stable_steps + 1, 0)
+
+        for name, value in conditions.items():
+            command.metrics[self._METRIC_PREFIX + name].copy_((at_final_frame & value).float())
+        command.metrics[self._METRIC_PREFIX + "default_joint_pos_rms"].copy_(
+            torch.where(at_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
+        )
+        command.metrics[self._METRIC_PREFIX + "stable_time"].copy_(self._stable_steps.float() * env.step_dt)
+
+        continuously_stable = self._stable_steps >= self._required_stable_steps
+        clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
+        return clip_timeout & continuously_stable
 
 
 def motion_end_failure(
     env: ManagerBasedRLEnv,
     command_name: str,
-    platform_cfg: SceneEntityCfg,
-    contact_sensor_cfg: SceneEntityCfg,
-    base_size: tuple[float, float, float],
-    foot_body_names: list[str],
-    footprint_inset: float,
-    foot_height_range: tuple[float, float],
-    min_foot_contact_force: float,
-    min_foot_contact_time: float,
-    max_root_height_error: float,
-    max_root_linear_speed: float,
-    max_root_angular_speed: float,
-    max_joint_speed: float,
-    max_torso_tilt: float,
-    max_default_joint_pos_rms: float,
+    success_term_name: str,
 ) -> torch.Tensor:
     """Classify a completed clip as a platform-standing failure."""
 
     command: MotionCommand = env.command_manager.get_term(command_name)
     if not command.cfg.terminate_on_motion_end:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    standing_valid = _valid_climb_standing(
-        env,
-        command,
-        platform_cfg,
-        contact_sensor_cfg,
-        base_size,
-        foot_body_names,
-        footprint_inset,
-        foot_height_range,
-        min_foot_contact_force,
-        min_foot_contact_time,
-        max_root_height_error,
-        max_root_linear_speed,
-        max_root_angular_speed,
-        max_joint_speed,
-        max_torso_tilt,
-        max_default_joint_pos_rms,
-    )
     clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
-    return clip_timeout & ~standing_valid
+    # The success term is configured immediately before this term.  Reusing
+    # its result guarantees that completed clips are partitioned exactly once.
+    successful = env.termination_manager.get_term(success_term_name)
+    return clip_timeout & ~successful

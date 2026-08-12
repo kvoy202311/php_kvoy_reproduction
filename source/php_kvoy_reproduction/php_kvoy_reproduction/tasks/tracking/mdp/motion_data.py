@@ -457,8 +457,11 @@ class MultiMotionAdaptiveSampler:
             raise ValueError(f"adaptive_kernel_size must be at least one, got {adaptive_kernel_size}.")
         if not 0.0 < adaptive_lambda <= 1.0:
             raise ValueError(f"adaptive_lambda must be in (0, 1], got {adaptive_lambda}.")
-        if adaptive_uniform_ratio <= 0.0:
-            raise ValueError(f"adaptive_uniform_ratio must be positive, got {adaptive_uniform_ratio}.")
+        if not np.isfinite(adaptive_uniform_ratio) or not 0.0 < adaptive_uniform_ratio <= 1.0:
+            raise ValueError(
+                "adaptive_uniform_ratio must be a finite value in (0, 1], "
+                f"got {adaptive_uniform_ratio}."
+            )
         if not 0.0 < adaptive_alpha <= 1.0:
             raise ValueError(f"adaptive_alpha must be in (0, 1], got {adaptive_alpha}.")
 
@@ -591,15 +594,28 @@ class MultiMotionAdaptiveSampler:
     def phase_sampling_probabilities(self) -> torch.Tensor:
         probabilities = torch.zeros_like(self.bin_failed_count)
         for motion_id, bin_count in enumerate(self._bin_counts_list):
-            motion_probabilities = self.bin_failed_count[motion_id, :bin_count]
-            motion_probabilities = motion_probabilities + self.adaptive_uniform_ratio / float(bin_count)
-            motion_probabilities = F.pad(
-                motion_probabilities.view(1, 1, -1),
+            adaptive_scores = self.bin_failed_count[motion_id, :bin_count]
+            adaptive_scores = F.pad(
+                adaptive_scores.view(1, 1, -1),
                 (0, self.kernel.numel() - 1),
                 mode="replicate",
             )
-            motion_probabilities = F.conv1d(motion_probabilities, self.kernel.view(1, 1, -1)).view(-1)
-            probabilities[motion_id, :bin_count] = motion_probabilities / motion_probabilities.sum()
+            adaptive_scores = F.conv1d(adaptive_scores, self.kernel.view(1, 1, -1)).view(-1)
+
+            uniform_probabilities = torch.full_like(adaptive_scores, 1.0 / float(bin_count))
+            adaptive_mass = adaptive_scores.sum()
+            normalized_adaptive_probabilities = adaptive_scores / adaptive_mass.clamp_min(
+                torch.finfo(adaptive_scores.dtype).tiny
+            )
+            adaptive_probabilities = torch.where(
+                adaptive_mass > 0.0,
+                normalized_adaptive_probabilities,
+                uniform_probabilities,
+            )
+            probabilities[motion_id, :bin_count] = (
+                (1.0 - self.adaptive_uniform_ratio) * adaptive_probabilities
+                + self.adaptive_uniform_ratio * uniform_probabilities
+            )
         return probabilities
 
     def sample(self, num_samples: int) -> tuple[torch.Tensor, torch.Tensor]:

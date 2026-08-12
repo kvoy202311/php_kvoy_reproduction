@@ -67,11 +67,21 @@ class _TerminationManager:
         return self.success
 
 
+class _CommandManager:
+    def __init__(self, num_envs):
+        self.motion = SimpleNamespace(episode_started_at_motion_beginning=torch.ones(num_envs, dtype=torch.bool))
+
+    def get_term(self, name):
+        assert name == "motion"
+        return self.motion
+
+
 class ClimbBoxPoseCurriculumTest(unittest.TestCase):
     def setUp(self):
         self.params = {
             "event_term_name": "platform_pose",
             "success_term_name": "motion_end_success",
+            "command_name": "motion",
             "full_position_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
             "full_yaw_range": (-0.8, 0.8),
             "stage_scales": (0.0, 0.5, 1.0),
@@ -85,6 +95,7 @@ class ClimbBoxPoseCurriculumTest(unittest.TestCase):
             common_step_counter=0,
             event_manager=_EventManager(),
             termination_manager=_TerminationManager(4),
+            command_manager=_CommandManager(4),
         )
         self.cfg = SimpleNamespace(params=self.params)
         self.term = curriculums.climb_box_pose_curriculum(self.cfg, self.env)
@@ -127,12 +138,25 @@ class ClimbBoxPoseCurriculumTest(unittest.TestCase):
             common_step_counter=0,
             event_manager=_EventManager(),
             termination_manager=_TerminationManager(4),
+            command_manager=_CommandManager(4),
         )
         restored = curriculums.climb_box_pose_curriculum(self.cfg, restored_env)
         restored.load_state_dict(saved)
 
         self.assertEqual(restored.state_dict(), saved)
         self.assertEqual(restored_env.event_manager.cfg.params["position_range"]["x"], (-0.0, 0.0))
+
+    def test_random_phase_episodes_do_not_change_curriculum_statistics(self):
+        self.env.common_step_counter = 1
+        self.env.command_manager.motion.episode_started_at_motion_beginning[:] = torch.tensor(
+            [True, False, True, False]
+        )
+        self.env.termination_manager.success[:] = True
+
+        state = self._compute()
+
+        self.assertEqual(state["window_episodes"], 2.0)
+        self.assertEqual(self.term.state_dict()["window_successes"], 2)
 
 
 if __name__ == "__main__":

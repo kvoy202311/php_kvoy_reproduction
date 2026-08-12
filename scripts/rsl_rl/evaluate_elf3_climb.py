@@ -29,6 +29,8 @@ parser.add_argument(
 parser.add_argument(
     "--platform_tolerance", type=float, default=1.0e-5, help="Maximum platform/height-map consistency error."
 )
+parser.add_argument("--json_output", type=Path, default=None, help="Optional path for a structured JSON report.")
+parser.add_argument("--csv_output", type=Path, default=None, help="Optional path for a per-NPZ CSV report.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -47,6 +49,13 @@ if args_cli.platform_tolerance <= 0.0:
     parser.error("--platform_tolerance must be positive.")
 if args_cli.min_success_rate is not None and not 0.0 <= args_cli.min_success_rate <= 1.0:
     parser.error("--min_success_rate must be in [0, 1].")
+for output_name in ("json_output", "csv_output"):
+    output_path = getattr(args_cli, output_name)
+    if output_path is not None:
+        output_path = output_path.expanduser().resolve()
+        if output_path.is_dir():
+            parser.error(f"--{output_name} must name a file, got directory: {output_path}")
+        setattr(args_cli, output_name, output_path)
 
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
@@ -80,6 +89,47 @@ from php_kvoy_reproduction.tasks.tracking.config.elf3.climb_env_cfg import (
     ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE,
     ELF3_CLIMB_PLATFORM_YAW_RANGE,
 )
+from php_kvoy_reproduction.utils.climb_evaluation_report import (
+    OUTCOME_STANDING_FAILURE,
+    TerminalSnapshotRecorder,
+    build_climb_evaluation_report,
+    classify_terminal_outcome,
+    write_climb_evaluation_csv,
+    write_climb_evaluation_json,
+)
+
+
+_FINAL_STANDING_DIAGNOSTIC_NAMES = ("default_joint_pos_rms", "stable_time")
+_TERMINAL_TERM_NAMES = ("motion_clip_end", "motion_end_success", "motion_end_failure")
+
+
+def _final_standing_contract(env, command) -> tuple[str, tuple[str, ...], float]:
+    """Read the metric names and exact stability threshold from the active term."""
+
+    manager = env.termination_manager
+    try:
+        term_index = manager._term_names.index("motion_end_success")
+    except ValueError as exc:
+        raise RuntimeError("Evaluation requires the active motion_end_success termination term.") from exc
+    success_term = manager._term_cfgs[term_index].func
+    metric_prefix = getattr(success_term, "_METRIC_PREFIX", None)
+    required_stable_steps = getattr(success_term, "_required_stable_steps", None)
+    if not isinstance(metric_prefix, str) or not metric_prefix:
+        raise RuntimeError("motion_end_success does not expose its final-standing metric prefix.")
+    if not isinstance(required_stable_steps, int) or required_stable_steps <= 0:
+        raise RuntimeError("motion_end_success does not expose a valid required stable-step count.")
+
+    registered_names = tuple(
+        name.removeprefix(metric_prefix) for name in command.metrics if name.startswith(metric_prefix)
+    )
+    missing_diagnostics = set(_FINAL_STANDING_DIAGNOSTIC_NAMES).difference(registered_names)
+    if missing_diagnostics:
+        raise RuntimeError(f"Missing final-standing diagnostic metrics: {sorted(missing_diagnostics)}.")
+    condition_names = tuple(name for name in registered_names if name not in _FINAL_STANDING_DIAGNOSTIC_NAMES)
+    if not condition_names:
+        raise RuntimeError("motion_end_success exposes no final-standing Boolean condition metrics.")
+    required_stable_time = required_stable_steps * env.step_dt
+    return metric_prefix, condition_names, required_stable_time
 
 
 def _read_motion_metadata(files: tuple[Path, ...]) -> tuple[float, list[int]]:
@@ -281,65 +331,125 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
         _audit_platform_and_height_map(env.unwrapped, args_cli.randomized_obstacles, args_cli.platform_tolerance)
 
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        runner.load(str(args_cli.checkpoint))
+        # Evaluation only needs policy/value and observation-normalizer state.
+        # Do not allocate/restore optimizer state from a training checkpoint.
+        runner.load(str(args_cli.checkpoint), load_optimizer=False)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
         obs, _ = env.get_observations()
 
-        recorded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        successes = torch.zeros(num_motions, dtype=torch.long, device=env.device)
-        standing_failures = torch.zeros_like(successes)
-        tracking_failures = torch.zeros_like(successes)
-        unexpected_failures = torch.zeros_like(successes)
         expected_ids = torch.arange(env.num_envs, device=env.device) % num_motions
+        metric_prefix, standing_condition_names, required_stable_time_s = _final_standing_contract(
+            env.unwrapped, command
+        )
+        report_condition_names = (*standing_condition_names, "continuous_stability")
+        metric_keys = tuple(
+            metric_prefix + name for name in (*standing_condition_names, *_FINAL_STANDING_DIAGNOSTIC_NAMES)
+        )
+        # ManagerBasedRLEnv clears termination terms and command metrics inside
+        # step() before returning, so take the terminal snapshot in _reset_idx.
+        recorder = TerminalSnapshotRecorder(
+            env.unwrapped,
+            command,
+            termination_term_names=_TERMINAL_TERM_NAMES,
+            metric_keys=metric_keys,
+        )
         maximum_steps = max(motion_lengths) + command.motion_end_hold_steps + 2
-
-        for _ in range(maximum_steps):
-            with torch.inference_mode():
-                obs, _, dones, _ = env.step(policy(obs))
-            done = dones.bool() & ~recorded
-            if not torch.any(done):
-                continue
-
-            success_term = env.unwrapped.termination_manager.get_term("motion_end_success")
-            standing_failure_term = env.unwrapped.termination_manager.get_term("motion_end_failure")
-            terminated = env.unwrapped.termination_manager.terminated
-            successful = done & success_term & ~terminated
-            bad_standing = done & standing_failure_term
-            early_tracking = done & terminated & ~standing_failure_term
-            unexpected = done & ~(successful | bad_standing | early_tracking)
-
-            for motion_id in range(num_motions):
-                motion_mask = expected_ids == motion_id
-                successes[motion_id] += torch.count_nonzero(successful & motion_mask)
-                standing_failures[motion_id] += torch.count_nonzero(bad_standing & motion_mask)
-                tracking_failures[motion_id] += torch.count_nonzero(early_tracking & motion_mask)
-                unexpected_failures[motion_id] += torch.count_nonzero(unexpected & motion_mask)
-            recorded |= done
-            if torch.all(recorded):
-                break
-
-        if not torch.all(recorded):
-            missing = torch.where(~recorded)[0].cpu().tolist()
-            raise RuntimeError(f"Evaluation did not terminate all environments within {maximum_steps} steps: {missing}")
-
         threshold = args_cli.min_success_rate
         if threshold is None:
             threshold = 0.9 if args_cli.randomized_obstacles else 1.0
+        recorder.install()
+        try:
+            for _ in range(maximum_steps):
+                with torch.inference_mode():
+                    obs, _, _, _ = env.step(policy(obs))
+                if torch.all(recorder.captured):
+                    break
+        finally:
+            recorder.uninstall()
+
+        if not torch.all(recorder.captured):
+            missing = torch.where(~recorder.captured)[0].cpu().tolist()
+            raise RuntimeError(f"Evaluation did not terminate all environments within {maximum_steps} steps: {missing}")
+        if not torch.equal(recorder.motion_ids, expected_ids):
+            mismatched = torch.where(recorder.motion_ids != expected_ids)[0].cpu().tolist()
+            raise RuntimeError(
+                "Evaluation environment changed NPZ before its first terminal snapshot; "
+                f"mismatched environment ids: {mismatched}."
+            )
+
+        trial_records = []
+        for env_id in range(env.num_envs):
+            motion_end_success = bool(recorder.termination_terms["motion_end_success"][env_id].item())
+            motion_end_failure = bool(recorder.termination_terms["motion_end_failure"][env_id].item())
+            physically_terminated = bool(recorder.physically_terminated[env_id].item())
+            completed_motion_end = bool(recorder.termination_terms["motion_clip_end"][env_id].item())
+            outcome = classify_terminal_outcome(
+                motion_end_success=motion_end_success,
+                motion_end_failure=motion_end_failure,
+                physically_terminated=physically_terminated,
+                completed_motion_end=completed_motion_end,
+            )
+            condition_pass = {
+                name: bool(recorder.metrics[metric_prefix + name][env_id].item() >= 0.5)
+                for name in standing_condition_names
+            }
+            default_rms = float(recorder.metrics[metric_prefix + "default_joint_pos_rms"][env_id].item())
+            stable_time = float(recorder.metrics[metric_prefix + "stable_time"][env_id].item())
+            condition_pass["continuous_stability"] = stable_time + 1.0e-9 >= required_stable_time_s
+            # Early tracking failures occur before the final-frame diagnostics
+            # become meaningful; encode neutral finite values for strict JSON.
+            if outcome != OUTCOME_STANDING_FAILURE and not (motion_end_success and completed_motion_end):
+                default_rms = 0.0
+                stable_time = 0.0
+            trial_records.append(
+                {
+                    "env_id": env_id,
+                    "motion_id": int(recorder.motion_ids[env_id].item()),
+                    "outcome": outcome,
+                    "standing_condition_pass": condition_pass,
+                    "default_joint_pos_rms": default_rms,
+                    "stable_time_s": stable_time,
+                }
+            )
+
+        report = build_climb_evaluation_report(
+            task=args_cli.task,
+            checkpoint=args_cli.checkpoint,
+            motion_dir=args_cli.motion_dir,
+            motion_files=motion_files,
+            trials_per_motion=args_cli.trials_per_motion,
+            randomized_obstacles=args_cli.randomized_obstacles,
+            seed=args_cli.seed,
+            min_success_rate=threshold,
+            required_stable_time_s=required_stable_time_s,
+            condition_names=report_condition_names,
+            trials=trial_records,
+        )
+
         print("\nfile | trials | success | rate | tracking_fail | standing_fail | unexpected | acceptance")
         print("--- | ---: | ---: | ---: | ---: | ---: | ---: | ---")
-        accepted = True
-        for motion_id, motion_file in enumerate(motion_files):
-            success_count = int(successes[motion_id].item())
-            rate = success_count / args_cli.trials_per_motion
-            motion_accepted = rate >= threshold
-            accepted &= motion_accepted
+        for motion in report["motions"]:
             print(
-                f"{motion_file.name} | {args_cli.trials_per_motion} | {success_count} | {rate:.1%} | "
-                f"{int(tracking_failures[motion_id].item())} | {int(standing_failures[motion_id].item())} | "
-                f"{int(unexpected_failures[motion_id].item())} | {'PASS' if motion_accepted else 'FAIL'}"
+                f"{motion['motion_file']} | {motion['trials']} | {motion['successes']} | "
+                f"{motion['success_rate']:.1%} | {motion['tracking_failures']} | "
+                f"{motion['standing_failures']} | {motion['unexpected_failures']} | "
+                f"{'PASS' if motion['accepted'] else 'FAIL'}"
             )
+            if motion["standing_failures"]:
+                failure_summary = ", ".join(
+                    f"{name}={motion['standing_condition_failures'][name]}" for name in report_condition_names
+                )
+                print(f"  standing condition failures: {failure_summary}")
+
+        if args_cli.json_output is not None:
+            write_climb_evaluation_json(report, args_cli.json_output)
+            print(f"[INFO] JSON report: {args_cli.json_output}")
+        if args_cli.csv_output is not None:
+            write_climb_evaluation_csv(report, args_cli.csv_output)
+            print(f"[INFO] CSV report: {args_cli.csv_output}")
+
         print(f"\nAcceptance threshold: every NPZ >= {threshold:.1%}.")
-        if not accepted:
+        if not report["accepted"]:
             raise RuntimeError("ELF3 climb acceptance failed: at least one NPZ is below the required success rate.")
         print("[PASS] Every NPZ satisfies the independent success-rate acceptance threshold.")
     finally:

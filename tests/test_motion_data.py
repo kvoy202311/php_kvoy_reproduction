@@ -112,6 +112,43 @@ class MultiMotionAdaptiveSamplerTest(unittest.TestCase):
         self.assertTrue(torch.allclose(probabilities[0, :3], torch.full((3,), 1.0 / 3.0)))
         self.assertEqual(float(self.sampler._current_bin_failed.sum().item()), 0.0)
 
+    def test_uniform_mixture_guarantees_a_probability_floor_under_concentrated_failures(self):
+        rho = 0.1
+        sampler = motion_data.MultiMotionAdaptiveSampler(
+            self.starts,
+            self.ends,
+            env_fps=2.0,
+            device="cpu",
+            adaptive_uniform_ratio=rho,
+            adaptive_alpha=1.0,
+        )
+        sampler.bin_failed_count[0, 1] = 1.0e9
+
+        probabilities = sampler.phase_sampling_probabilities[0, : sampler.bin_counts[0]]
+        bin_count = int(sampler.bin_counts[0].item())
+        probability_floor = rho / float(bin_count)
+
+        self.assertTrue(torch.all(probabilities >= probability_floor))
+        self.assertTrue(torch.allclose(probabilities.sum(), torch.tensor(1.0)))
+        self.assertTrue(
+            torch.allclose(
+                probabilities,
+                torch.tensor([probability_floor, 1.0 - rho + probability_floor, probability_floor]),
+            )
+        )
+
+    def test_uniform_ratio_must_be_a_finite_probability(self):
+        for invalid_ratio in (0.0, -0.1, 1.1, float("inf"), float("nan")):
+            with self.subTest(adaptive_uniform_ratio=invalid_ratio):
+                with self.assertRaisesRegex(ValueError, r"\(0, 1\]"):
+                    motion_data.MultiMotionAdaptiveSampler(
+                        self.starts,
+                        self.ends,
+                        env_fps=2.0,
+                        device="cpu",
+                        adaptive_uniform_ratio=invalid_ratio,
+                    )
+
     def test_uniform_sampling_never_selects_a_final_frame(self):
         torch.manual_seed(11)
         motion_ids, time_steps = self.sampler.sample_uniform(20_000)

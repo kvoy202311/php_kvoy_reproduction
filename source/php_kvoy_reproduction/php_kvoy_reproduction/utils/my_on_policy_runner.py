@@ -76,7 +76,14 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 self.registry_name = None
 
     def load(self, path: str, load_optimizer: bool = True):
-        """Restore training state and resume after the last completed update."""
+        """Load a checkpoint for a full resume or a policy-only warm start.
+
+        ``load_optimizer=True`` preserves the historical full-resume behavior:
+        optimizer, iteration, adaptive sampler, and curriculum state are all
+        restored. With ``load_optimizer=False``, RSL-RL loads the actor/critic
+        and empirical observation normalizers, while this runner deliberately
+        leaves all training-control state at its freshly initialized values.
+        """
 
         checkpoint_infos = super().load(path, load_optimizer=load_optimizer)
         if load_optimizer:
@@ -89,33 +96,42 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 f"[INFO]: Checkpoint completed iteration {last_completed_iteration}; "
                 f"resuming from iteration {self.current_learning_iteration}."
             )
-        if isinstance(checkpoint_infos, dict) and _MOTION_SAMPLER_CHECKPOINT_KEY in checkpoint_infos:
-            motion_command = self.env.unwrapped.command_manager.get_term("motion")
-            motion_command.motion_sampler.load_state_dict(checkpoint_infos[_MOTION_SAMPLER_CHECKPOINT_KEY])
-        elif load_optimizer:
-            warnings.warn(
-                "Checkpoint has no adaptive motion-sampler state; policy training can resume, "
-                "but phase-failure statistics will restart from zero.",
-                stacklevel=2,
-            )
-
-        stateful_terms = _stateful_curriculum_terms(self.env)
-        if isinstance(checkpoint_infos, dict) and _CURRICULUM_CHECKPOINT_KEY in checkpoint_infos:
-            saved_terms = checkpoint_infos[_CURRICULUM_CHECKPOINT_KEY]
-            if set(saved_terms) != set(stateful_terms):
-                raise ValueError(
-                    "Checkpoint curriculum terms do not match the current task: "
-                    f"saved={sorted(saved_terms)}, current={sorted(stateful_terms)}."
+            if isinstance(checkpoint_infos, dict) and _MOTION_SAMPLER_CHECKPOINT_KEY in checkpoint_infos:
+                motion_command = self.env.unwrapped.command_manager.get_term("motion")
+                motion_command.motion_sampler.load_state_dict(checkpoint_infos[_MOTION_SAMPLER_CHECKPOINT_KEY])
+            else:
+                warnings.warn(
+                    "Checkpoint has no adaptive motion-sampler state; policy training can resume, "
+                    "but phase-failure statistics will restart from zero.",
+                    stacklevel=2,
                 )
-            for name, term in stateful_terms.items():
-                term.load_state_dict(saved_terms[name])
-        elif load_optimizer and stateful_terms:
-            warnings.warn(
-                "Checkpoint has no terrain-curriculum state; policy training can resume, "
-                "but the curriculum will restart from stage zero.",
-                stacklevel=2,
-            )
+
+            stateful_terms = _stateful_curriculum_terms(self.env)
+            if isinstance(checkpoint_infos, dict) and _CURRICULUM_CHECKPOINT_KEY in checkpoint_infos:
+                saved_terms = checkpoint_infos[_CURRICULUM_CHECKPOINT_KEY]
+                if set(saved_terms) != set(stateful_terms):
+                    raise ValueError(
+                        "Checkpoint curriculum terms do not match the current task: "
+                        f"saved={sorted(saved_terms)}, current={sorted(stateful_terms)}."
+                    )
+                for name, term in stateful_terms.items():
+                    term.load_state_dict(saved_terms[name])
+            elif stateful_terms:
+                warnings.warn(
+                    "Checkpoint has no terrain-curriculum state; policy training can resume, "
+                    "but the curriculum will restart from stage zero.",
+                    stacklevel=2,
+                )
+        else:
+            # RSL-RL 2.3.x assigns the saved iteration even when optimizer
+            # loading is disabled. A warm start is a new run by definition.
+            self.current_learning_iteration = 0
 
         if isinstance(checkpoint_infos, dict) and _UPSTREAM_INFOS_KEY in checkpoint_infos:
             return checkpoint_infos[_UPSTREAM_INFOS_KEY]
         return checkpoint_infos
+
+    def load_policy_only(self, path: str):
+        """Warm-start actor/critic and observation normalizers in a fresh run."""
+
+        return self.load(path, load_optimizer=False)

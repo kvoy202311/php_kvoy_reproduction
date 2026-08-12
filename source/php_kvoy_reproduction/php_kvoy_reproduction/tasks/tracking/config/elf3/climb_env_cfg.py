@@ -147,9 +147,10 @@ ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET = 0.5
 
 
 # The source clips already contain a motionless 0.5 s tail. Add another 0.5 s
-# hold in which the final-standing target transitions toward the robot default
-# pose and sustained foot contact can be established before classification.
+# hold of the exact NPZ final frame so sustained functional stability can be
+# measured without introducing a second, kinematically inconsistent target.
 ELF3_CLIMB_FINAL_HOLD_TIME_S = 0.5
+ELF3_CLIMB_MIN_STABLE_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
@@ -160,10 +161,6 @@ ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
 ELF3_CLIMB_MAX_JOINT_SPEED = 0.5
 ELF3_CLIMB_MAX_TORSO_TILT = 0.35
 ELF3_CLIMB_FINAL_DEFAULT_POSE_REWARD_STD = 0.25
-# The four source clips end about 0.288 rad RMS away from this articulation's
-# default pose. Requiring <= 0.25 rad asks the policy to improve the final stand
-# without demanding an exact pose while it balances on the platform.
-ELF3_CLIMB_MAX_DEFAULT_JOINT_POS_RMS = 0.25
 
 
 # Three performance-gated reset-pose stages: fixed, half range, full range.
@@ -499,9 +496,9 @@ class ELF3ClimbRewardsCfg:
     )
     final_default_joint_pose = RewTerm(
         func=mdp.final_default_joint_position_error_exp,
-        # Balance the two unit-weight final body pose/orientation tracking terms
-        # without changing their behavior during the source motion.
-        weight=2.0,
+        # Retain the term for future experiments, but do not pull the expert's
+        # valid stationary final pose toward an unrelated articulation default.
+        weight=0.0,
         params={
             "command_name": "motion",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
@@ -582,7 +579,7 @@ class ELF3ClimbTerminationsCfg:
             "max_root_angular_speed": ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED,
             "max_joint_speed": ELF3_CLIMB_MAX_JOINT_SPEED,
             "max_torso_tilt": ELF3_CLIMB_MAX_TORSO_TILT,
-            "max_default_joint_pos_rms": ELF3_CLIMB_MAX_DEFAULT_JOINT_POS_RMS,
+            "min_stable_time": ELF3_CLIMB_MIN_STABLE_TIME_S,
         },
     )
     motion_end_failure = DoneTerm(
@@ -590,23 +587,7 @@ class ELF3ClimbTerminationsCfg:
         time_out=True,
         params={
             "command_name": "motion",
-            "platform_cfg": SceneEntityCfg("platform"),
-            "contact_sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=["l_ankle_x_link", "r_ankle_x_link"],
-            ),
-            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
-            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
-            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_range": ELF3_CLIMB_FOOT_HEIGHT_RANGE,
-            "min_foot_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
-            "min_foot_contact_time": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
-            "max_root_height_error": ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR,
-            "max_root_linear_speed": ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED,
-            "max_root_angular_speed": ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED,
-            "max_joint_speed": ELF3_CLIMB_MAX_JOINT_SPEED,
-            "max_torso_tilt": ELF3_CLIMB_MAX_TORSO_TILT,
-            "max_default_joint_pos_rms": ELF3_CLIMB_MAX_DEFAULT_JOINT_POS_RMS,
+            "success_term_name": "motion_end_success",
         },
     )
 
@@ -620,6 +601,7 @@ class ELF3ClimbCurriculumCfg:
         params={
             "event_term_name": "platform_pose",
             "success_term_name": "motion_end_success",
+            "command_name": "motion",
             "full_position_range": {
                 "x": ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE,
                 "y": ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE,
@@ -686,4 +668,4 @@ class ELF3ClimbEnvCfg(TrackingEnvCfg):
         # self.viewer.origin_type = "asset_root"
         self.viewer.origin_type = "world"
         # self.viewer.asset_name = "robot"
-        self.viewer.asset_name = "None"
+        self.viewer.asset_name = None
