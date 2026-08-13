@@ -1,162 +1,191 @@
-# BeyondMimic Motion Tracking Code
+# PHP-Kvoy Reproduction
 
-[![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
-[![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.1.0-silver)](https://isaac-sim.github.io/IsaacLab)
-[![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
-[![Linux platform](https://img.shields.io/badge/platform-linux--64-orange.svg)](https://releases.ubuntu.com/20.04/)
-[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://pre-commit.com/)
-[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/license/mit)
+基于 Isaac Lab 的 ELF3 机器人动作跟踪与攀爬专家策略训练工程。当前主要任务是让一个策略同时学习同一技能的多个 NPZ 动作片段，并在 0.65 m 平台上完成攀爬和最终站立。
 
-[[Website]](https://beyondmimic.github.io/)
-[[Arxiv]](https://arxiv.org/abs/2508.08241)
-[[Video]](https://youtu.be/RS_MtKVIAzY)
+## 环境与安装
 
-## Overview
-
-BeyondMimic is a versatile humanoid control framework that provides highly dynamic motion tracking with the
-state-of-the-art motion quality on real-world deployment and steerable test-time control with guided diffusion-based
-controllers.
-
-This repo covers the motion tracking training in BeyondMimic. **You should be able to
-train any sim-to-real-ready motion in the LAFAN1 dataset, without tuning any parameters**.
-
-For sim-to-sim and sim-to-real deployment, please refer to
-the [motion_tracking_controller](https://github.com/HybridRobotics/motion_tracking_controller).
-
-### Alternative Implementations
-
-- There is an alternative reproduction of BeyondMimic in [mjlab](https://github.com/mujocolab/mjlab), a new Isaac Lab-style manager API powered by MuJoCo-Warp for RL and robotics research. See the implementation [here](https://github.com/mujocolab/mjlab/blob/main/src/mjlab/tasks/tracking/tracking_env_cfg.py).
-
-## Installation
-
-- Install Isaac Lab v2.1.0 by following
-  the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). We recommend
-  using the conda installation as it simplifies calling Python scripts from the terminal.
-
-- Clone this repository separately from the Isaac Lab installation (i.e., outside the `IsaacLab` directory):
+需要已安装 Isaac Sim 4.5、Isaac Lab 2.1 和 Python 3.10，并使用包含 Isaac Lab 的 conda 环境（示例环境名为 `mimic`）。
 
 ```bash
-# Option 1: SSH
-git clone git@github.com:HybridRobotics/php_kvoy_reproduction.git
-
-# Option 2: HTTPS
-git clone https://github.com/HybridRobotics/php_kvoy_reproduction.git
-```
-
-- Pull the robot description files from GCS
-
-```bash
-# Enter the repository
-cd php_kvoy_reproduction
-# Rename all occurrences of php_kvoy_reproduction (in files/directories) to your_fancy_extension_name
-curl -L -o unitree_description.tar.gz https://storage.googleapis.com/qiayuanl_robot_descriptions/unitree_description.tar.gz && \
-tar -xzf unitree_description.tar.gz -C source/php_kvoy_reproduction/php_kvoy_reproduction/assets/ && \
-rm unitree_description.tar.gz
-```
-
-- Using a Python interpreter that has Isaac Lab installed, install the library
-
-```bash
+conda activate mimic
+cd /home/kvoy/Desktop/php_kvoy_reproduction
 python -m pip install -e source/php_kvoy_reproduction
 ```
 
-## Motion Tracking
+本地动作数据默认位于：
 
-### Motion Preprocessing & Registry Setup
-
-In order to manage the large set of motions we used in this work, we leverage the WandB registry to store and load
-reference motions automatically.
-Note: The reference motion should be retargeted and use generalized coordinates only.
-
-- Gather the reference motion datasets (please follow the original licenses), we use the same convention as .csv of
-  Unitree's dataset
-
-    - Unitree-retargeted LAFAN1 Dataset is available
-      on [HuggingFace](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset)
-    - Sidekicks are from [KungfuBot](https://kungfu-bot.github.io/)
-    - Christiano Ronaldo celebration is from [ASAP](https://github.com/LeCAR-Lab/ASAP).
-    - Balance motions are from [HuB](https://hub-robot.github.io/)
-
-
-- Log in to your WandB account; access Registry under Core on the left. Create a new registry collection with the name "
-  Motions" and artifact type "All Types".
-
-
-- Convert retargeted motions to include the maximum coordinates information (body pose, body velocity, and body
-  acceleration) via forward kinematics,
-
-```bash
-python scripts/csv_to_npz.py --input_file {motion_name}.csv --input_fps 30 --output_name {motion_name} --headless
+```text
+data/processed_motions/elf3/climb_50hz/
 ```
 
-This will automatically upload the processed motion file to the WandB registry with output name {motion_name}.
+目录训练会读取其中全部 `.npz` 文件（当前为同一攀爬技能的 4 个动作）。请确认动作数据和 ELF3 资产已经存在；数据文件较大时不会随代码仓库自动获得。
 
-- Test if the WandB registry works properly by replaying the motion in Isaac Sim:
+## 任务
 
-```bash
-python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-registry-motions/{motion_name}
-```
+| 任务 | 用途 |
+| --- | --- |
+| `Tracking-Climb-ELF3-v0` | 0.65 m 平台攀爬专家训练与评估 |
+| `Tracking-Flat-ELF3-v0` | 平地动作跟踪 |
 
-- Debugging
-    - Make sure to export WANDB_ENTITY to your organization name, not your personal username.
-    - If /tmp folder is not accessible, modify csv_to_npz.py L319 & L326 to a temporary folder of your choice.
+## 训练
 
-### Policy Training
-
-- Train policy by the following command:
+### 多动作（推荐）
 
 ```bash
-python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
---registry_name {your-organization}-org/wandb-registry-motions/{motion_name} \
---headless --logger wandb --log_project_name {project_name} --run_name {run_name}
+python scripts/rsl_rl/train.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --num_envs 2048 \
+  --max_iterations 100000 \
+  --logger tensorboard \
+  --run_name elf3_climb \
+  --device cuda:0 \
+  --headless
 ```
 
-### Policy Evaluation
-
-- Play the trained policy by the following command:
+### 单动作
 
 ```bash
-python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_path={wandb-run-path}
+python scripts/rsl_rl/train.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_file /path/to/one_motion.npz \
+  --num_envs 2048 \
+  --max_iterations 100000 \
+  --logger tensorboard \
+  --run_name elf3_climb_single \
+  --device cuda:0 \
+  --headless
 ```
 
-The WandB run path can be located in the run overview. It follows the format {your_organization}/{project_name}/ along
-with a unique 8-character identifier. Note that run_name is different from run_path.
+训练时动作来源三选一：`--motion_file`（单个本地 NPZ）、`--motion_dir`（目录中全部 NPZ）或 `--registry_name`（W&B 动作 artifact）。本工程推荐使用本地 `--motion_dir`。
 
-## Code Structure
+常用训练参数：
 
-Below is an overview of the code structure for this repository:
+```text
+--task TASK                 任务注册名
+--motion_file FILE          单个 NPZ；不能与另外两个动作来源同时使用
+--motion_dir DIR            多个 NPZ 的目录；不能与另外两个动作来源同时使用
+--registry_name NAME        W&B registry artifact（可选）
+--num_envs N                并行环境数；4090 可先从 2048 开始
+--max_iterations N          PPO 训练迭代数
+--seed N                    随机种子
+--experiment_name NAME      日志根目录名，默认使用任务配置
+--run_name NAME             本次运行的目录后缀
+--logger {tensorboard,wandb,neptune}
+--log_project_name NAME     W&B/Neptune 项目名
+--device {cuda:0,cpu}       仿真和训练设备
+--headless                  无界面训练
+--video                     训练期间录制视频
+--video_length N            视频长度（步）
+--video_interval N          录制间隔（步）
+--resume / --no-resume      是否恢复 checkpoint（完整恢复优化器等状态）
+--warm_start                只加载策略、价值网络和观测归一化参数，重新开始优化器/采样器状态
+--load_run NAME             要加载的日志运行目录
+--checkpoint FILE           指定 checkpoint 文件名
+```
 
-- **`source/php_kvoy_reproduction/php_kvoy_reproduction/tasks/tracking/mdp`**
-  This directory contains the atomic functions to define the MDP for BeyondMimic. Below is a breakdown of the functions:
+修改奖励函数或环境逻辑后，建议重新训练；若只想复用已有策略参数，使用 `--warm_start`，不要把旧实验当作严格续训。
 
-    - **`commands.py`**
-      Command library to compute relevant variables from the reference motion, current robot state, and error
-      computations. This includes pose and velocity error calculation, initial state randomization, and adaptive
-      sampling.
+训练日志默认写入 `logs/rsl_rl/<experiment_name>/<时间>_<run_name>/`。
 
-    - **`rewards.py`**
-      Implements the DeepMimic reward functions and smoothing terms.
+## 播放策略
 
-    - **`events.py`**
-      Implements domain randomization terms.
+`--load_run` 是日志运行目录名，`--checkpoint` 是其中的模型文件名，例如 `model_100000.pt`。
 
-    - **`observations.py`**
-      Implements observation terms for motion tracking and data collection.
+### 播放全部动作（从第 0 帧开始）
 
-    - **`terminations.py`**
-      Implements early terminations and timeouts.
+```bash
+python scripts/rsl_rl/play.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --playback_mode full_clip \
+  --load_run 2026-08-12_某次运行 \
+  --checkpoint model_100000.pt \
+  --num_envs 4 \
+  --device cuda:0
+```
 
-- **`source/php_kvoy_reproduction/php_kvoy_reproduction/tasks/tracking/tracking_env_cfg.py`**
-  Contains the environment (MDP) hyperparameters configuration for the tracking task.
+### 固定播放第 `motion_id` 个动作
 
-- **`source/php_kvoy_reproduction/php_kvoy_reproduction/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`**
-  Contains the PPO hyperparameters for the tracking task.
+```bash
+python scripts/rsl_rl/play.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --playback_mode fixed_clip \
+  --motion_id 0 \
+  --load_run 2026-08-12_某次运行 \
+  --checkpoint model_100000.pt \
+  --num_envs 1 \
+  --device cuda:0
+```
 
-- **`source/php_kvoy_reproduction/php_kvoy_reproduction/robots`**
-  Contains robot-specific settings, including armature parameters, joint stiffness/damping calculation, and action scale
-  calculation.
+播放模式：`training` 保持训练配置；`full_clip` 从第 0 帧按顺序播放全部动作；`fixed_clip` 从第 0 帧固定播放一个动作。`--free_camera` 使用世界坐标相机，可以在 Isaac Sim 窗口中手动拖动视角：
 
-- **`scripts`**
-  Includes utility scripts for preprocessing motion data, training policies, and evaluating trained policies.
+```bash
+python scripts/rsl_rl/play.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --playback_mode full_clip \
+  --free_camera \
+  --load_run 2026-08-12_某次运行 \
+  --checkpoint model_100000.pt \
+  --num_envs 4 \
+  --device cuda:0
+```
 
-This structure is designed to ensure modularity and ease of navigation for developers expanding the project.
+还可使用 `--video --video_length 500` 录制播放视频；`--headless` 用于无界面运行。播放脚本会将策略导出到 checkpoint 目录下的 `exported/policy.onnx`。
+
+常用播放参数：
+
+```text
+--motion_file FILE          播放单个 NPZ（与 --motion_dir 二选一）
+--motion_dir DIR            播放目录中的多个 NPZ
+--playback_mode MODE        training / full_clip / fixed_clip
+--motion_id N               fixed_clip 使用的动作编号，从 0 开始
+--load_run NAME             日志运行目录名
+--checkpoint FILE           checkpoint 文件名
+--wandb_path PATH           从 W&B 运行下载模型（可选）
+--num_envs N                播放环境数
+--free_camera               禁止相机跟随机器人，允许手动拖动
+--video                     录制播放视频
+--video_length N            视频长度（步）
+--headless                  无界面播放
+```
+
+## 确定性验收评估
+
+该脚本让每个 NPZ 的独立试验都从第 0 帧开始，并分别统计成功率、跟踪失败和最终站立失败，同时检查动作边界以及固定平台与高程图的一致性。
+
+```bash
+python scripts/rsl_rl/evaluate_elf3_climb.py \
+  --task Tracking-Climb-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --checkpoint /home/kvoy/Desktop/php_kvoy_reproduction/logs/rsl_rl/elf3_climb/某次运行/model_100000.pt \
+  --trials_per_motion 10 \
+  --headless \
+  --json_output climb_eval.json \
+  --csv_output climb_eval.csv
+```
+
+评估随机障碍物时增加 `--randomized_obstacles`；固定平台默认要求每个 NPZ 成功率为 100%，随机障碍物默认要求至少 90%。可用 `--min_success_rate 0.8` 自定义阈值，`--seed` 固定评估随机性，`--platform_tolerance` 设置平台/高程图允许误差。
+
+## 代码结构
+
+```text
+source/php_kvoy_reproduction/php_kvoy_reproduction/
+├── assets/                 ELF3 机器人资产
+├── tasks/tracking/
+│   ├── config/elf3/        ELF3 平地/攀爬环境与 PPO 配置
+│   └── mdp/                观测、奖励、事件、终止和动作采样逻辑
+└── utils/                  ONNX 导出等工具
+scripts/rsl_rl/             训练、播放和确定性评估入口
+data/processed_motions/     处理后的 NPZ 动作
+logs/rsl_rl/                训练日志与 checkpoint
+tests/                      自动化测试
+```
+
+运行基础测试：
+
+```bash
+python -m pytest -q
+```

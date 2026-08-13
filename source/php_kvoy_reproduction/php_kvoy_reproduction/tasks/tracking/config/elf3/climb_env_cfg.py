@@ -119,6 +119,11 @@ ELF3_CLIMB_END_EFFECTOR_NAMES = [
     "r_wrist_z_link",
 ]
 
+# During the final platform-contact window, ankle position/orientation
+# tracking is deliberately softened.  The expert still controls the dynamic
+# climb; physical platform contact controls the final foot placement.
+ELF3_CLIMB_TERMINAL_FOOT_TRACKING_WEIGHT = 0.15
+
 
 # Preserve the source motion's task-critical x edges while raising the top to
 # 0.65 m. The 0.80 m width covers the union of the original non-mirrored and
@@ -128,11 +133,10 @@ ELF3_CLIMB_PLATFORM_CENTER = (-0.95, 0.0, 0.325)
 ELF3_CLIMB_PLATFORM_LENGTH_RANGE = (0.41, 0.51)
 ELF3_CLIMB_PLATFORM_WIDTH_RANGE = (0.80, 1.50)
 ELF3_CLIMB_PLATFORM_HEIGHT_RANGE = (0.60, 0.70)
-# Mixed-training default: half the environments preserve the exact reference
-# geometry and support adaptive random-phase resets; half carry geometry
-# randomization and always reset from frame zero.  Set this to 1.0 for a
-# nominal-geometry warm-up run, then resume with 0.5 for mixed fine-tuning.
-ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION = 0.5
+# All environments use the configured full geometry ranges.  This keeps the
+# height distribution at 0.60--0.70 m from the beginning; the yaw/xy pose
+# ranges remain controlled separately by the performance-gated curriculum.
+ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION = 0.0
 ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE = (-0.05, 0.05)
 ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE = (-0.05, 0.05)
 ELF3_CLIMB_PLATFORM_YAW_RANGE = (-math.pi / 4.0, math.pi / 4.0)
@@ -486,14 +490,48 @@ class ELF3ClimbRewardsCfg:
         params={"command_name": "motion", "std": 0.4},
     )
     motion_body_pos = RewTerm(
-        func=mdp.motion_relative_body_position_error_exp,
+        func=mdp.climb_motion_relative_body_position_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 0.3},
+        params={
+            "command_name": "motion",
+            "std": 0.3,
+            "body_names": ELF3_CLIMB_TRACKED_BODY_NAMES,
+            "terminal_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "terminal_body_weight": ELF3_CLIMB_TERMINAL_FOOT_TRACKING_WEIGHT,
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["l_ankle_x_link", "r_ankle_x_link"]
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+        },
     )
     motion_body_ori = RewTerm(
-        func=mdp.motion_relative_body_orientation_error_exp,
+        func=mdp.climb_motion_relative_body_orientation_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 0.4},
+        params={
+            "command_name": "motion",
+            "std": 0.4,
+            "body_names": ELF3_CLIMB_TRACKED_BODY_NAMES,
+            "terminal_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "terminal_body_weight": ELF3_CLIMB_TERMINAL_FOOT_TRACKING_WEIGHT,
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["l_ankle_x_link", "r_ankle_x_link"]
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+        },
     )
     motion_body_lin_vel = RewTerm(
         func=mdp.motion_global_body_linear_velocity_error_exp,
@@ -526,7 +564,7 @@ class ELF3ClimbRewardsCfg:
     )
     final_standing_stability = RewTerm(
         func=mdp.final_standing_stability,
-        weight=10.0,
+        weight=12.0,
         params={
             "command_name": "motion",
             "platform_cfg": SceneEntityCfg("platform"),
@@ -546,17 +584,6 @@ class ELF3ClimbRewardsCfg:
             "joint_speed_std": ELF3_CLIMB_JOINT_SPEED_REWARD_STD,
             "torso_tilt_std": ELF3_CLIMB_TORSO_TILT_REWARD_STD,
             "stability_weights": ELF3_CLIMB_STABILITY_REWARD_WEIGHTS,
-        },
-    )
-    final_default_joint_pose = RewTerm(
-        func=mdp.final_default_joint_position_error_exp,
-        # Retain the term for future experiments, but do not pull the expert's
-        # valid stationary final pose toward an unrelated articulation default.
-        weight=0.0,
-        params={
-            "command_name": "motion",
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
-            "std": ELF3_CLIMB_FINAL_DEFAULT_POSE_REWARD_STD,
         },
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0e-1)

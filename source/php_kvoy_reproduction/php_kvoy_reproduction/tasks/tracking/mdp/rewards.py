@@ -44,6 +44,134 @@ def motion_relative_body_position_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
+def _terminal_platform_contact_gate(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+) -> torch.Tensor:
+    """Return a smooth gate that requires both feet to contact the platform."""
+
+    per_foot_scores = _platform_foot_contact_scores(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+    # The minimum prevents one well-supported foot from masking a missing or
+    # poorly supported second foot.
+    return per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
+
+
+def _terminal_weighted_body_error_exp(
+    error: torch.Tensor,
+    body_indexes: list[int],
+    terminal_body_indexes: list[int],
+    terminal_body_weight: float,
+    terminal_gate: torch.Tensor,
+    std: float,
+) -> torch.Tensor:
+    """Fade selected body tracking after the final two-foot contact gate."""
+
+    if not 0.0 <= terminal_body_weight <= 1.0:
+        raise ValueError(f"terminal_body_weight must be in [0, 1], got {terminal_body_weight}.")
+    if std <= 0.0:
+        raise ValueError(f"std must be positive, got {std}.")
+    terminal_set = set(terminal_body_indexes)
+    terminal_mask = torch.tensor(
+        [index in terminal_set for index in body_indexes], dtype=error.dtype, device=error.device
+    )
+    weights = 1.0 - (1.0 - terminal_body_weight) * terminal_gate[:, None] * terminal_mask[None, :]
+    # Keep the original body-count normalization. This genuinely weakens the
+    # ankle objective instead of renormalizing the remaining body terms.
+    return torch.exp(-(error * weights).mean(dim=-1) / std**2)
+
+
+def _climb_terminal_gate(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    terminal_window_time_s: float,
+) -> torch.Tensor:
+    """Fade terminal objectives in only near the clip end after contact."""
+
+    return _final_phase_gate(command, terminal_window_time_s, env.step_dt) * _terminal_platform_contact_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+
+
+def climb_motion_relative_body_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str],
+    terminal_body_names: list[str],
+    terminal_body_weight: float,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    terminal_window_time_s: float,
+) -> torch.Tensor:
+    """Track climb body positions while fading ankle tracking at the end."""
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    terminal_body_indexes = _get_body_indexes(command, terminal_body_names)
+    error = torch.sum(
+        torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]),
+        dim=-1,
+    )
+    terminal_gate = _climb_terminal_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        terminal_window_time_s,
+    )
+    return _terminal_weighted_body_error_exp(
+        error, body_indexes, terminal_body_indexes, terminal_body_weight, terminal_gate, std
+    )
+
+
 def motion_relative_body_orientation_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
@@ -54,6 +182,49 @@ def motion_relative_body_orientation_error_exp(
         ** 2
     )
     return torch.exp(-error.mean(-1) / std**2)
+
+
+def climb_motion_relative_body_orientation_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str],
+    terminal_body_names: list[str],
+    terminal_body_weight: float,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    terminal_window_time_s: float,
+) -> torch.Tensor:
+    """Track climb body orientations while fading ankle tracking at the end."""
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    terminal_body_indexes = _get_body_indexes(command, terminal_body_names)
+    error = quat_error_magnitude(
+        command.body_quat_relative_w[:, body_indexes], command.robot_body_quat_w[:, body_indexes]
+    ) ** 2
+    terminal_gate = _climb_terminal_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        terminal_window_time_s,
+    )
+    return _terminal_weighted_body_error_exp(
+        error, body_indexes, terminal_body_indexes, terminal_body_weight, terminal_gate, std
+    )
 
 
 def motion_global_body_linear_velocity_error_exp(
@@ -107,6 +278,46 @@ def final_default_joint_position_error_exp(
 
     # Scaling by progress confines this optional objective to the extra hold.
     return hold_progress * torch.exp(-mean_squared_error / std**2)
+
+
+def climb_final_default_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    std: float,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+) -> torch.Tensor:
+    """Apply a small default-pose regularizer only during contacted hold."""
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if command.motion_end_hold_steps <= 0:
+        return torch.zeros(env.num_envs, device=env.device)
+    asset = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+    target_joint_pos = asset.data.default_joint_pos[:, joint_ids]
+    robot_joint_pos = asset.data.joint_pos[:, joint_ids]
+    contact_gate = _terminal_platform_contact_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+    hold_progress = command.final_hold_progress.to(dtype=robot_joint_pos.dtype)
+    mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
+    return hold_progress * contact_gate * torch.exp(-mean_squared_error / std**2)
 
 
 def _final_phase_gate(command: MotionCommand, window_time_s: float, step_dt: float) -> torch.Tensor:
