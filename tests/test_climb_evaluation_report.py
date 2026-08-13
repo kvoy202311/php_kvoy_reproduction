@@ -120,6 +120,7 @@ class ClimbEvaluationReportTest(unittest.TestCase):
         conditions: tuple[bool, bool, bool],
         default_rms: float = 0.0,
         stable_time: float = 0.0,
+        terminal_diagnostics: dict[str, float] | None = None,
     ) -> dict:
         return {
             "env_id": env_id,
@@ -128,6 +129,7 @@ class ClimbEvaluationReportTest(unittest.TestCase):
             "standing_condition_pass": dict(zip(self.conditions, conditions, strict=True)),
             "default_joint_pos_rms": default_rms,
             "stable_time_s": stable_time,
+            "terminal_diagnostics": terminal_diagnostics or {},
         }
 
     def _build(self):
@@ -200,6 +202,57 @@ class ClimbEvaluationReportTest(unittest.TestCase):
             self.assertEqual([row["motion_file"] for row in rows], ["a.npz", "b.npz"])
             self.assertEqual(rows[0]["standing_condition_failure__feet_inside"], "1")
             self.assertEqual(rows[1]["completed_motion_ends"], "0")
+
+    def test_reports_speed_percentiles_and_nominal_randomized_groups(self):
+        diagnostic_a = {
+            "max_joint_speed": 0.6,
+            "joint_speed_rms": 0.2,
+            "root_angular_speed": 0.4,
+            "nominal_geometry": 1.0,
+        }
+        diagnostic_b = {
+            "max_joint_speed": 1.8,
+            "joint_speed_rms": 0.7,
+            "root_angular_speed": 0.9,
+            "nominal_geometry": 0.0,
+        }
+        trials = [
+            self._trial(
+                0,
+                0,
+                reporting.OUTCOME_SUCCESS,
+                (True, True, True),
+                terminal_diagnostics=diagnostic_a,
+            ),
+            self._trial(
+                2,
+                0,
+                reporting.OUTCOME_STANDING_FAILURE,
+                (True, True, False),
+                terminal_diagnostics=diagnostic_b,
+            ),
+            self._trial(1, 1, reporting.OUTCOME_TRACKING_FAILURE, (False, False, False)),
+            self._trial(3, 1, reporting.OUTCOME_TRACKING_FAILURE, (False, False, False)),
+        ]
+        report = reporting.build_climb_evaluation_report(
+            task="task",
+            checkpoint=Path("model.pt"),
+            motion_dir=Path("motions"),
+            motion_files=self.motion_files,
+            trials_per_motion=2,
+            randomized_obstacles=True,
+            seed=1,
+            min_success_rate=0.5,
+            required_stable_time_s=0.25,
+            condition_names=self.conditions,
+            trials=trials,
+        )
+
+        diagnostic = report["motions"][0]["terminal_diagnostics"]
+        self.assertEqual(diagnostic["speed_and_contact_percentiles"]["max_joint_speed"]["p50"], 0.6)
+        self.assertEqual(diagnostic["speed_and_contact_percentiles"]["max_joint_speed"]["p95"], 1.8)
+        self.assertEqual(diagnostic["geometry_groups"]["nominal"]["completed_motion_ends"], 1)
+        self.assertEqual(diagnostic["geometry_groups"]["randomized"]["max_joint_speed"]["p50"], 1.8)
 
     def test_rejects_missing_or_duplicate_terminal_snapshots(self):
         with self.assertRaisesRegex(ValueError, "Expected 4 terminal snapshots"):

@@ -171,10 +171,9 @@ ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
 ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
-# Keep this auxiliary term materially below the main tracking terms. Its
-# bounded potential change provides direction, while expert tracking remains
-# the dominant objective for the climb trajectory.
-ELF3_CLIMB_PROGRESS_REWARD_WEIGHT = 0.8
+# Bounded, non-repeatable physical progress shaping requested for the climb.
+# Expert tracking remains active throughout the dynamic trajectory.
+ELF3_CLIMB_PROGRESS_REWARD_WEIGHT = 3.2
 ELF3_CLIMB_PROGRESS_APPROACH_DISTANCE = 0.45
 ELF3_CLIMB_PROGRESS_APPROACH_LATERAL_MARGIN = 0.15
 ELF3_CLIMB_PROGRESS_SUPPORT_XY_MARGIN = 0.12
@@ -196,6 +195,17 @@ ELF3_CLIMB_TORSO_TILT_REWARD_STD = 0.35
 # The weighted average keeps a temporarily poor individual signal from
 # collapsing the complete settling reward to zero.
 ELF3_CLIMB_STABILITY_REWARD_WEIGHTS = (0.20, 0.35, 0.35, 0.10)
+# A separate terminal settling signal addresses the strict all-joint speed
+# success condition. Its maximum weight is close to the 4.2 effective joint-
+# speed share of final_standing_stability (12.0 * 0.35), while remaining gated
+# by a stationary expert target and sustained two-foot platform support.
+ELF3_CLIMB_FINAL_JOINT_SETTLING_REWARD_WEIGHT = 4.0
+ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
+ELF3_CLIMB_SETTLING_RMS_SPEED_SCALE = 1.0
+ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE = 2.0
+ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE = 0.5
+# Ordered as RMS broad, maximum-speed broad, maximum-speed fine.
+ELF3_CLIMB_SETTLING_SCORE_WEIGHTS = (0.40, 0.30, 0.30)
 ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR = 0.15
 ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED = 0.15
 ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
@@ -610,6 +620,29 @@ class ELF3ClimbRewardsCfg:
             "joint_speed_std": ELF3_CLIMB_JOINT_SPEED_REWARD_STD,
             "torso_tilt_std": ELF3_CLIMB_TORSO_TILT_REWARD_STD,
             "stability_weights": ELF3_CLIMB_STABILITY_REWARD_WEIGHTS,
+        },
+    )
+    final_joint_settling = RewTerm(
+        func=mdp.final_joint_settling,
+        weight=ELF3_CLIMB_FINAL_JOINT_SETTLING_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "rms_speed_scale": ELF3_CLIMB_SETTLING_RMS_SPEED_SCALE,
+            "max_speed_scale": ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE,
+            "fine_max_speed_scale": ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE,
+            "score_weights": ELF3_CLIMB_SETTLING_SCORE_WEIGHTS,
         },
     )
     climb_platform_progress = RewTerm(

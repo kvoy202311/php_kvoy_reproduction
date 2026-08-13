@@ -146,6 +146,20 @@ def _summary(values: Sequence[float], *, include_min: bool) -> dict[str, float |
     return result
 
 
+def _percentile_summary(values: Sequence[float]) -> dict[str, float | None]:
+    """Return deterministic nearest-rank-style P50/P90/P95 summaries."""
+
+    finite_values = sorted(_finite_values(values))
+    if not finite_values:
+        return {"p50": None, "p90": None, "p95": None}
+
+    def percentile(fraction: float) -> float:
+        index = round(fraction * (len(finite_values) - 1))
+        return finite_values[index]
+
+    return {"p50": percentile(0.50), "p90": percentile(0.90), "p95": percentile(0.95)}
+
+
 def build_climb_evaluation_report(
     *,
     task: str,
@@ -239,6 +253,42 @@ def build_climb_evaluation_report(
         ]
         default_rms = [float(trial["default_joint_pos_rms"]) for trial in completed_trials]
         stable_times = [float(trial["stable_time_s"]) for trial in completed_trials]
+        diagnostic_names = tuple(
+            sorted(
+                set().union(
+                    *(set(trial.get("terminal_diagnostics", {})) for trial in completed_trials)
+                )
+            )
+        )
+        for trial in completed_trials:
+            if set(trial.get("terminal_diagnostics", {})) != set(diagnostic_names):
+                raise ValueError("Completed trials must expose identical terminal diagnostic fields.")
+        speed_diagnostics = {
+            name: _percentile_summary(
+                [float(trial["terminal_diagnostics"][name]) for trial in completed_trials]
+            )
+            for name in diagnostic_names
+        }
+        geometry_groups: dict[str, dict[str, Any]] = {}
+        if "nominal_geometry" in diagnostic_names:
+            for group_name, is_nominal in (("nominal", True), ("randomized", False)):
+                group_trials = [
+                    trial
+                    for trial in completed_trials
+                    if (float(trial["terminal_diagnostics"]["nominal_geometry"]) >= 0.5) == is_nominal
+                ]
+                geometry_groups[group_name] = {
+                    "completed_motion_ends": len(group_trials),
+                    "max_joint_speed": _percentile_summary(
+                        [float(trial["terminal_diagnostics"]["max_joint_speed"]) for trial in group_trials]
+                    ),
+                    "joint_speed_rms": _percentile_summary(
+                        [float(trial["terminal_diagnostics"]["joint_speed_rms"]) for trial in group_trials]
+                    ),
+                    "root_angular_speed": _percentile_summary(
+                        [float(trial["terminal_diagnostics"]["root_angular_speed"]) for trial in group_trials]
+                    ),
+                }
 
         successes = counts[OUTCOME_SUCCESS]
         success_rate = successes / trials_per_motion
@@ -259,6 +309,8 @@ def build_climb_evaluation_report(
                     "completed_motion_ends": len(completed_trials),
                     "default_joint_pos_rms": _summary(default_rms, include_min=False),
                     "stable_time_s": _summary(stable_times, include_min=True),
+                    "speed_and_contact_percentiles": speed_diagnostics,
+                    "geometry_groups": geometry_groups,
                     "required_stable_time_s": float(required_stable_time_s),
                 },
                 "accepted": success_rate >= min_success_rate,

@@ -190,13 +190,47 @@ class motion_end_success(ManagerTermBase):
     """
 
     _METRIC_PREFIX = "final_standing_"
+    _JOINT_GROUP_TOKENS = {
+        "arm": ("shoulder", "elbow", "wrist"),
+        "waist": ("waist",),
+        "leg": ("hip", "knee", "ankle"),
+    }
+    _WRIST_BODY_NAMES = ("l_wrist_z_link", "r_wrist_z_link")
 
     def __init__(self, cfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         self._stable_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self._longest_stable_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self._required_stable_steps = max(1, math.ceil(float(cfg.params["min_stable_time"]) / env.step_dt - 1.0e-9))
 
         command: MotionCommand = env.command_manager.get_term(cfg.params["command_name"])
+        self._joint_group_ids = {
+            group_name: torch.tensor(
+                [
+                    joint_id
+                    for joint_id, joint_name in enumerate(command.robot.joint_names)
+                    if any(token in joint_name for token in name_tokens)
+                ],
+                dtype=torch.long,
+                device=env.device,
+            )
+            for group_name, name_tokens in self._JOINT_GROUP_TOKENS.items()
+        }
+        empty_groups = [name for name, ids in self._joint_group_ids.items() if ids.numel() == 0]
+        if empty_groups:
+            raise RuntimeError(f"No robot joints found for diagnostic groups: {empty_groups}.")
+
+        contact_sensor: ContactSensor = env.scene.sensors[cfg.params["contact_sensor_cfg"].name]
+        wrist_body_ids, wrist_body_names = contact_sensor.find_bodies(
+            list(self._WRIST_BODY_NAMES), preserve_order=True
+        )
+        if tuple(wrist_body_names) != self._WRIST_BODY_NAMES:
+            raise RuntimeError(
+                "The contact sensor must expose wrist bodies in the requested order; "
+                f"expected {self._WRIST_BODY_NAMES}, got {tuple(wrist_body_names)}."
+            )
+        self._wrist_contact_body_ids = wrist_body_ids
+
         metric_names = (
             "feet_inside",
             "foot_height_valid",
@@ -206,8 +240,25 @@ class motion_end_success(ManagerTermBase):
             "root_linear_speed_valid",
             "root_angular_speed_valid",
             "joint_speed_valid",
+            "final_frame_fraction",
+            "max_joint_speed",
+            "joint_speed_rms",
+            "joints_over_0_5",
+            "joints_over_0_75",
+            "joints_over_1_0",
+            "joints_over_2_0",
+            "root_angular_speed",
+            "arm_max_joint_speed",
+            "waist_max_joint_speed",
+            "leg_max_joint_speed",
+            "left_wrist_contact_force",
+            "right_wrist_contact_force",
+            "left_wrist_contact_time",
+            "right_wrist_contact_time",
             "default_joint_pos_rms",
             "stable_time",
+            "longest_stable_time",
+            "nominal_geometry",
         )
         for name in metric_names:
             command.metrics.setdefault(self._METRIC_PREFIX + name, torch.zeros(env.num_envs, device=env.device))
@@ -216,6 +267,7 @@ class motion_end_success(ManagerTermBase):
         if env_ids is None:
             env_ids = slice(None)
         self._stable_steps[env_ids] = 0
+        self._longest_stable_steps[env_ids] = 0
 
     def __call__(
         self,
@@ -267,6 +319,20 @@ class motion_end_success(ManagerTermBase):
             standing_valid &= value
         valid_final_stand = at_final_frame & standing_valid
         self._stable_steps = torch.where(valid_final_stand, self._stable_steps + 1, 0)
+        self._longest_stable_steps = torch.maximum(self._longest_stable_steps, self._stable_steps)
+
+        absolute_joint_speed = torch.abs(command.robot_joint_vel)
+        max_joint_speed_value = torch.max(absolute_joint_speed, dim=1).values
+        joint_speed_rms = torch.sqrt(torch.mean(torch.square(command.robot_joint_vel), dim=1))
+        root_angular_speed = torch.linalg.vector_norm(command.robot_anchor_ang_vel_w, dim=1)
+
+        contact_sensor: ContactSensor = env.scene.sensors[contact_sensor_cfg.name]
+        if contact_sensor.data.net_forces_w is None or contact_sensor.data.current_contact_time is None:
+            raise RuntimeError("The climb contact sensor must provide net forces and current contact time.")
+        wrist_contact_forces = torch.linalg.vector_norm(
+            contact_sensor.data.net_forces_w[:, self._wrist_contact_body_ids], dim=-1
+        )
+        wrist_contact_times = contact_sensor.data.current_contact_time[:, self._wrist_contact_body_ids]
 
         for name, value in conditions.items():
             command.metrics[self._METRIC_PREFIX + name].copy_((at_final_frame & value).float())
@@ -274,6 +340,44 @@ class motion_end_success(ManagerTermBase):
             torch.where(at_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
         )
         command.metrics[self._METRIC_PREFIX + "stable_time"].copy_(self._stable_steps.float() * env.step_dt)
+        final_float = at_final_frame.to(dtype=max_joint_speed_value.dtype)
+        command.metrics[self._METRIC_PREFIX + "final_frame_fraction"].copy_(final_float)
+        command.metrics[self._METRIC_PREFIX + "max_joint_speed"].copy_(final_float * max_joint_speed_value)
+        command.metrics[self._METRIC_PREFIX + "joint_speed_rms"].copy_(final_float * joint_speed_rms)
+        for threshold_name, threshold in (
+            ("0_5", 0.5),
+            ("0_75", 0.75),
+            ("1_0", 1.0),
+            ("2_0", 2.0),
+        ):
+            joints_over_threshold = torch.count_nonzero(absolute_joint_speed > threshold, dim=1)
+            command.metrics[self._METRIC_PREFIX + f"joints_over_{threshold_name}"].copy_(
+                final_float * joints_over_threshold.to(dtype=final_float.dtype)
+            )
+        command.metrics[self._METRIC_PREFIX + "root_angular_speed"].copy_(
+            final_float * root_angular_speed
+        )
+        for group_name, joint_ids in self._joint_group_ids.items():
+            group_max_speed = torch.max(absolute_joint_speed[:, joint_ids], dim=1).values
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_max_joint_speed"].copy_(
+                final_float * group_max_speed
+            )
+        for wrist_index, side in enumerate(("left", "right")):
+            command.metrics[self._METRIC_PREFIX + f"{side}_wrist_contact_force"].copy_(
+                final_float * wrist_contact_forces[:, wrist_index]
+            )
+            command.metrics[self._METRIC_PREFIX + f"{side}_wrist_contact_time"].copy_(
+                final_float * wrist_contact_times[:, wrist_index]
+            )
+        command.metrics[self._METRIC_PREFIX + "longest_stable_time"].copy_(
+            self._longest_stable_steps.float() * env.step_dt
+        )
+        nominal_mask = getattr(env.scene[platform_cfg.name], "_climb_box_nominal_geometry_mask", None)
+        if nominal_mask is None:
+            raise RuntimeError("Platform does not expose the nominal-geometry diagnostic mask.")
+        command.metrics[self._METRIC_PREFIX + "nominal_geometry"].copy_(
+            nominal_mask.to(device=env.device, dtype=max_joint_speed_value.dtype)
+        )
 
         continuously_stable = self._stable_steps >= self._required_stable_steps
         clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)

@@ -11,6 +11,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude
 
 from php_kvoy_reproduction.tasks.tracking.mdp.commands import MotionCommand
+from php_kvoy_reproduction.tasks.tracking.mdp.joint_settling import joint_settling_score
 from php_kvoy_reproduction.tasks.tracking.mdp.obstacle import get_climb_box_sizes, points_inside_oriented_box_xy
 
 if TYPE_CHECKING:
@@ -737,6 +738,73 @@ def final_standing_stability(
         (weight / weight_sum) * score for weight, score in zip(stability_weights, stability_scores, strict=True)
     )
     return gate * contact_score * stability_score
+
+
+def final_joint_settling(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    reference_max_joint_speed: float,
+    rms_speed_scale: float,
+    max_speed_scale: float,
+    fine_max_speed_scale: float,
+    score_weights: tuple[float, float, float],
+) -> torch.Tensor:
+    """Reward real joint settling during the expert's stationary tail.
+
+    The reward is enabled only when the immutable reference has already
+    stopped and both feet have sustained physical support on the platform.
+    It deliberately does not require an upright torso or a particular hand
+    state: those requirements would make the transition circular or assume a
+    hand-support strategy that has not been established by contact evidence.
+    """
+
+    if reference_max_joint_speed < 0.0:
+        raise ValueError(
+            f"reference_max_joint_speed must be non-negative, got {reference_max_joint_speed}."
+        )
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reference_speed = torch.max(torch.abs(command.joint_vel), dim=1).values
+    # The source clips also begin with a short static segment. Requiring the
+    # second half of the clip prevents the settling reward from firing at the
+    # initial stand before the climb has started.
+    motion_starts = command.motion.motion_start_idx[command.motion_ids]
+    motion_lengths = command.motion.motion_lengths[command.motion_ids]
+    local_time_steps = command.time_steps - motion_starts
+    in_terminal_half = 2 * local_time_steps >= motion_lengths - 1
+    # During the additional hold ``time_steps`` remains clamped to the final
+    # frame, so this gate naturally stays active without creating a new target.
+    reference_stopped = (reference_speed <= reference_max_joint_speed) & in_terminal_half
+    per_foot_scores = _platform_foot_contact_scores(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+    # The minimum prevents one planted foot from opening the settling reward
+    # while the other foot is unsupported or still moving onto the platform.
+    two_foot_support = per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
+    settling_score = joint_settling_score(
+        command.robot_joint_vel,
+        rms_speed_scale=rms_speed_scale,
+        max_speed_scale=max_speed_scale,
+        fine_max_speed_scale=fine_max_speed_scale,
+        score_weights=score_weights,
+    )
+    return reference_stopped.to(dtype=settling_score.dtype) * two_foot_support * settling_score
 
 
 def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:

@@ -99,7 +99,27 @@ from php_kvoy_reproduction.utils.climb_evaluation_report import (
 )
 
 
-_FINAL_STANDING_DIAGNOSTIC_NAMES = ("default_joint_pos_rms", "stable_time")
+_FINAL_STANDING_DIAGNOSTIC_NAMES = (
+    "final_frame_fraction",
+    "max_joint_speed",
+    "joint_speed_rms",
+    "joints_over_0_5",
+    "joints_over_0_75",
+    "joints_over_1_0",
+    "joints_over_2_0",
+    "root_angular_speed",
+    "arm_max_joint_speed",
+    "waist_max_joint_speed",
+    "leg_max_joint_speed",
+    "left_wrist_contact_force",
+    "right_wrist_contact_force",
+    "left_wrist_contact_time",
+    "right_wrist_contact_time",
+    "default_joint_pos_rms",
+    "stable_time",
+    "longest_stable_time",
+    "nominal_geometry",
+)
 _TERMINAL_TERM_NAMES = ("motion_clip_end", "motion_end_success", "motion_end_failure")
 
 
@@ -159,6 +179,7 @@ def _configure_obstacles(env_cfg: ManagerBasedRLEnvCfg, randomized: bool) -> Non
     env_cfg.events.platform_geometry.params["length_range"] = (length, length)
     env_cfg.events.platform_geometry.params["width_range"] = (width, width)
     env_cfg.events.platform_geometry.params["height_range"] = (height, height)
+    env_cfg.events.platform_geometry.params["nominal_size_fraction"] = 1.0
     env_cfg.events.platform_pose.params["position_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0)}
     env_cfg.events.platform_pose.params["yaw_range"] = (0.0, 0.0)
 
@@ -395,12 +416,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             }
             default_rms = float(recorder.metrics[metric_prefix + "default_joint_pos_rms"][env_id].item())
             stable_time = float(recorder.metrics[metric_prefix + "stable_time"][env_id].item())
+            terminal_diagnostics = {
+                name: float(recorder.metrics[metric_prefix + name][env_id].item())
+                for name in _FINAL_STANDING_DIAGNOSTIC_NAMES
+                if name not in ("default_joint_pos_rms", "stable_time")
+            }
             condition_pass["continuous_stability"] = stable_time + 1.0e-9 >= required_stable_time_s
             # Early tracking failures occur before the final-frame diagnostics
             # become meaningful; encode neutral finite values for strict JSON.
             if outcome != OUTCOME_STANDING_FAILURE and not (motion_end_success and completed_motion_end):
                 default_rms = 0.0
                 stable_time = 0.0
+                terminal_diagnostics = {name: 0.0 for name in terminal_diagnostics}
             trial_records.append(
                 {
                     "env_id": env_id,
@@ -409,6 +436,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
                     "standing_condition_pass": condition_pass,
                     "default_joint_pos_rms": default_rms,
                     "stable_time_s": stable_time,
+                    "terminal_diagnostics": terminal_diagnostics,
                 }
             )
 

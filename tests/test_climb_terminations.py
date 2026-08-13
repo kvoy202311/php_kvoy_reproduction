@@ -125,20 +125,55 @@ class _TerminationManager:
         self.terminated = torch.zeros(num_envs, dtype=torch.bool)
 
 
+class _DiagnosticContactSensor:
+    def __init__(self, num_envs):
+        self.data = SimpleNamespace(
+            net_forces_w=torch.zeros(num_envs, 2, 3),
+            current_contact_time=torch.zeros(num_envs, 2),
+        )
+
+    def find_bodies(self, names, preserve_order=False):
+        assert preserve_order
+        return [0, 1], list(names)
+
+
+class _SuccessScene:
+    def __init__(self, num_envs):
+        self.sensors = {"contact_forces": _DiagnosticContactSensor(num_envs)}
+        self.platform = SimpleNamespace(
+            _climb_box_nominal_geometry_mask=torch.tensor([index == 0 for index in range(num_envs)])
+        )
+
+    def __getitem__(self, name):
+        assert name == "platform"
+        return self.platform
+
+
 def _make_success_term(num_envs=3, step_dt=0.02, min_stable_time=0.05):
     command = SimpleNamespace(
         cfg=SimpleNamespace(terminate_on_motion_end=True),
         metrics={},
         motion=SimpleNamespace(motion_end_idx=torch.tensor([10], dtype=torch.long)),
+        robot=SimpleNamespace(
+            joint_names=["waist_y_joint", "l_hip_y_joint", "l_wrist_z_joint"],
+        ),
+        device="cpu",
+        robot_joint_vel=torch.zeros(num_envs, 3),
+        robot_anchor_ang_vel_w=torch.zeros(num_envs, 3),
         motion_ids=torch.zeros(num_envs, dtype=torch.long),
         time_steps=torch.full((num_envs,), 9, dtype=torch.long),
         motion_finished=torch.ones(num_envs, dtype=torch.bool),
     )
-    params = {"command_name": "motion", "min_stable_time": min_stable_time}
+    params = {
+        "command_name": "motion",
+        "contact_sensor_cfg": _SceneEntityCfg("contact_forces", body_ids=[0, 1]),
+        "min_stable_time": min_stable_time,
+    }
     env = SimpleNamespace(
         num_envs=num_envs,
         device="cpu",
         step_dt=step_dt,
+        scene=_SuccessScene(num_envs),
         command_manager=_CommandManager(command),
         termination_manager=_TerminationManager(num_envs),
     )
@@ -194,6 +229,7 @@ class MotionEndSuccessTest(unittest.TestCase):
             self.assertFalse(torch.any(_call_success_term(term, env)))
             self.assertTrue(torch.all(_call_success_term(term, env)))
         torch.testing.assert_close(term._stable_steps, torch.full((3,), 3, dtype=torch.long))
+        torch.testing.assert_close(term._longest_stable_steps, torch.full((3,), 3, dtype=torch.long))
 
     def test_any_failed_condition_resets_only_that_environment(self):
         condition_names = (
@@ -239,9 +275,11 @@ class MotionEndSuccessTest(unittest.TestCase):
 
         term.reset(torch.tensor([0, 2]))
         torch.testing.assert_close(term._stable_steps, torch.tensor([0, 2, 0]))
+        torch.testing.assert_close(term._longest_stable_steps, torch.tensor([0, 2, 0]))
 
         term.reset()
         torch.testing.assert_close(term._stable_steps, torch.zeros(3, dtype=torch.long))
+        torch.testing.assert_close(term._longest_stable_steps, torch.zeros(3, dtype=torch.long))
 
     def test_not_at_final_frame_cannot_accumulate_stability(self):
         term, env, command = _make_success_term()
@@ -251,6 +289,41 @@ class MotionEndSuccessTest(unittest.TestCase):
             result = _call_success_term(term, env)
         self.assertFalse(torch.any(result))
         torch.testing.assert_close(term._stable_steps, torch.zeros(3, dtype=torch.long))
+
+    def test_speed_and_contact_diagnostics_record_actual_terminal_values(self):
+        term, env, command = _make_success_term()
+        command.robot_joint_vel[:] = torch.tensor(
+            [[0.1, 0.2, 0.3], [0.6, 0.8, 2.1], [0.4, 0.2, 1.1]]
+        )
+        command.robot_anchor_ang_vel_w[:] = torch.tensor([[0.0, 0.0, 0.2], [0.0, 0.6, 0.8], [0.0, 0.0, 0.0]])
+        sensor = env.scene.sensors["contact_forces"]
+        sensor.data.net_forces_w[:, :, 2] = torch.tensor([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        sensor.data.current_contact_time[:] = torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            _call_success_term(term, env)
+
+        metrics = command.metrics
+        torch.testing.assert_close(metrics["final_standing_final_frame_fraction"], torch.ones(3))
+        torch.testing.assert_close(metrics["final_standing_max_joint_speed"], torch.tensor([0.3, 2.1, 1.1]))
+        torch.testing.assert_close(
+            metrics["final_standing_joint_speed_rms"],
+            torch.sqrt(torch.tensor([(0.01 + 0.04 + 0.09) / 3, (0.36 + 0.64 + 4.41) / 3, (0.16 + 0.04 + 1.21) / 3])),
+        )
+        torch.testing.assert_close(metrics["final_standing_joints_over_0_5"], torch.tensor([0.0, 3.0, 1.0]))
+        torch.testing.assert_close(metrics["final_standing_joints_over_0_75"], torch.tensor([0.0, 2.0, 1.0]))
+        torch.testing.assert_close(metrics["final_standing_joints_over_1_0"], torch.tensor([0.0, 1.0, 1.0]))
+        torch.testing.assert_close(metrics["final_standing_joints_over_2_0"], torch.tensor([0.0, 1.0, 0.0]))
+        torch.testing.assert_close(metrics["final_standing_root_angular_speed"], torch.tensor([0.2, 1.0, 0.0]))
+        torch.testing.assert_close(metrics["final_standing_arm_max_joint_speed"], torch.tensor([0.3, 2.1, 1.1]))
+        torch.testing.assert_close(metrics["final_standing_waist_max_joint_speed"], torch.tensor([0.1, 0.6, 0.4]))
+        torch.testing.assert_close(metrics["final_standing_leg_max_joint_speed"], torch.tensor([0.2, 0.8, 0.2]))
+        torch.testing.assert_close(metrics["final_standing_left_wrist_contact_force"], torch.tensor([5.0, 7.0, 9.0]))
+        torch.testing.assert_close(metrics["final_standing_right_wrist_contact_force"], torch.tensor([6.0, 8.0, 10.0]))
+        torch.testing.assert_close(metrics["final_standing_left_wrist_contact_time"], torch.tensor([0.1, 0.3, 0.5]))
+        torch.testing.assert_close(metrics["final_standing_right_wrist_contact_time"], torch.tensor([0.2, 0.4, 0.6]))
+        torch.testing.assert_close(metrics["final_standing_nominal_geometry"], torch.tensor([1.0, 0.0, 0.0]))
+        torch.testing.assert_close(metrics["final_standing_longest_stable_time"], torch.full((3,), 0.02))
 
 
 class ClimbStandingConditionsTest(unittest.TestCase):
