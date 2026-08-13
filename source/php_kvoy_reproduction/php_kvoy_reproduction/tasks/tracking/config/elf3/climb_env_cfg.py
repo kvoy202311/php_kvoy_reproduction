@@ -119,6 +119,16 @@ ELF3_CLIMB_END_EFFECTOR_NAMES = [
     "r_wrist_z_link",
 ]
 
+# Bodies allowed to provide physical support for the conservative progress
+# hint.  Contact and platform geometry still gate the term; this is not a
+# substitute for the expert motion target.
+ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES = [
+    "l_ankle_x_link",
+    "r_ankle_x_link",
+    "l_wrist_z_link",
+    "r_wrist_z_link",
+]
+
 # During the final platform-contact window, ankle position/orientation
 # tracking is deliberately softened.  The expert still controls the dynamic
 # climb; physical platform contact controls the final foot placement.
@@ -136,7 +146,7 @@ ELF3_CLIMB_PLATFORM_HEIGHT_RANGE = (0.60, 0.70)
 # All environments use the configured full geometry ranges.  This keeps the
 # height distribution at 0.60--0.70 m from the beginning; the yaw/xy pose
 # ranges remain controlled separately by the performance-gated curriculum.
-ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION = 0.0
+ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION = 0.1
 ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE = (-0.05, 0.05)
 ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE = (-0.05, 0.05)
 ELF3_CLIMB_PLATFORM_YAW_RANGE = (-math.pi / 4.0, math.pi / 4.0)
@@ -161,6 +171,22 @@ ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
 ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
+# Keep this auxiliary term materially below the main tracking terms. Its
+# bounded potential change provides direction, while expert tracking remains
+# the dominant objective for the climb trajectory.
+ELF3_CLIMB_PROGRESS_REWARD_WEIGHT = 0.8
+ELF3_CLIMB_PROGRESS_APPROACH_DISTANCE = 0.45
+ELF3_CLIMB_PROGRESS_APPROACH_LATERAL_MARGIN = 0.15
+ELF3_CLIMB_PROGRESS_SUPPORT_XY_MARGIN = 0.12
+ELF3_CLIMB_PROGRESS_SUPPORT_HEIGHT_STD = 0.12
+ELF3_CLIMB_PROGRESS_LIFT_HEIGHT_WINDOW = 0.25
+ELF3_CLIMB_PROGRESS_APPROACH_SIDE = -1.0
+ELF3_CLIMB_PROGRESS_APPROACH_PHASE_END = 0.70
+ELF3_CLIMB_PROGRESS_LIFT_PHASE_START = 0.30
+ELF3_CLIMB_PROGRESS_LIFT_PHASE_END = 0.75
+ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT = 0.65
+ELF3_CLIMB_PROGRESS_LIFT_WEIGHT = 0.35
+ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
 ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD = 0.08
 ELF3_CLIMB_ROOT_LINEAR_SPEED_REWARD_STD = 0.15
 ELF3_CLIMB_ROOT_ANGULAR_SPEED_REWARD_STD = 0.5
@@ -586,6 +612,34 @@ class ELF3ClimbRewardsCfg:
             "stability_weights": ELF3_CLIMB_STABILITY_REWARD_WEIGHTS,
         },
     )
+    climb_platform_progress = RewTerm(
+        func=mdp.climb_platform_progress,
+        weight=ELF3_CLIMB_PROGRESS_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "support_body_names": ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES,
+            "lift_body_names": ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES,
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES, preserve_order=True
+            ),
+            "approach_distance": ELF3_CLIMB_PROGRESS_APPROACH_DISTANCE,
+            "approach_lateral_margin": ELF3_CLIMB_PROGRESS_APPROACH_LATERAL_MARGIN,
+            "support_xy_margin": ELF3_CLIMB_PROGRESS_SUPPORT_XY_MARGIN,
+            "support_height_std": ELF3_CLIMB_PROGRESS_SUPPORT_HEIGHT_STD,
+            "lift_height_window": ELF3_CLIMB_PROGRESS_LIFT_HEIGHT_WINDOW,
+            "approach_side": ELF3_CLIMB_PROGRESS_APPROACH_SIDE,
+            "approach_phase_end": ELF3_CLIMB_PROGRESS_APPROACH_PHASE_END,
+            "lift_phase_start": ELF3_CLIMB_PROGRESS_LIFT_PHASE_START,
+            "lift_phase_end": ELF3_CLIMB_PROGRESS_LIFT_PHASE_END,
+            "approach_weight": ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT,
+            "lift_weight": ELF3_CLIMB_PROGRESS_LIFT_WEIGHT,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "max_delta_per_step": ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP,
+        },
+    )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0e-1)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
@@ -622,7 +676,7 @@ class ELF3ClimbTerminationsCfg:
         func=mdp.bad_motion_body_pos_z_only,
         params={
             "command_name": "motion",
-            "threshold": 0.25,
+            "threshold": 0.30,
             "body_names": ELF3_CLIMB_END_EFFECTOR_NAMES,
         },
     )

@@ -21,6 +21,7 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from .climb_progress import bounded_episode_progress_increment
 from .motion_data import (
     MultiMotionAdaptiveSampler,
     adaptive_failure_mask,
@@ -115,6 +116,13 @@ class MotionCommand(CommandTerm):
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self._has_sampled_motion = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Stateful buffers used by the bounded climb-progress shaping term.
+        # Each maximum records the best physical progress reached in the
+        # episode. Contact loss/recovery therefore cannot repeatedly reward
+        # the same progress.
+        self._climb_progress_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._climb_approach_max_potential = torch.zeros(self.num_envs, device=self.device)
+        self._climb_lift_max_potential = torch.zeros(self.num_envs, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
@@ -148,6 +156,55 @@ class MotionCommand(CommandTerm):
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        """Reset command state, including the climb-progress potential baseline."""
+
+        extras = super().reset(env_ids)
+        if env_ids is None:
+            env_ids = slice(None)
+        self._climb_progress_initialized[env_ids] = False
+        self._climb_approach_max_potential[env_ids] = 0.0
+        self._climb_lift_max_potential[env_ids] = 0.0
+        return extras
+
+    def climb_progress_deltas(
+        self,
+        approach_potential: torch.Tensor,
+        lift_potential: torch.Tensor,
+        max_delta_per_step: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return reset-safe, non-repeatable progress increments.
+
+        The first sample after reset establishes the episode baseline and has
+        zero shaping reward. Thereafter only a new episode maximum can create
+        reward. Backing away or losing contact cannot reset the maximum or farm
+        repeated reward.
+        """
+
+        expected_shape = (self.num_envs,)
+        if approach_potential.shape != expected_shape or lift_potential.shape != expected_shape:
+            raise ValueError(
+                "climb progress potentials must have shape "
+                f"{expected_shape}, got {approach_potential.shape} and {lift_potential.shape}."
+            )
+
+        approach_delta, approach_max = bounded_episode_progress_increment(
+            approach_potential,
+            self._climb_progress_initialized,
+            self._climb_approach_max_potential,
+            max_delta_per_step,
+        )
+        lift_delta, lift_max = bounded_episode_progress_increment(
+            lift_potential,
+            self._climb_progress_initialized,
+            self._climb_lift_max_potential,
+            max_delta_per_step,
+        )
+        self._climb_approach_max_potential.copy_(approach_max)
+        self._climb_lift_max_potential.copy_(lift_max)
+        self._climb_progress_initialized.fill_(True)
+        return approach_delta, lift_delta
 
     @property
     def source_joint_pos(self) -> torch.Tensor:

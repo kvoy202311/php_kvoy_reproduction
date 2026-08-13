@@ -249,6 +249,228 @@ def motion_global_body_angular_velocity_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
+def _smoothstep_window(value: torch.Tensor, start: float, end: float) -> torch.Tensor:
+    """Smooth cubic gate which is zero before ``start`` and one after ``end``."""
+
+    if not 0.0 <= start < end <= 1.0:
+        raise ValueError(f"phase window must satisfy 0 <= start < end <= 1, got {(start, end)}.")
+    x = ((value - start) / (end - start)).clamp(min=0.0, max=1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _motion_phase(command: MotionCommand) -> torch.Tensor:
+    """Return normalized local reference phase for every environment."""
+
+    starts = command.motion.motion_start_idx[command.motion_ids]
+    lengths = command.motion.motion_lengths[command.motion_ids].to(dtype=torch.float32)
+    return ((command.time_steps - starts).to(dtype=torch.float32) / (lengths - 1.0).clamp_min(1.0)).clamp(
+        min=0.0, max=1.0
+    )
+
+
+def _platform_local_x(points_w: torch.Tensor, platform: RigidObject) -> torch.Tensor:
+    """Transform world points to the platform's yaw-aligned local x coordinate."""
+
+    w, x, y, z = platform.data.root_quat_w.unbind(dim=-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    delta = points_w - platform.data.root_pos_w[:, None, :]
+    return torch.cos(yaw)[:, None] * delta[..., 0] + torch.sin(yaw)[:, None] * delta[..., 1]
+
+
+def _platform_local_y(points_w: torch.Tensor, platform: RigidObject) -> torch.Tensor:
+    """Transform world points to the platform's yaw-aligned local y coordinate."""
+
+    w, x, y, z = platform.data.root_quat_w.unbind(dim=-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    delta = points_w - platform.data.root_pos_w[:, None, :]
+    return -torch.sin(yaw)[:, None] * delta[..., 0] + torch.cos(yaw)[:, None] * delta[..., 1]
+
+
+def _climb_platform_support_score(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    platform: RigidObject,
+    sizes: torch.Tensor,
+    support_body_names: list[str],
+    contact_sensor_cfg: SceneEntityCfg,
+    support_xy_margin: float,
+    support_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+) -> torch.Tensor:
+    """Smoothly detect a foot/hand physically supported by the platform."""
+
+    if not support_body_names:
+        raise ValueError("support_body_names must contain at least one body name.")
+    if support_xy_margin < 0.0 or support_height_std <= 0.0:
+        raise ValueError("support_xy_margin must be non-negative and support_height_std must be positive.")
+    if min_contact_force <= 0.0 or contact_time_scale <= 0.0:
+        raise ValueError("min_contact_force and contact_time_scale must be positive.")
+    body_ids = torch.tensor(
+        [command.robot.body_names.index(name) for name in support_body_names],
+        dtype=torch.long,
+        device=command.device,
+    )
+    positions = command.robot.data.body_pos_w[:, body_ids]
+    support_sizes = sizes.clone()
+    support_sizes[:, :2] += 2.0 * support_xy_margin
+    inside = points_inside_oriented_box_xy(
+        positions,
+        platform.data.root_pos_w,
+        platform.data.root_quat_w,
+        support_sizes,
+    ).to(dtype=positions.dtype)
+    platform_top = platform.data.root_pos_w[:, None, 2] + 0.5 * sizes[:, None, 2]
+    height_score = torch.exp(-0.5 * torch.square((positions[..., 2] - platform_top) / support_height_std))
+    contact_sensor: ContactSensor = env.scene.sensors[contact_sensor_cfg.name]
+    if contact_sensor_cfg.body_ids is None:
+        raise RuntimeError("The climb progress reward requires resolved contact sensor body_ids.")
+    if contact_sensor.data.net_forces_w is None or contact_sensor.data.current_contact_time is None:
+        raise RuntimeError("The climb progress contact sensor must provide net forces and current contact time.")
+    if len(contact_sensor_cfg.body_ids) != len(support_body_names):
+        raise RuntimeError(
+            "The climb progress contact sensor body selection must match support_body_names: "
+            f"{len(contact_sensor_cfg.body_ids)} != {len(support_body_names)}."
+        )
+    contact_force = torch.linalg.vector_norm(
+        contact_sensor.data.net_forces_w[:, contact_sensor_cfg.body_ids], dim=-1
+    )
+    contact_time = contact_sensor.data.current_contact_time[:, contact_sensor_cfg.body_ids]
+    force_score = 1.0 - torch.exp(-contact_force / min_contact_force)
+    time_score = (contact_time / contact_time_scale).clamp(min=0.0, max=1.0)
+    return (inside * height_score * force_score * time_score).clamp(min=0.0, max=1.0)
+
+
+def climb_platform_progress(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    support_body_names: list[str],
+    lift_body_names: list[str],
+    contact_sensor_cfg: SceneEntityCfg,
+    approach_distance: float = 0.45,
+    approach_lateral_margin: float = 0.15,
+    support_xy_margin: float = 0.12,
+    support_height_std: float = 0.12,
+    lift_height_window: float = 0.25,
+    min_contact_force: float = 10.0,
+    contact_time_scale: float = 0.25,
+    approach_side: float = -1.0,
+    approach_phase_end: float = 0.70,
+    lift_phase_start: float = 0.30,
+    lift_phase_end: float = 0.75,
+    approach_weight: float = 0.65,
+    lift_weight: float = 0.35,
+    max_delta_per_step: float = 0.05,
+) -> torch.Tensor:
+    """Give conservative progress shaping for the physical climb geometry.
+
+    The approach term saturates at the platform's near edge, so it cannot
+    reward driving through the box.  The lift term uses the *sampled* platform
+    top height and is gated by an actual foot/hand support proximity score and
+    a broad expert-motion phase window. Both terms reward only newly reached
+    episode-best progress. Their historical maxima are reset on every
+    episode, so losing and regaining the same contact cannot farm reward. This
+    provides a small directional hint without replacing motion tracking or
+    encouraging a ballistic jump.
+    """
+
+    if approach_distance <= 0.0 or approach_lateral_margin <= 0.0 or lift_height_window <= 0.0:
+        raise ValueError("approach_distance, approach_lateral_margin, and lift_height_window must be positive.")
+    if not lift_body_names:
+        raise ValueError("lift_body_names must contain at least one body name.")
+    if len(lift_body_names) != len(support_body_names):
+        raise ValueError(
+            "lift_body_names and support_body_names must have the same length so each height signal "
+            "can be paired with its own contact gate."
+        )
+    if approach_side not in (-1.0, 1.0):
+        raise ValueError(f"approach_side must be -1.0 or 1.0, got {approach_side}.")
+    if not 0.15 < approach_phase_end <= 1.0:
+        raise ValueError(f"approach_phase_end must lie in (0.15, 1], got {approach_phase_end}.")
+    if not 0.0 <= lift_phase_start < lift_phase_end < 1.0:
+        raise ValueError(
+            f"lift phase window must satisfy 0 <= start < end < 1, got {(lift_phase_start, lift_phase_end)}."
+        )
+    if approach_weight < 0.0 or lift_weight < 0.0 or approach_weight + lift_weight <= 0.0:
+        raise ValueError("approach_weight and lift_weight must be non-negative and not both zero.")
+    if env.step_dt <= 0.0:
+        raise ValueError(f"env.step_dt must be positive, got {env.step_dt}.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    platform: RigidObject = env.scene[platform_cfg.name]
+    sizes = get_climb_box_sizes(platform, base_size=base_size, device=platform.device)
+
+    # Approach: distance to the near edge on the expert's approach side.  The
+    # ELF3 clips approach from negative platform-local x; yaw randomization is
+    # handled by the local-coordinate transform above.  The finite horizon
+    # keeps distant motion from producing a persistent incentive, and the
+    # potential is exactly saturated at the edge (and inside the box).
+    anchor_local_x = _platform_local_x(command.robot_anchor_pos_w[:, None, :], platform).squeeze(1)
+    anchor_local_y = _platform_local_y(command.robot_anchor_pos_w[:, None, :], platform).squeeze(1)
+    edge_local_x = approach_side * 0.5 * sizes[:, 0]
+    distance_to_edge = (approach_side * (anchor_local_x - edge_local_x)).clamp(min=0.0)
+    approach_fraction = 1.0 - (distance_to_edge / approach_distance).clamp(min=0.0, max=1.0)
+    approach_potential = approach_fraction * approach_fraction * (3.0 - 2.0 * approach_fraction)
+    lateral_distance = (anchor_local_y.abs() - 0.5 * sizes[:, 1]).clamp(min=0.0)
+    lateral_fraction = 1.0 - (lateral_distance / approach_lateral_margin).clamp(min=0.0, max=1.0)
+    lateral_gate = lateral_fraction * lateral_fraction * (3.0 - 2.0 * lateral_fraction)
+    approach_potential = approach_potential * lateral_gate
+
+    # Lift: use the highest configured foot, but only after a real support body
+    # is close to the sampled platform top.  The lower bound is below the top;
+    # values above the top are clipped, so jumping higher cannot earn more.
+    lift_ids = torch.tensor(
+        [command.robot.body_names.index(name) for name in lift_body_names],
+        dtype=torch.long,
+        device=command.device,
+    )
+    lift_positions = command.robot.data.body_pos_w[:, lift_ids]
+    platform_top = platform.data.root_pos_w[:, 2] + 0.5 * sizes[:, 2]
+    lift_progress = (
+        (lift_positions[..., 2] - (platform_top[:, None] - lift_height_window)) / lift_height_window
+    ).clamp(min=0.0, max=1.0)
+    support_scores = _climb_platform_support_score(
+        env,
+        command,
+        platform,
+        sizes,
+        support_body_names,
+        contact_sensor_cfg,
+        support_xy_margin,
+        support_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+    # A body can contribute height only when that same body is physically
+    # supported. This prevents one planted foot from rewarding an unsupported
+    # jump of the other foot or a hand.
+    lift_potential = (lift_progress * support_scores).amax(dim=1)
+
+    phase = _motion_phase(command)
+    approach_gate = 1.0 - _smoothstep_window(phase, approach_phase_end - 0.15, approach_phase_end)
+    # Keep the progress hint out of the final standing/hold window.  The gate
+    # ramps in at the beginning of the lift phase, remains active through the
+    # configured end, then fades out smoothly over 0.15 normalized phase.
+    lift_gate_in = _smoothstep_window(phase, lift_phase_start, min(lift_phase_start + 0.15, lift_phase_end))
+    lift_gate_out = 1.0 - _smoothstep_window(phase, lift_phase_end, min(lift_phase_end + 0.15, 1.0))
+    lift_gate = lift_gate_in * lift_gate_out
+    approach_delta, lift_delta = command.climb_progress_deltas(
+        approach_potential,
+        lift_potential,
+        max_delta_per_step,
+    )
+    approach_delta = approach_gate * approach_delta
+    lift_delta = lift_gate * lift_delta
+    normalization = approach_weight + lift_weight
+    # RewardManager multiplies every term by env.step_dt.  Convert the
+    # per-step progress increment back to a rate. Since each historical maximum
+    # only increases from its reset baseline toward at most one, the cumulative
+    # shaping contribution remains bounded even if contact is repeatedly lost.
+    return (approach_weight * approach_delta + lift_weight * lift_delta) / (normalization * env.step_dt)
+
+
 def final_default_joint_position_error_exp(
     env: ManagerBasedRLEnv,
     command_name: str,
