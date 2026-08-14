@@ -49,6 +49,12 @@ parser.add_argument(
     default=False,
     help="Use a world-frame camera so manual viewport movement is not overwritten by asset tracking.",
 )
+parser.add_argument(
+    "--debug_vis",
+    action="store_true",
+    default=False,
+    help="Show current-robot and expert-target tracked-body 3-D coordinate frames during full/fixed-clip playback.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -166,7 +172,9 @@ def _configure_playback(env_cfg: ManagerBasedRLEnvCfg) -> None:
     motion_cfg.pose_range = {key: (0.0, 0.0) for key in motion_cfg.pose_range}
     motion_cfg.velocity_range = {key: (0.0, 0.0) for key in motion_cfg.velocity_range}
     motion_cfg.joint_position_range = (0.0, 0.0)
-    motion_cfg.debug_vis = False
+    # Full/fixed-clip playback is normally kept visually clean.  Opt in to
+    # MotionCommand's marker callback when inspecting current-vs-target poses.
+    motion_cfg.debug_vis = args_cli.debug_vis
 
     # Playback is an inference mode: no episode boundary, early tracking
     # reset, end-of-clip classification, or training curriculum may run.
@@ -191,6 +199,8 @@ def _configure_playback(env_cfg: ManagerBasedRLEnvCfg) -> None:
     mode_label = "one fixed clip" if args_cli.playback_mode == "fixed_clip" else "all clips round-robin"
     print(f"[INFO]: Playback mode: {args_cli.playback_mode} ({mode_label}, frame zero, nominal platform).")
     print("[INFO]: The final NPZ frame will be held indefinitely; all terminations and curricula are disabled.")
+    if args_cli.debug_vis:
+        print("[INFO]: Motion debug visualization enabled: current-robot and expert-target body frames are shown.")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")

@@ -133,17 +133,21 @@ python scripts/rsl_rl/play.py \
   --device cuda:0
 ```
 
-播放模式：`training` 保持训练配置；`full_clip` 从第 0 帧按顺序播放全部动作；`fixed_clip` 从第 0 帧固定播放一个动作。`--free_camera` 使用世界坐标相机，可以在 Isaac Sim 窗口中手动拖动视角：
+播放模式：`training` 保持训练配置；`full_clip` 从第 0 帧按顺序播放全部动作；`fixed_clip` 从第 0 帧固定播放一个动作。`--free_camera` 使用世界坐标相机，可以在 Isaac Sim 窗口中手动拖动视角。
+
+需要核对跟踪姿态时，可在 `full_clip` 或 `fixed_clip` 播放中加入 `--debug_vis`。它显示当前机器人和专家目标的关键 body 三维坐标轴（不是 29 个关节的数值）；建议使用 `--num_envs 1`、配合 `--free_camera`，且不要加 `--headless`：
 
 ```bash
 python scripts/rsl_rl/play.py \
   --task Tracking-Climb-ELF3-v0 \
   --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
-  --playback_mode full_clip \
+  --playback_mode fixed_clip \
+  --motion_id 0 \
   --free_camera \
+  --debug_vis \
   --load_run 2026-08-12_某次运行 \
   --checkpoint model_100000.pt \
-  --num_envs 4 \
+  --num_envs 1 \
   --device cuda:0
 ```
 
@@ -161,6 +165,7 @@ python scripts/rsl_rl/play.py \
 --wandb_path PATH           从 W&B 运行下载模型（可选）
 --num_envs N                播放环境数
 --free_camera               禁止相机跟随机器人，允许手动拖动
+--debug_vis                 显示当前机器人与专家目标关键 body 的三维坐标轴（full/fixed 播放）
 --video                     录制播放视频
 --video_length N            视频长度（步）
 --headless                  无界面播放
