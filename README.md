@@ -1,6 +1,6 @@
 # PHP-Kvoy Reproduction
 
-基于 Isaac Lab 的 ELF3 机器人动作跟踪与攀爬专家策略训练工程。当前主要任务是让一个策略同时学习同一技能的多个 NPZ 动作片段，并在 0.65 m 平台上完成攀爬和最终站立。
+基于 Isaac Lab 的 ELF3 机器人动作跟踪与攀爬专家策略训练工程。当前主要任务是让一个策略同时学习同一技能的多个 NPZ 动作片段，并在 0.60–0.70 m 随机高度的平台上完成攀爬和最终站立。
 
 ## 环境与安装
 
@@ -12,19 +12,33 @@ cd /home/kvoy/Desktop/php_kvoy_reproduction
 python -m pip install -e source/php_kvoy_reproduction
 ```
 
-本地动作数据默认位于：
+推荐使用已修复自然开场姿态的数据：
 
 ```text
-data/processed_motions/elf3/climb_50hz/
+data/processed_motions/elf3/climb_50hz_default_start_v1/
 ```
 
-目录训练会读取其中全部 `.npz` 文件（当前为同一攀爬技能的 4 个动作）。请确认动作数据和 ELF3 资产已经存在；数据文件较大时不会随代码仓库自动获得。
+目录训练会读取其中全部 `.npz` 文件（当前为同一攀爬技能的 4 个动作）。旧的 `climb_50hz/` 数据保持不变，可用于对照。
+
+若上述新目录尚未生成，先在包含 MuJoCo 的 Holosoma 环境中重建原始 WBT 数据，再用 `mimic` 转换为训练格式：
+
+```bash
+conda run -p /home/kvoy/.holosoma_deps/miniconda3/envs/hsretargeting \
+  python scripts/rebuild_elf3_climb_default_start.py \
+  data/motions/elf3/climb_50hz \
+  data/motions/elf3/climb_50hz_default_start_v1 \
+  --holosoma-root /home/kvoy/Desktop/PHP-kvoy/holosoma
+
+conda run -n mimic python scripts/convert_elf3_holosoma2wbt_npz.py \
+  data/motions/elf3/climb_50hz_default_start_v1 \
+  data/processed_motions/elf3/climb_50hz_default_start_v1
+```
 
 ## 任务
 
 | 任务 | 用途 |
 | --- | --- |
-| `Tracking-Climb-ELF3-v0` | 0.65 m 平台攀爬专家训练与评估 |
+| `Tracking-Climb-ELF3-v0` | 0.60–0.70 m 平台攀爬专家训练与评估 |
 | `Tracking-Flat-ELF3-v0` | 平地动作跟踪 |
 
 ## 训练
@@ -34,7 +48,7 @@ data/processed_motions/elf3/climb_50hz/
 ```bash
 python scripts/rsl_rl/train.py \
   --task Tracking-Climb-ELF3-v0 \
-  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
   --num_envs 2048 \
   --max_iterations 100000 \
   --logger tensorboard \
@@ -97,7 +111,7 @@ python scripts/rsl_rl/train.py \
 ```bash
 python scripts/rsl_rl/play.py \
   --task Tracking-Climb-ELF3-v0 \
-  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
   --playback_mode full_clip \
   --load_run 2026-08-12_某次运行 \
   --checkpoint model_100000.pt \
@@ -110,7 +124,7 @@ python scripts/rsl_rl/play.py \
 ```bash
 python scripts/rsl_rl/play.py \
   --task Tracking-Climb-ELF3-v0 \
-  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
   --playback_mode fixed_clip \
   --motion_id 0 \
   --load_run 2026-08-12_某次运行 \
@@ -124,7 +138,7 @@ python scripts/rsl_rl/play.py \
 ```bash
 python scripts/rsl_rl/play.py \
   --task Tracking-Climb-ELF3-v0 \
-  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
   --playback_mode full_clip \
   --free_camera \
   --load_run 2026-08-12_某次运行 \
@@ -159,7 +173,7 @@ python scripts/rsl_rl/play.py \
 ```bash
 python scripts/rsl_rl/evaluate_elf3_climb.py \
   --task Tracking-Climb-ELF3-v0 \
-  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/climb_50hz_default_start_v1 \
   --checkpoint /home/kvoy/Desktop/php_kvoy_reproduction/logs/rsl_rl/elf3_climb/某次运行/model_100000.pt \
   --trials_per_motion 10 \
   --headless \

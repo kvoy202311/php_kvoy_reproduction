@@ -560,6 +560,90 @@ def _final_phase_gate(command: MotionCommand, window_time_s: float, step_dt: flo
     return torch.maximum(progress, command.final_hold_progress.to(dtype=progress.dtype))
 
 
+def _expert_static_tail_gate(
+    command: MotionCommand,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    step_dt: float,
+) -> torch.Tensor:
+    """Return a smooth gate for the stationary tail of the reference clip.
+
+    A reference motion can contain a static pose at its beginning as well as
+    at its end.  The final-window requirement deliberately excludes the
+    initial stand, while the reference-speed check makes the gate robust to a
+    short moving transition inside that window.  During MotionCommand's extra
+    final-frame hold, :func:`_final_phase_gate` remains one.
+    """
+
+    if reference_max_joint_speed < 0.0:
+        raise ValueError(
+            "reference_max_joint_speed must be non-negative, "
+            f"got {reference_max_joint_speed}."
+        )
+    reference_speed = torch.max(torch.abs(command.joint_vel), dim=1).values
+    reference_is_static = reference_speed <= reference_max_joint_speed
+    return _final_phase_gate(command, static_window_time_s, step_dt) * reference_is_static.to(
+        dtype=command.joint_pos.dtype
+    )
+
+
+def final_expert_upper_body_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    std: float,
+) -> torch.Tensor:
+    """Track the stationary expert's waist and arms after two-foot contact.
+
+    This is intentionally a reference-motion objective, not a default-pose
+    regularizer.  The caller selects only the waist and arm joints through
+    ``asset_cfg``; legs remain free to adapt to the randomized platform
+    height through physical contact and the existing stability terms.
+    """
+
+    if std <= 0.0:
+        raise ValueError(f"std must be positive, got {std}.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+    if joint_ids is None or len(joint_ids) == 0:
+        raise RuntimeError("The terminal expert upper-body reward requires resolved non-empty joint_ids.")
+
+    target_joint_pos = command.joint_pos[:, joint_ids]
+    robot_joint_pos = asset.data.joint_pos[:, joint_ids]
+    mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
+    two_foot_contact = _terminal_platform_contact_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+    )
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+    )
+    return static_tail * two_foot_contact * torch.exp(-mean_squared_error / std**2)
+
+
 def _platform_foot_contact_scores(
     env: ManagerBasedRLEnv,
     command: MotionCommand,

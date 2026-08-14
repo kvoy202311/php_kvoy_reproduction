@@ -171,6 +171,33 @@ ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
 ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
+# The final source frames already form a verified 0.5 s static expert tail.
+# This shorter window is used only by the upper-body pose term below, so an
+# initial default stand or a moving pre-terminal transition cannot activate it.
+ELF3_CLIMB_TERMINAL_STATIC_WINDOW_TIME_S = 0.5
+ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_JOINT_NAMES = [
+    "l_shoulder_y_joint",
+    "r_shoulder_y_joint",
+    "waist_y_joint",
+    "l_shoulder_x_joint",
+    "r_shoulder_x_joint",
+    "waist_x_joint",
+    "l_shoulder_z_joint",
+    "r_shoulder_z_joint",
+    "waist_z_joint",
+    "l_elbow_y_joint",
+    "r_elbow_y_joint",
+    "l_wrist_x_joint",
+    "r_wrist_x_joint",
+    "l_wrist_y_joint",
+    "r_wrist_y_joint",
+    "l_wrist_z_joint",
+    "r_wrist_z_joint",
+]
+# This is deliberately comparable to final_joint_settling, rather than a
+# replacement for platform contact or all-joint velocity settling.
+ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_WEIGHT = 4.0
+ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_STD = 0.35
 # Bounded, non-repeatable physical progress shaping requested for the climb.
 # Expert tracking remains active throughout the dynamic trajectory.
 ELF3_CLIMB_PROGRESS_REWARD_WEIGHT = 3.2
@@ -643,6 +670,32 @@ class ELF3ClimbRewardsCfg:
             "max_speed_scale": ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE,
             "fine_max_speed_scale": ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE,
             "score_weights": ELF3_CLIMB_SETTLING_SCORE_WEIGHTS,
+        },
+    )
+    final_expert_upper_body_pose = RewTerm(
+        func=mdp.final_expert_upper_body_joint_position_error_exp,
+        weight=ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_JOINT_NAMES,
+                preserve_order=True,
+            ),
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "static_window_time_s": ELF3_CLIMB_TERMINAL_STATIC_WINDOW_TIME_S,
+            "std": ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_STD,
         },
     )
     climb_platform_progress = RewTerm(

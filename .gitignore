@@ -45,7 +45,13 @@ _build
 !data/processed_motions/elf3/
 !data/processed_motions/elf3/climb_50hz/
 !data/processed_motions/elf3/climb_50hz/*.npz
+!data/processed_motions/elf3/climb_50hz_default_start_v1/
+!data/processed_motions/elf3/climb_50hz_default_start_v1/*.npz
 !data/processed_motions/elf3/down_roll_50hz/
 !data/processed_motions/elf3/down_roll_50hz/*.npz
+
+# ``climb_50hz_default_start_v1`` under data/motions is reproducible raw WBT
+# input.  The training-ready processed files above are the reviewed artifact.
+data/motions/elf3/climb_50hz_default_start_v1/
 
 artifacts/
