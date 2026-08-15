@@ -35,6 +35,9 @@ def _load_rewards_module():
         "php_kvoy_reproduction.tasks.tracking.mdp.obstacle": types.ModuleType(
             "php_kvoy_reproduction.tasks.tracking.mdp.obstacle"
         ),
+        "php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry": types.ModuleType(
+            "php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry"
+        ),
     }
     stubs["isaaclab.assets"].RigidObject = object
     stubs["isaaclab.managers"].SceneEntityCfg = _SceneEntityCfg
@@ -48,6 +51,15 @@ def _load_rewards_module():
     stubs["php_kvoy_reproduction.tasks.tracking.mdp.obstacle"].points_inside_oriented_box_xy = (
         lambda *_args, **_kwargs: None
     )
+    obstacle_geometry = stubs["php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry"]
+    obstacle_geometry.filtered_platform_contact_score = lambda *_args, **_kwargs: None
+    obstacle_geometry.filtered_platform_force_score = lambda *_args, **_kwargs: None
+    obstacle_geometry.first_foothold_reference_gate = lambda *_args, **_kwargs: None
+    obstacle_geometry.foot_sole_corners_world = lambda *_args, **_kwargs: None
+    obstacle_geometry.foothold_precontact_score = lambda *_args, **_kwargs: None
+    obstacle_geometry.foothold_safety_score = lambda *_args, **_kwargs: None
+    obstacle_geometry.foothold_safety_violation = lambda *_args, **_kwargs: None
+    obstacle_geometry.sole_top_height_score = lambda *_args, **_kwargs: None
     saved = {name: sys.modules.get(name) for name in stubs}
     try:
         sys.modules.update(stubs)
@@ -78,6 +90,52 @@ class _CommandManager:
     def get_term(self, name):
         assert name == "motion"
         return self.command
+
+
+class FirstFootholdTrackingFadeTest(unittest.TestCase):
+    def test_fade_is_side_specific_and_never_below_existing_terminal_floor(self):
+        command = SimpleNamespace(
+            cfg=SimpleNamespace(
+                body_names=[
+                    "l_knee_y_link",
+                    "l_ankle_x_link",
+                    "r_knee_y_link",
+                    "r_ankle_x_link",
+                    "torso_link",
+                ]
+            )
+        )
+        body_indexes = [0, 1, 2, 3, 4]
+        gates = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        body_weights = {
+            "l_knee_y_link": 0.65,
+            "l_ankle_x_link": 0.25,
+            "r_knee_y_link": 0.65,
+            "r_ankle_x_link": 0.25,
+        }
+        weights = rewards._apply_first_foothold_body_tracking_weights(
+            torch.ones(2, 5),
+            command,
+            body_indexes,
+            gates,
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            body_weights,
+        )
+
+        torch.testing.assert_close(weights[0], torch.tensor([0.65, 0.25, 1.0, 1.0, 1.0]))
+        torch.testing.assert_close(weights[1], torch.tensor([1.0, 1.0, 0.65, 0.25, 1.0]))
+
+        terminal_weights = torch.ones(1, 5)
+        terminal_weights[0, 1] = 0.15
+        preserved_floor = rewards._apply_first_foothold_body_tracking_weights(
+            terminal_weights,
+            command,
+            body_indexes,
+            gates[:1],
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            body_weights,
+        )
+        self.assertAlmostEqual(preserved_floor[0, 1].item(), 0.15, places=6)
 
 
 class FinalJointSettlingRewardTest(unittest.TestCase):

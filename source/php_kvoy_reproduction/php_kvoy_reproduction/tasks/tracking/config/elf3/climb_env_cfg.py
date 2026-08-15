@@ -134,6 +134,98 @@ ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES = [
 # climb; physical platform contact controls the final foot placement.
 ELF3_CLIMB_TERMINAL_FOOT_TRACKING_WEIGHT = 0.15
 
+# The first platform support is evaluated from the physical sole geometry, not
+# from the ankle-link origin.  The values are conservative bounds of the ELF3
+# foot mesh in the ankle-link frame.  Keeping the sole samples explicit lets a
+# pitched forefoot contact remain valid while enforcing the requested heel
+# overhang limit on the real contact geometry.
+ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES = ["l_ankle_x_link", "r_ankle_x_link"]
+ELF3_CLIMB_FIRST_FOOTHOLD_PLATFORM_CONTACT_SENSOR_NAMES = [
+    "l_foot_platform_contact",
+    "r_foot_platform_contact",
+]
+ELF3_CLIMB_FIRST_FOOTHOLD_SOLE_CORNERS_B = (
+    (-0.09, -0.04, -0.041),
+    (-0.09, 0.04, -0.041),
+    (0.15, -0.04, -0.041),
+    (0.15, 0.04, -0.041),
+)
+# User-approved physical limit: a rear-most sole point may extend at most
+# 5 cm past the approach edge.  Beyond this limit the positive support credit
+# is exactly zero and the first-foot term applies a bounded return-to-safety
+# penalty; this is not a soft extra 5--7 cm band.
+ELF3_CLIMB_FIRST_FOOTHOLD_MAX_HEEL_OVERHANG = 0.05
+ELF3_CLIMB_FIRST_FOOTHOLD_MIN_FOREFOOT_INSIDE = 0.04
+ELF3_CLIMB_FIRST_FOOTHOLD_FAR_EDGE_MARGIN = 0.04
+ELF3_CLIMB_FIRST_FOOTHOLD_LATERAL_MARGIN = 0.02
+ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_STD = 0.06
+ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_APPROACH_DISTANCE = 0.15
+ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_HEIGHT_STD = 0.16
+ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_ACTIVATION_DISTANCE = 0.20
+ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_ACTIVATION_INSIDE = 0.03
+ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_RELEASE_DISTANCE = 0.08
+ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_RELEASE_INSIDE = 0.03
+ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_START = 0.28
+ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_RAMP = 0.08
+ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_END = 0.72
+ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_FADE = 0.10
+ELF3_CLIMB_FIRST_FOOTHOLD_REWARD_WEIGHT = 4.0
+ELF3_CLIMB_FIRST_FOOTHOLD_MIN_UPWARD_FORCE_N = 10.0
+ELF3_CLIMB_FIRST_FOOTHOLD_CONTACT_TIME_S = 0.06
+
+# The first foot needs room to adapt to the sampled box length/height before
+# contact.  Hip and torso tracking stay intact; only the arriving ankle and a
+# smaller amount of its knee tracking are softened.  The same phase gate is
+# applied to position, orientation, and velocity objectives so the immutable
+# expert motion cannot pull an already-arriving foot back to a bad edge pose.
+ELF3_CLIMB_FIRST_FOOTHOLD_POSITION_TRACKING_WEIGHTS = {
+    "l_knee_y_link": 0.65,
+    "r_knee_y_link": 0.65,
+    "l_ankle_x_link": 0.25,
+    "r_ankle_x_link": 0.25,
+}
+ELF3_CLIMB_FIRST_FOOTHOLD_ORIENTATION_TRACKING_WEIGHTS = {
+    "l_knee_y_link": 0.80,
+    "r_knee_y_link": 0.80,
+    "l_ankle_x_link": 0.50,
+    "r_ankle_x_link": 0.50,
+}
+ELF3_CLIMB_FIRST_FOOTHOLD_LINEAR_VELOCITY_TRACKING_WEIGHTS = {
+    "l_knee_y_link": 0.70,
+    "r_knee_y_link": 0.70,
+    "l_ankle_x_link": 0.35,
+    "r_ankle_x_link": 0.35,
+}
+ELF3_CLIMB_FIRST_FOOTHOLD_ANGULAR_VELOCITY_TRACKING_WEIGHTS = {
+    "l_knee_y_link": 0.75,
+    "r_knee_y_link": 0.75,
+    "l_ankle_x_link": 0.45,
+    "r_ankle_x_link": 0.45,
+}
+ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS = {
+    "foot_body_names": ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES,
+    "platform_contact_sensor_names": ELF3_CLIMB_FIRST_FOOTHOLD_PLATFORM_CONTACT_SENSOR_NAMES,
+    "sole_corners_b": ELF3_CLIMB_FIRST_FOOTHOLD_SOLE_CORNERS_B,
+    "approach_side": -1.0,
+    "max_heel_overhang": ELF3_CLIMB_FIRST_FOOTHOLD_MAX_HEEL_OVERHANG,
+    "min_forefoot_inside": ELF3_CLIMB_FIRST_FOOTHOLD_MIN_FOREFOOT_INSIDE,
+    "far_edge_margin": ELF3_CLIMB_FIRST_FOOTHOLD_FAR_EDGE_MARGIN,
+    "lateral_margin": ELF3_CLIMB_FIRST_FOOTHOLD_LATERAL_MARGIN,
+    "foot_height_std": ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_STD,
+    "precontact_approach_distance": ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_APPROACH_DISTANCE,
+    "precontact_height_std": ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_HEIGHT_STD,
+    "reference_activation_distance": ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_ACTIVATION_DISTANCE,
+    "reference_activation_inside": ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_ACTIVATION_INSIDE,
+    "reference_release_distance": ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_RELEASE_DISTANCE,
+    "reference_release_inside": ELF3_CLIMB_FIRST_FOOTHOLD_REFERENCE_RELEASE_INSIDE,
+    "phase_start": ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_START,
+    "phase_ramp": ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_RAMP,
+    "phase_end": ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_END,
+    "phase_fade": ELF3_CLIMB_FIRST_FOOTHOLD_PHASE_FADE,
+    "min_upward_force": ELF3_CLIMB_FIRST_FOOTHOLD_MIN_UPWARD_FORCE_N,
+    "contact_time_scale": ELF3_CLIMB_FIRST_FOOTHOLD_CONTACT_TIME_S,
+}
+
 
 # Preserve the source motion's task-critical x edges while raising the top to
 # 0.65 m. The 0.80 m width covers the union of the original non-mirrored and
@@ -320,6 +412,29 @@ class ELF3ClimbSceneCfg(InteractiveSceneCfg):
         track_air_time=True,
         force_threshold=10.0,
         debug_vis=True,
+    )
+
+    # Filtered, one-body sensors are required for a trustworthy first-foot
+    # platform-support reward.  Isaac Lab's contact-force matrix is only
+    # reliable with a single sensor body per filter, hence one sensor per
+    # ankle instead of reusing the all-robot contact sensor above.
+    l_foot_platform_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/l_ankle_x_link",
+        update_period=0.0,
+        history_length=3,
+        track_air_time=True,
+        force_threshold=ELF3_CLIMB_FIRST_FOOTHOLD_MIN_UPWARD_FORCE_N,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/ClimbPlatform"],
+        debug_vis=False,
+    )
+    r_foot_platform_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/r_ankle_x_link",
+        update_period=0.0,
+        history_length=3,
+        track_air_time=True,
+        force_threshold=ELF3_CLIMB_FIRST_FOOTHOLD_MIN_UPWARD_FORCE_N,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/ClimbPlatform"],
+        debug_vis=False,
     )
 
     # Yaw-aligned terrain scan attached to the torso. Isaac Lab 4.5 can ray
@@ -572,6 +687,8 @@ class ELF3ClimbRewardsCfg:
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+            "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_POSITION_TRACKING_WEIGHTS,
         },
     )
     motion_body_ori = RewTerm(
@@ -594,17 +711,35 @@ class ELF3ClimbRewardsCfg:
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+            "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_ORIENTATION_TRACKING_WEIGHTS,
         },
     )
     motion_body_lin_vel = RewTerm(
-        func=mdp.motion_global_body_linear_velocity_error_exp,
+        func=mdp.climb_motion_global_body_linear_velocity_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 1.0},
+        params={
+            "command_name": "motion",
+            "std": 1.0,
+            "body_names": ELF3_CLIMB_TRACKED_BODY_NAMES,
+            "platform_cfg": SceneEntityCfg("platform"),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+            "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_LINEAR_VELOCITY_TRACKING_WEIGHTS,
+        },
     )
     motion_body_ang_vel = RewTerm(
-        func=mdp.motion_global_body_angular_velocity_error_exp,
+        func=mdp.climb_motion_global_body_angular_velocity_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 3.14},
+        params={
+            "command_name": "motion",
+            "std": 3.14,
+            "body_names": ELF3_CLIMB_TRACKED_BODY_NAMES,
+            "platform_cfg": SceneEntityCfg("platform"),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+            "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_ANGULAR_VELOCITY_TRACKING_WEIGHTS,
+        },
     )
     platform_foot_contact = RewTerm(
         func=mdp.platform_foot_contact,
@@ -698,6 +833,16 @@ class ELF3ClimbRewardsCfg:
             "std": ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_STD,
         },
     )
+    first_foothold_support_quality = RewTerm(
+        func=mdp.first_foothold_support_quality,
+        weight=ELF3_CLIMB_FIRST_FOOTHOLD_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+        },
+    )
     climb_platform_progress = RewTerm(
         func=mdp.climb_platform_progress,
         weight=ELF3_CLIMB_PROGRESS_REWARD_WEIGHT,
@@ -724,6 +869,7 @@ class ELF3ClimbRewardsCfg:
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "max_delta_per_step": ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP,
+            "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
         },
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0e-1)

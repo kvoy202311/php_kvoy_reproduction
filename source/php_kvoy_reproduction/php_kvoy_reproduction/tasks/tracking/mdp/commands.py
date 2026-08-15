@@ -22,6 +22,7 @@ from isaaclab.utils.math import (
 )
 
 from .climb_progress import bounded_episode_progress_increment
+from .obstacle_geometry import advance_filtered_platform_contact_time
 from .motion_data import (
     MultiMotionAdaptiveSampler,
     adaptive_failure_mask,
@@ -123,6 +124,10 @@ class MotionCommand(CommandTerm):
         self._climb_progress_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._climb_approach_max_potential = torch.zeros(self.num_envs, device=self.device)
         self._climb_lift_max_potential = torch.zeros(self.num_envs, device=self.device)
+        # Allocated lazily by the climb-only first-foothold reward.  This must
+        # not reuse ContactSensor.current_contact_time because that timer
+        # includes ground and other non-platform contacts.
+        self._first_foothold_filtered_contact_time: torch.Tensor | None = None
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
@@ -166,6 +171,8 @@ class MotionCommand(CommandTerm):
         self._climb_progress_initialized[env_ids] = False
         self._climb_approach_max_potential[env_ids] = 0.0
         self._climb_lift_max_potential[env_ids] = 0.0
+        if self._first_foothold_filtered_contact_time is not None:
+            self._first_foothold_filtered_contact_time[env_ids] = 0.0
         return extras
 
     def climb_progress_deltas(
@@ -205,6 +212,45 @@ class MotionCommand(CommandTerm):
         self._climb_lift_max_potential.copy_(lift_max)
         self._climb_progress_initialized.fill_(True)
         return approach_delta, lift_delta
+
+    def advance_first_foothold_filtered_contact_time(
+        self,
+        active_platform_support: torch.Tensor,
+        step_dt: float,
+    ) -> torch.Tensor:
+        """Advance per-foot contact duration using only filtered platform support.
+
+        The first-foothold reward is evaluated once per policy step.  Its
+        state belongs here, rather than in a free function, so every subset of
+        environments is reset together with its motion command.
+        """
+
+        if active_platform_support.ndim != 2 or active_platform_support.shape[0] != self.num_envs:
+            raise ValueError(
+                "active_platform_support must have shape "
+                f"({self.num_envs}, num_feet), got {active_platform_support.shape}."
+            )
+        expected_device = torch.device(self.device)
+        if active_platform_support.device != expected_device:
+            raise ValueError(
+                "active_platform_support must be on the MotionCommand device "
+                f"{expected_device}, got {active_platform_support.device}."
+            )
+        if (
+            self._first_foothold_filtered_contact_time is None
+            or self._first_foothold_filtered_contact_time.shape != active_platform_support.shape
+        ):
+            self._first_foothold_filtered_contact_time = torch.zeros(
+                active_platform_support.shape,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        self._first_foothold_filtered_contact_time = advance_filtered_platform_contact_time(
+            self._first_foothold_filtered_contact_time,
+            active_platform_support,
+            step_dt=step_dt,
+        )
+        return self._first_foothold_filtered_contact_time
 
     @property
     def source_joint_pos(self) -> torch.Tensor:

@@ -19,6 +19,36 @@ _SPEC.loader.exec_module(obstacle)
 
 
 class ClimbBoxGeometryTest(unittest.TestCase):
+    @staticmethod
+    def _platform(length: float = 0.46, width: float = 0.80):
+        return (
+            torch.tensor([[0.0, 0.0, 0.325]], dtype=torch.float32),
+            torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+            torch.tensor([[length, width, 0.65]], dtype=torch.float32),
+        )
+
+    @staticmethod
+    def _sole_corners(rear_x: float, front_x: float, half_width: float = 0.04):
+        return torch.tensor(
+            [[[[rear_x, -half_width, 0.65], [rear_x, half_width, 0.65],
+               [front_x, -half_width, 0.65], [front_x, half_width, 0.65]]]],
+            dtype=torch.float32,
+        )
+
+    @staticmethod
+    def _foothold_score(corners, centers, orientations, sizes):
+        return obstacle.foothold_safety_score(
+            corners,
+            centers,
+            orientations,
+            sizes,
+            approach_side=-1.0,
+            max_heel_overhang=0.05,
+            min_forefoot_inside=0.04,
+            far_edge_margin=0.04,
+            lateral_margin=0.02,
+        )
+
     def test_nominal_box_top_is_exactly_point_six_five_metres(self):
         hits = torch.tensor([[[-0.95, 0.0, 0.0], [-0.50, 0.0, 0.0]]], dtype=torch.float32)
         centers = torch.tensor([[-0.95, 0.0, 0.325]], dtype=torch.float32)
@@ -61,6 +91,213 @@ class ClimbBoxGeometryTest(unittest.TestCase):
         mask = obstacle.nominal_environment_mask(env_ids, num_envs=10, nominal_fraction=0.5)
 
         self.assertEqual(mask.tolist(), [True, True, True, True, True, False, False, False, False, False])
+
+    def test_heel_overhang_exactly_five_centimetres_is_safe_but_more_is_not(self):
+        centers, orientations, sizes = self._platform()
+        at_limit_corners = self._sole_corners(-0.28, -0.04)
+        beyond_corners = self._sole_corners(-0.281, -0.04)
+        at_limit_score, at_limit_valid = self._foothold_score(
+            at_limit_corners, centers, orientations, sizes
+        )
+        beyond_score, beyond_valid = self._foothold_score(
+            beyond_corners, centers, orientations, sizes
+        )
+        at_limit_violation = obstacle.foothold_safety_violation(
+            at_limit_corners,
+            centers,
+            orientations,
+            sizes,
+            approach_side=-1.0,
+            max_heel_overhang=0.05,
+            min_forefoot_inside=0.04,
+            far_edge_margin=0.04,
+            lateral_margin=0.02,
+        )
+        beyond_violation = obstacle.foothold_safety_violation(
+            beyond_corners,
+            centers,
+            orientations,
+            sizes,
+            approach_side=-1.0,
+            max_heel_overhang=0.05,
+            min_forefoot_inside=0.04,
+            far_edge_margin=0.04,
+            lateral_margin=0.02,
+        )
+
+        self.assertTrue(at_limit_valid.item())
+        self.assertGreater(at_limit_score.item(), 0.0)
+        self.assertLess(at_limit_violation.item(), 1.0e-5)
+        self.assertFalse(beyond_valid.item())
+        self.assertEqual(beyond_score.item(), 0.0)
+        self.assertGreater(beyond_violation.item(), 0.0)
+
+    def test_far_and_lateral_safe_boundaries_are_strict(self):
+        centers, orientations, sizes = self._platform()
+        far_limit_score, far_limit_valid = self._foothold_score(
+            self._sole_corners(-0.05, 0.19), centers, orientations, sizes
+        )
+        far_beyond_score, far_beyond_valid = self._foothold_score(
+            self._sole_corners(-0.05, 0.191), centers, orientations, sizes
+        )
+        lateral_limit_score, lateral_limit_valid = self._foothold_score(
+            self._sole_corners(-0.28, -0.04, half_width=0.38), centers, orientations, sizes
+        )
+        lateral_beyond_score, lateral_beyond_valid = self._foothold_score(
+            self._sole_corners(-0.28, -0.04, half_width=0.381), centers, orientations, sizes
+        )
+
+        self.assertTrue(far_limit_valid.item())
+        self.assertGreater(far_limit_score.item(), 0.0)
+        self.assertFalse(far_beyond_valid.item())
+        self.assertEqual(far_beyond_score.item(), 0.0)
+        self.assertTrue(lateral_limit_valid.item())
+        self.assertGreater(lateral_limit_score.item(), 0.0)
+        self.assertFalse(lateral_beyond_valid.item())
+        self.assertEqual(lateral_beyond_score.item(), 0.0)
+
+    def test_safe_region_adapts_to_each_sampled_platform_length(self):
+        centers, orientations, short_sizes = self._platform(length=0.41)
+        _, _, long_sizes = self._platform(length=0.51)
+        fixed_world_sole = self._sole_corners(-0.28, -0.04)
+        _, short_valid = self._foothold_score(fixed_world_sole, centers, orientations, short_sizes)
+        _, long_valid = self._foothold_score(fixed_world_sole, centers, orientations, long_sizes)
+        adjusted_short_sole = self._sole_corners(-0.255, -0.015)
+        adjusted_short_score, adjusted_short_valid = self._foothold_score(
+            adjusted_short_sole, centers, orientations, short_sizes
+        )
+
+        self.assertFalse(short_valid.item())
+        self.assertTrue(long_valid.item())
+        self.assertTrue(adjusted_short_valid.item())
+        self.assertGreater(adjusted_short_score.item(), 0.0)
+
+    def test_foothold_score_is_invariant_to_shared_platform_yaw(self):
+        centers, _, sizes = self._platform()
+        local_corners = self._sole_corners(-0.28, -0.04)
+        identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+        identity_score, identity_valid = self._foothold_score(local_corners, centers, identity, sizes)
+
+        half_yaw = math.pi / 4.0
+        quarter_turn = torch.tensor([[math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)]], dtype=torch.float32)
+        yawed_corners = local_corners.clone()
+        yawed_corners[..., 0] = -local_corners[..., 1]
+        yawed_corners[..., 1] = local_corners[..., 0]
+        yawed_score, yawed_valid = self._foothold_score(yawed_corners, centers, quarter_turn, sizes)
+
+        self.assertEqual(identity_valid.tolist(), yawed_valid.tolist())
+        torch.testing.assert_close(identity_score, yawed_score, rtol=0.0, atol=1.0e-6)
+
+    def test_sole_corner_transform_respects_ankle_yaw(self):
+        foot_positions = torch.tensor([[[1.0, 2.0, 3.0]]], dtype=torch.float32)
+        half_yaw = math.pi / 4.0
+        foot_orientations = torch.tensor(
+            [[[math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)]]], dtype=torch.float32
+        )
+        corners = obstacle.foot_sole_corners_world(
+            foot_positions,
+            foot_orientations,
+            torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        )
+
+        torch.testing.assert_close(corners, torch.tensor([[[[1.0, 3.0, 3.0]]]]), rtol=0.0, atol=1.0e-6)
+
+    def test_batched_left_and_right_feet_are_not_hard_coded(self):
+        centers, orientations, sizes = self._platform()
+        valid = self._sole_corners(-0.28, -0.04)
+        invalid = self._sole_corners(-0.281, -0.04)
+        corners = torch.cat(
+            (
+                torch.cat((valid, invalid), dim=1),
+                torch.cat((invalid, valid), dim=1),
+            ),
+            dim=0,
+        )
+        batched_centers = centers.repeat(2, 1)
+        batched_orientations = orientations.repeat(2, 1)
+        batched_sizes = sizes.repeat(2, 1)
+        scores, valid_mask = self._foothold_score(corners, batched_centers, batched_orientations, batched_sizes)
+
+        self.assertEqual(valid_mask.tolist(), [[True, False], [False, True]])
+        self.assertGreater(scores[0, 0].item(), 0.0)
+        self.assertGreater(scores[1, 1].item(), 0.0)
+        self.assertEqual(scores[0, 1].item(), 0.0)
+        self.assertEqual(scores[1, 0].item(), 0.0)
+
+    def test_reference_gate_selects_mirrored_leader_and_closes_after_second_foot_arrives(self):
+        centers, orientations, sizes = self._platform()
+        reference_feet = torch.tensor(
+            [[[-0.10, 0.0, 0.65], [-0.50, 0.0, 0.0]],
+             [[-0.50, 0.0, 0.0], [-0.10, 0.0, 0.65]]],
+            dtype=torch.float32,
+        )
+        gate, lead_mask = obstacle.first_foothold_reference_gate(
+            reference_feet,
+            centers.repeat(2, 1),
+            orientations.repeat(2, 1),
+            sizes.repeat(2, 1),
+            torch.tensor([0.5, 0.5]),
+            approach_side=-1.0,
+            reference_activation_distance=0.20,
+            reference_activation_inside=0.03,
+            reference_release_distance=0.08,
+            reference_release_inside=0.03,
+            phase_start=0.28,
+            phase_ramp=0.08,
+            phase_end=0.72,
+            phase_fade=0.10,
+        )
+        second_foot_caught_up = torch.tensor([[[-0.10, 0.0, 0.65], [-0.12, 0.0, 0.65]]], dtype=torch.float32)
+        closed_gate, _ = obstacle.first_foothold_reference_gate(
+            second_foot_caught_up,
+            centers,
+            orientations,
+            sizes,
+            torch.tensor([0.5]),
+            approach_side=-1.0,
+            reference_activation_distance=0.20,
+            reference_activation_inside=0.03,
+            reference_release_distance=0.08,
+            reference_release_inside=0.03,
+            phase_start=0.28,
+            phase_ramp=0.08,
+            phase_end=0.72,
+            phase_fade=0.10,
+        )
+
+        self.assertGreater(gate[0].item(), 0.0)
+        self.assertGreater(gate[1].item(), 0.0)
+        self.assertEqual(lead_mask.tolist(), [[1.0, 0.0], [0.0, 1.0]])
+        self.assertEqual(closed_gate.item(), 0.0)
+
+    def test_only_filtered_upward_platform_force_counts_as_support(self):
+        forces = torch.tensor([[[0.0, 0.0, 20.0], [20.0, 0.0, 0.0]]], dtype=torch.float32)
+        contact_times = torch.tensor([[0.06, 0.06]], dtype=torch.float32)
+        scores = obstacle.filtered_platform_contact_score(
+            forces,
+            contact_times,
+            min_upward_force=10.0,
+            contact_time_scale=0.06,
+        )
+
+        self.assertGreater(scores[0, 0].item(), 0.0)
+        self.assertEqual(scores[0, 1].item(), 0.0)
+
+    def test_filtered_platform_contact_time_needs_continuous_filtered_support(self):
+        previous = torch.zeros((1, 2), dtype=torch.float32)
+        left_only = torch.tensor([[True, False]])
+        first = obstacle.advance_filtered_platform_contact_time(previous, left_only, step_dt=0.02)
+        second = obstacle.advance_filtered_platform_contact_time(first, left_only, step_dt=0.02)
+        third = obstacle.advance_filtered_platform_contact_time(second, left_only, step_dt=0.02)
+        interrupted = obstacle.advance_filtered_platform_contact_time(
+            third,
+            torch.tensor([[False, True]]),
+            step_dt=0.02,
+        )
+
+        torch.testing.assert_close(first, torch.tensor([[0.02, 0.00]]))
+        torch.testing.assert_close(third, torch.tensor([[0.06, 0.00]]))
+        torch.testing.assert_close(interrupted, torch.tensor([[0.00, 0.02]]))
 
 
 if __name__ == "__main__":
