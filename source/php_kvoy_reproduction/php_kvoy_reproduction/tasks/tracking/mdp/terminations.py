@@ -180,6 +180,20 @@ def _climb_standing_conditions(
     return conditions, default_joint_pos_rms
 
 
+def _terminal_platform_alignment_complete(command: MotionCommand) -> torch.Tensor:
+    """Return the optional final-reference alignment state, defaulting to true."""
+
+    completed = getattr(command, "terminal_platform_alignment_complete", None)
+    if completed is None:
+        return torch.ones_like(command.time_steps, dtype=torch.bool)
+    if completed.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_platform_alignment_complete must match command time_steps, "
+            f"got {completed.shape} and {command.time_steps.shape}."
+        )
+    return completed.to(dtype=torch.bool)
+
+
 class motion_end_success(ManagerTermBase):
     """Classify a clip as successful only after a continuous stable final stand.
 
@@ -240,6 +254,7 @@ class motion_end_success(ManagerTermBase):
             "root_linear_speed_valid",
             "root_angular_speed_valid",
             "joint_speed_valid",
+            "terminal_alignment_complete",
             "final_frame_fraction",
             "max_joint_speed",
             "joint_speed_rms",
@@ -314,10 +329,12 @@ class motion_end_success(ManagerTermBase):
         )
         final_frames = command.motion.motion_end_idx[command.motion_ids] - 1
         at_final_frame = command.time_steps >= final_frames
+        alignment_complete = _terminal_platform_alignment_complete(command)
+        eligible_final_frame = at_final_frame & alignment_complete
         standing_valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
         for value in conditions.values():
             standing_valid &= value
-        valid_final_stand = at_final_frame & standing_valid
+        valid_final_stand = eligible_final_frame & standing_valid
         self._stable_steps = torch.where(valid_final_stand, self._stable_steps + 1, 0)
         self._longest_stable_steps = torch.maximum(self._longest_stable_steps, self._stable_steps)
 
@@ -335,12 +352,15 @@ class motion_end_success(ManagerTermBase):
         wrist_contact_times = contact_sensor.data.current_contact_time[:, self._wrist_contact_body_ids]
 
         for name, value in conditions.items():
-            command.metrics[self._METRIC_PREFIX + name].copy_((at_final_frame & value).float())
+            command.metrics[self._METRIC_PREFIX + name].copy_((eligible_final_frame & value).float())
+        command.metrics[self._METRIC_PREFIX + "terminal_alignment_complete"].copy_(
+            (at_final_frame & alignment_complete).float()
+        )
         command.metrics[self._METRIC_PREFIX + "default_joint_pos_rms"].copy_(
-            torch.where(at_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
+            torch.where(eligible_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
         )
         command.metrics[self._METRIC_PREFIX + "stable_time"].copy_(self._stable_steps.float() * env.step_dt)
-        final_float = at_final_frame.to(dtype=max_joint_speed_value.dtype)
+        final_float = eligible_final_frame.to(dtype=max_joint_speed_value.dtype)
         command.metrics[self._METRIC_PREFIX + "final_frame_fraction"].copy_(final_float)
         command.metrics[self._METRIC_PREFIX + "max_joint_speed"].copy_(final_float * max_joint_speed_value)
         command.metrics[self._METRIC_PREFIX + "joint_speed_rms"].copy_(final_float * joint_speed_rms)

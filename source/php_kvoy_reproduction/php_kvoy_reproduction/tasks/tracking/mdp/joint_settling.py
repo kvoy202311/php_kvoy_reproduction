@@ -22,6 +22,8 @@ def joint_speed_statistics(joint_velocity: torch.Tensor) -> tuple[torch.Tensor, 
 def joint_settling_score(
     joint_velocity: torch.Tensor,
     *,
+    rms_speed_tolerance: float,
+    max_speed_tolerance: float,
     rms_speed_scale: float,
     max_speed_scale: float,
     fine_max_speed_scale: float,
@@ -29,13 +31,19 @@ def joint_settling_score(
 ) -> torch.Tensor:
     """Return a smooth settling score in ``[0, 1]``.
 
-    The two Cauchy scores retain useful gradients when the robot is still
-    moving quickly.  The Gaussian score becomes important near the strict
-    final-standing speed limit.  Combining RMS and maximum speed prevents the
-    average from hiding one fast joint while avoiding a reward controlled by
-    only one joint at every stage of learning.
+    Scoring the *excess over the success tolerances* makes every final state
+    within the acceptance band high-value, while still giving a smooth and
+    substantial gradient to states that exceed it.  Combining RMS and maximum
+    speed prevents the average from hiding one fast joint without making the
+    full objective depend only on one joint.
     """
 
+    for name, value in (
+        ("rms_speed_tolerance", rms_speed_tolerance),
+        ("max_speed_tolerance", max_speed_tolerance),
+    ):
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {value}.")
     for name, value in (
         ("rms_speed_scale", rms_speed_scale),
         ("max_speed_scale", max_speed_scale),
@@ -50,9 +58,11 @@ def joint_settling_score(
         raise ValueError("score_weights must contain at least one positive value.")
 
     rms_speed, max_speed = joint_speed_statistics(joint_velocity)
-    rms_broad_score = torch.reciprocal(1.0 + torch.square(rms_speed / rms_speed_scale))
-    max_broad_score = torch.reciprocal(1.0 + torch.square(max_speed / max_speed_scale))
-    max_fine_score = torch.exp(-0.5 * torch.square(max_speed / fine_max_speed_scale))
+    rms_excess = (rms_speed - rms_speed_tolerance).clamp_min(0.0)
+    max_excess = (max_speed - max_speed_tolerance).clamp_min(0.0)
+    rms_broad_score = torch.reciprocal(1.0 + torch.square(rms_excess / rms_speed_scale))
+    max_broad_score = torch.reciprocal(1.0 + torch.square(max_excess / max_speed_scale))
+    max_fine_score = torch.exp(-0.5 * torch.square(max_excess / fine_max_speed_scale))
     scores = (rms_broad_score, max_broad_score, max_fine_score)
     return sum(
         (weight / weight_sum) * score for weight, score in zip(score_weights, scores, strict=True)

@@ -1203,6 +1203,25 @@ def _expert_static_tail_gate(
     )
 
 
+def _terminal_platform_alignment_gate(command: MotionCommand) -> torch.Tensor:
+    """Return one only after an optional terminal platform-z correction finishes.
+
+    Older/generic motion commands do not configure the correction.  They are
+    treated as already aligned so this climb-only gate remains backward
+    compatible with the base tracking tasks and lightweight unit-test mocks.
+    """
+
+    completed = getattr(command, "terminal_platform_alignment_complete", None)
+    if completed is None:
+        return torch.ones_like(command.time_steps, dtype=torch.float32)
+    if completed.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_platform_alignment_complete must match command time_steps, "
+            f"got {completed.shape} and {command.time_steps.shape}."
+        )
+    return completed.to(dtype=torch.float32)
+
+
 def final_expert_upper_body_joint_position_error_exp(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -1257,7 +1276,8 @@ def final_expert_upper_body_joint_position_error_exp(
         static_window_time_s,
         env.step_dt,
     )
-    return static_tail * two_foot_contact * torch.exp(-mean_squared_error / std**2)
+    alignment_complete = _terminal_platform_alignment_gate(command)
+    return alignment_complete * static_tail * two_foot_contact * torch.exp(-mean_squared_error / std**2)
 
 
 def _platform_foot_contact_scores(
@@ -1437,7 +1457,8 @@ def final_standing_stability(
     stability_score = sum(
         (weight / weight_sum) * score for weight, score in zip(stability_weights, stability_scores, strict=True)
     )
-    return gate * contact_score * stability_score
+    alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=stability_score.dtype)
+    return alignment_complete * gate * contact_score * stability_score
 
 
 def final_joint_settling(
@@ -1452,6 +1473,8 @@ def final_joint_settling(
     min_contact_force: float,
     contact_time_scale: float,
     reference_max_joint_speed: float,
+    rms_speed_tolerance: float,
+    max_speed_tolerance: float,
     rms_speed_scale: float,
     max_speed_scale: float,
     fine_max_speed_scale: float,
@@ -1499,12 +1522,15 @@ def final_joint_settling(
     two_foot_support = per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
     settling_score = joint_settling_score(
         command.robot_joint_vel,
+        rms_speed_tolerance=rms_speed_tolerance,
+        max_speed_tolerance=max_speed_tolerance,
         rms_speed_scale=rms_speed_scale,
         max_speed_scale=max_speed_scale,
         fine_max_speed_scale=fine_max_speed_scale,
         score_weights=score_weights,
     )
-    return reference_stopped.to(dtype=settling_score.dtype) * two_foot_support * settling_score
+    alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=settling_score.dtype)
+    return alignment_complete * reference_stopped.to(dtype=settling_score.dtype) * two_foot_support * settling_score
 
 
 def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:

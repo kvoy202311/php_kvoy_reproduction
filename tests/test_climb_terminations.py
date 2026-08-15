@@ -290,6 +290,24 @@ class MotionEndSuccessTest(unittest.TestCase):
         self.assertFalse(torch.any(result))
         torch.testing.assert_close(term._stable_steps, torch.zeros(3, dtype=torch.long))
 
+    def test_success_window_waits_for_terminal_platform_alignment(self):
+        term, env, command = _make_success_term()
+        command.terminal_platform_alignment_complete = torch.tensor([False, False, False])
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            result = _call_success_term(term, env)
+        self.assertFalse(torch.any(result))
+        torch.testing.assert_close(term._stable_steps, torch.zeros(3, dtype=torch.long))
+        torch.testing.assert_close(command.metrics["final_standing_terminal_alignment_complete"], torch.zeros(3))
+
+        command.terminal_platform_alignment_complete[:] = True
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            _call_success_term(term, env)
+            _call_success_term(term, env)
+            result = _call_success_term(term, env)
+        self.assertTrue(torch.all(result))
+        torch.testing.assert_close(command.metrics["final_standing_terminal_alignment_complete"], torch.ones(3))
+
     def test_speed_and_contact_diagnostics_record_actual_terminal_values(self):
         term, env, command = _make_success_term()
         command.robot_joint_vel[:] = torch.tensor(

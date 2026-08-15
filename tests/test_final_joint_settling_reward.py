@@ -139,7 +139,7 @@ class FirstFootholdTrackingFadeTest(unittest.TestCase):
 
 
 class FinalJointSettlingRewardTest(unittest.TestCase):
-    def _call(self, reference_velocity, robot_velocity, support_scores, *, time_step=80):
+    def _call(self, reference_velocity, robot_velocity, support_scores, *, time_step=80, alignment_complete=None):
         command = SimpleNamespace(
             joint_vel=torch.tensor(reference_velocity, dtype=torch.float32),
             robot_joint_vel=torch.tensor(robot_velocity, dtype=torch.float32),
@@ -151,6 +151,8 @@ class FinalJointSettlingRewardTest(unittest.TestCase):
             motion_ids=torch.zeros(len(reference_velocity), dtype=torch.long),
             time_steps=torch.full((len(reference_velocity),), time_step, dtype=torch.long),
         )
+        if alignment_complete is not None:
+            command.terminal_platform_alignment_complete = torch.tensor(alignment_complete, dtype=torch.bool)
         env = SimpleNamespace(command_manager=_CommandManager(command))
         with patch.object(
             rewards,
@@ -169,6 +171,8 @@ class FinalJointSettlingRewardTest(unittest.TestCase):
                 min_contact_force=10.0,
                 contact_time_scale=0.25,
                 reference_max_joint_speed=0.1,
+                rms_speed_tolerance=0.35,
+                max_speed_tolerance=0.5,
                 rms_speed_scale=1.0,
                 max_speed_scale=2.0,
                 fine_max_speed_scale=0.5,
@@ -232,12 +236,25 @@ class FinalJointSettlingRewardTest(unittest.TestCase):
                 min_contact_force=10.0,
                 contact_time_scale=0.25,
                 reference_max_joint_speed=0.1,
+                rms_speed_tolerance=0.35,
+                max_speed_tolerance=0.5,
                 rms_speed_scale=1.0,
                 max_speed_scale=2.0,
                 fine_max_speed_scale=0.5,
                 score_weights=(0.4, 0.3, 0.3),
             )
         self.assertEqual(reward.item(), 0.0)
+
+    def test_terminal_settling_waits_for_platform_relative_reference_alignment(self):
+        reward = self._call(
+            reference_velocity=[[0.0, 0.0], [0.0, 0.0]],
+            robot_velocity=[[0.1, 0.1], [0.1, 0.1]],
+            support_scores=[[1.0, 1.0], [1.0, 1.0]],
+            alignment_complete=[False, True],
+        )
+
+        self.assertEqual(reward[0].item(), 0.0)
+        self.assertGreater(reward[1].item(), 0.0)
 
 
 class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
@@ -249,6 +266,7 @@ class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
         reference_joint_vel,
         two_foot_contact,
         time_step=100,
+        alignment_complete=None,
     ):
         reference_joint_pos = torch.tensor(reference_joint_pos, dtype=torch.float32)
         robot_joint_pos = torch.tensor(robot_joint_pos, dtype=torch.float32)
@@ -267,6 +285,8 @@ class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
             # so the terminal gate can also be exercised during final-frame hold.
             final_hold_progress=torch.zeros(num_envs, dtype=torch.float32),
         )
+        if alignment_complete is not None:
+            command.terminal_platform_alignment_complete = torch.tensor(alignment_complete, dtype=torch.bool)
         asset = SimpleNamespace(data=SimpleNamespace(joint_pos=robot_joint_pos))
         env = SimpleNamespace(
             command_manager=_CommandManager(command),
@@ -341,9 +361,16 @@ class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
             reference_joint_vel=[[0.0] * 5],
             two_foot_contact=[0.0],
         )
+        alignment_in_progress = self._call(
+            **common,
+            reference_joint_vel=[[0.0] * 5],
+            two_foot_contact=[1.0],
+            alignment_complete=[False],
+        )
         self.assertEqual(initial_static.item(), 0.0)
         self.assertEqual(moving_tail.item(), 0.0)
         self.assertEqual(single_foot.item(), 0.0)
+        self.assertEqual(alignment_in_progress.item(), 0.0)
 
 
 if __name__ == "__main__":

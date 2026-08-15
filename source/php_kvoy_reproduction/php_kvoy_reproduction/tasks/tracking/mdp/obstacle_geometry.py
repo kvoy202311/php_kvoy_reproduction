@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -155,6 +157,75 @@ def foot_sole_corners_world(
     twice_cross = 2.0 * torch.cross(quat_vector, vectors.expand_as(quat_vector), dim=-1)
     rotated = vectors + quat_scalar * twice_cross + torch.cross(quat_vector, twice_cross, dim=-1)
     return foot_positions_w.unsqueeze(-2) + rotated
+
+
+def terminal_sole_support_plane_z(
+    foot_positions_w: torch.Tensor,
+    foot_orientations_w: torch.Tensor,
+    sole_corners_b: torch.Tensor,
+) -> torch.Tensor:
+    """Return the lowest physical sole point for every terminal reference.
+
+    The source clips may finish with pitched or rolled feet, so an ankle-link
+    origin (or a nominal box height) is not a reliable terminal support plane.
+    Taking the minimum across both configured feet and all their sole samples
+    gives one clip-specific plane that can be aligned to a runtime platform.
+    """
+
+    sole_corners_w = foot_sole_corners_world(foot_positions_w, foot_orientations_w, sole_corners_b)
+    return sole_corners_w[..., 2].amin(dim=(1, 2))
+
+
+def terminal_platform_z_alignment(
+    source_support_z: torch.Tensor,
+    platform_top_z: torch.Tensor,
+    final_hold_count: torch.Tensor,
+    *,
+    ramp_steps: int,
+    step_dt: float,
+    terminal_clearance: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return smooth terminal-reference z position/velocity corrections.
+
+    The correction is zero until a clip has reached its extra final-frame
+    hold.  It then smoothly moves the *whole* immutable body reference so its
+    source sole support plane reaches the actual sampled platform top.  The
+    matching z velocity makes the temporary translation kinematically
+    explicit to velocity-tracking rewards.  No joint-space reference is
+    altered.
+    """
+
+    if source_support_z.ndim != 1:
+        raise ValueError(f"source_support_z must have shape [N], got {source_support_z.shape}.")
+    if platform_top_z.shape != source_support_z.shape:
+        raise ValueError(
+            "platform_top_z must match source_support_z, "
+            f"got {platform_top_z.shape} and {source_support_z.shape}."
+        )
+    if final_hold_count.shape != source_support_z.shape:
+        raise ValueError(
+            "final_hold_count must match source_support_z, "
+            f"got {final_hold_count.shape} and {source_support_z.shape}."
+        )
+    if platform_top_z.device != source_support_z.device or final_hold_count.device != source_support_z.device:
+        raise ValueError("terminal alignment tensors must all share one device.")
+    if ramp_steps <= 0:
+        raise ValueError(f"ramp_steps must be positive, got {ramp_steps}.")
+    if step_dt <= 0.0:
+        raise ValueError(f"step_dt must be positive, got {step_dt}.")
+    if not math.isfinite(terminal_clearance) or terminal_clearance < 0.0:
+        raise ValueError(
+            "terminal_clearance must be a finite non-negative value, "
+            f"got {terminal_clearance}."
+        )
+
+    progress = (final_hold_count.to(dtype=source_support_z.dtype) / float(ramp_steps)).clamp(0.0, 1.0)
+    blend = progress * progress * (3.0 - 2.0 * progress)
+    # This is the derivative of the cubic blend.  It is exactly zero at both
+    # endpoints, including every post-ramp final-frame-hold step.
+    blend_rate = 6.0 * progress * (1.0 - progress) / (float(ramp_steps) * step_dt)
+    target_delta_z = platform_top_z.to(dtype=source_support_z.dtype) + terminal_clearance - source_support_z
+    return blend * target_delta_z, blend_rate * target_delta_z, final_hold_count >= ramp_steps
 
 
 def _smoothstep_between(value: torch.Tensor, start: torch.Tensor, end: torch.Tensor) -> torch.Tensor:

@@ -252,11 +252,14 @@ ELF3_CLIMB_HEIGHT_SCAN_OFFSET = (0.4, 0.0, 20.0)
 ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET = 0.5
 
 
-# The source clips already contain a motionless 0.5 s tail. Add a further
-# 1.0 s hold of the exact NPZ final frame so the policy has enough control time
-# to dissipate residual motion and learn to remain stable. This does not alter
-# the NPZ data or create a second kinematic target.
-ELF3_CLIMB_FINAL_HOLD_TIME_S = 1.0
+# The source clips already contain a motionless 0.5 s tail.  The extra hold
+# first spends 0.5 s aligning that terminal reference to the sampled physical
+# platform top, then leaves more than the required 0.5 s of truly stationary
+# evaluation time.  This does not alter the NPZ joints or create a second
+# kinematic pose target.
+ELF3_CLIMB_FINAL_HOLD_TIME_S = 1.25
+ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S = 0.5
+ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_CLEARANCE = 0.0
 ELF3_CLIMB_MIN_STABLE_TIME_S = 0.5
 ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
@@ -318,18 +321,24 @@ ELF3_CLIMB_STABILITY_REWARD_WEIGHTS = (0.20, 0.35, 0.35, 0.10)
 # success condition. Its maximum weight is close to the 4.2 effective joint-
 # speed share of final_standing_stability (12.0 * 0.35), while remaining gated
 # by a stationary expert target and sustained two-foot platform support.
-ELF3_CLIMB_FINAL_JOINT_SETTLING_REWARD_WEIGHT = 4.0
-ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
-ELF3_CLIMB_SETTLING_RMS_SPEED_SCALE = 1.0
-ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE = 2.0
-ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE = 0.5
-# Ordered as RMS broad, maximum-speed broad, maximum-speed fine.
-ELF3_CLIMB_SETTLING_SCORE_WEIGHTS = (0.40, 0.30, 0.30)
 ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR = 0.15
 ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED = 0.15
 ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
 ELF3_CLIMB_MAX_JOINT_SPEED = 0.5
 ELF3_CLIMB_MAX_TORSO_TILT = 0.35
+ELF3_CLIMB_FINAL_JOINT_SETTLING_REWARD_WEIGHT = 4.0
+ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
+# Score excess over the actual success limits, rather than merely preferring
+# an arbitrary low raw velocity.  This makes every all-joint <=0.5 rad/s
+# state strongly preferable to the 1--3 rad/s terminal oscillations seen in
+# the previous runs while retaining non-zero gradients above the threshold.
+ELF3_CLIMB_SETTLING_RMS_SPEED_TOLERANCE = 0.35
+ELF3_CLIMB_SETTLING_MAX_SPEED_TOLERANCE = ELF3_CLIMB_MAX_JOINT_SPEED
+ELF3_CLIMB_SETTLING_RMS_SPEED_SCALE = 0.35
+ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE = 0.35
+ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE = 0.25
+# Ordered as RMS broad, maximum-speed broad, maximum-speed fine.
+ELF3_CLIMB_SETTLING_SCORE_WEIGHTS = (0.25, 0.60, 0.15)
 ELF3_CLIMB_FINAL_DEFAULT_POSE_REWARD_STD = 0.25
 
 
@@ -488,6 +497,11 @@ class ELF3ClimbCommandsCfg:
         random_phase_env_mask_attr="_climb_box_nominal_geometry_mask",
         reference_transform_asset_name="platform",
         reference_transform_nominal_xy=ELF3_CLIMB_PLATFORM_CENTER[:2],
+        terminal_platform_alignment_foot_body_names=tuple(ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES),
+        terminal_platform_alignment_sole_corners_b=ELF3_CLIMB_FIRST_FOOTHOLD_SOLE_CORNERS_B,
+        terminal_platform_alignment_base_size=ELF3_CLIMB_PLATFORM_SIZE,
+        terminal_platform_alignment_clearance=ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_CLEARANCE,
+        terminal_platform_alignment_ramp_time_s=ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S,
     )
 
 
@@ -801,6 +815,8 @@ class ELF3ClimbRewardsCfg:
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "rms_speed_tolerance": ELF3_CLIMB_SETTLING_RMS_SPEED_TOLERANCE,
+            "max_speed_tolerance": ELF3_CLIMB_SETTLING_MAX_SPEED_TOLERANCE,
             "rms_speed_scale": ELF3_CLIMB_SETTLING_RMS_SPEED_SCALE,
             "max_speed_scale": ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE,
             "fine_max_speed_scale": ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE,

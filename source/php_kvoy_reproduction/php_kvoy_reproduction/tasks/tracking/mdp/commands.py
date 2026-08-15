@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import MISSING
+import math
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -22,7 +23,12 @@ from isaaclab.utils.math import (
 )
 
 from .climb_progress import bounded_episode_progress_increment
-from .obstacle_geometry import advance_filtered_platform_contact_time
+from .obstacle import get_climb_box_sizes
+from .obstacle_geometry import (
+    advance_filtered_platform_contact_time,
+    terminal_platform_z_alignment,
+    terminal_sole_support_plane_z,
+)
 from .motion_data import (
     MultiMotionAdaptiveSampler,
     adaptive_failure_mask,
@@ -105,6 +111,10 @@ class MotionCommand(CommandTerm):
                     f"got {type(reference_asset).__name__}."
                 )
             self.reference_transform_asset = reference_asset
+
+        self._terminal_platform_alignment_ramp_steps = 0
+        self._terminal_source_support_z: torch.Tensor | None = None
+        self._initialize_terminal_platform_z_alignment()
 
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -252,6 +262,118 @@ class MotionCommand(CommandTerm):
         )
         return self._first_foothold_filtered_contact_time
 
+    def _initialize_terminal_platform_z_alignment(self) -> None:
+        """Precompute each clip's physical terminal sole plane when enabled."""
+
+        ramp_time_s = self.cfg.terminal_platform_alignment_ramp_time_s
+        if not math.isfinite(ramp_time_s) or ramp_time_s < 0.0:
+            raise ValueError(
+                "terminal_platform_alignment_ramp_time_s must be finite and non-negative, "
+                f"got {ramp_time_s}."
+            )
+        if ramp_time_s == 0.0:
+            return
+        if self.reference_transform_asset is None:
+            raise ValueError(
+                "terminal platform z alignment requires reference_transform_asset_name to name the platform."
+            )
+        if not self.cfg.terminate_on_motion_end:
+            raise ValueError("terminal platform z alignment requires terminate_on_motion_end=True.")
+        if self.cfg.terminal_platform_alignment_base_size is None:
+            raise ValueError("terminal platform z alignment requires terminal_platform_alignment_base_size.")
+        base_size = self.cfg.terminal_platform_alignment_base_size
+        if len(base_size) != 3 or any(size <= 0.0 for size in base_size):
+            raise ValueError(
+                "terminal_platform_alignment_base_size must contain three positive values, "
+                f"got {base_size}."
+            )
+        foot_body_names = tuple(self.cfg.terminal_platform_alignment_foot_body_names)
+        if not foot_body_names:
+            raise ValueError("terminal platform z alignment requires at least one configured foot body.")
+        if len(set(foot_body_names)) != len(foot_body_names):
+            raise ValueError("terminal platform z alignment foot body names must be unique.")
+        missing_foot_names = [name for name in foot_body_names if name not in self.cfg.body_names]
+        if missing_foot_names:
+            raise ValueError(
+                "terminal platform z alignment foot bodies must be tracked by MotionCommand, "
+                f"missing {missing_foot_names}."
+            )
+        if not self.cfg.terminal_platform_alignment_sole_corners_b:
+            raise ValueError("terminal platform z alignment requires non-empty sole corner samples.")
+        if not math.isfinite(self.cfg.terminal_platform_alignment_clearance) or (
+            self.cfg.terminal_platform_alignment_clearance < 0.0
+        ):
+            raise ValueError(
+                "terminal_platform_alignment_clearance must be finite and non-negative, "
+                f"got {self.cfg.terminal_platform_alignment_clearance}."
+            )
+
+        self._terminal_platform_alignment_ramp_steps = max(
+            1, math.ceil(ramp_time_s / self._env.step_dt - 1.0e-9)
+        )
+        if self.motion_end_hold_steps <= self._terminal_platform_alignment_ramp_steps:
+            raise ValueError(
+                "motion_end_hold_time_s must leave at least one stationary policy step after terminal platform "
+                "z alignment; increase the hold or reduce the alignment ramp."
+            )
+
+        foot_body_ids = torch.tensor(
+            [self.cfg.body_names.index(name) for name in foot_body_names], dtype=torch.long, device=self.device
+        )
+        final_frames = self.motion.motion_end_idx - 1
+        terminal_foot_positions = self.motion.body_pos_w[final_frames][:, foot_body_ids]
+        terminal_foot_orientations = self.motion.body_quat_w[final_frames][:, foot_body_ids]
+        sole_corners_b = torch.as_tensor(
+            self.cfg.terminal_platform_alignment_sole_corners_b,
+            dtype=terminal_foot_positions.dtype,
+            device=self.device,
+        )
+        self._terminal_source_support_z = terminal_sole_support_plane_z(
+            terminal_foot_positions,
+            terminal_foot_orientations,
+            sole_corners_b,
+        )
+
+    def _terminal_platform_z_alignment(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the configured final-hold platform-relative reference offset."""
+
+        if self._terminal_source_support_z is None:
+            zero = torch.zeros(self.num_envs, dtype=self.motion.body_pos_w.dtype, device=self.device)
+            return zero, zero, torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.reference_transform_asset is None:
+            raise RuntimeError("Terminal platform z alignment lost its configured reference asset.")
+        base_size = self.cfg.terminal_platform_alignment_base_size
+        if base_size is None:
+            raise RuntimeError("Terminal platform z alignment lost its configured base size.")
+        platform_sizes = get_climb_box_sizes(
+            self.reference_transform_asset,
+            base_size=base_size,
+            device=self.device,
+        )
+        if platform_sizes.shape != (self.num_envs, 3):
+            raise RuntimeError(
+                "Terminal platform z alignment received invalid platform sizes: "
+                f"expected {(self.num_envs, 3)}, got {platform_sizes.shape}."
+            )
+        # Motion clips are stored in the per-environment local frame, whereas
+        # the platform root position is world-frame.  ``body_pos_w`` adds the
+        # environment origin after this correction, so align both support
+        # planes in the local frame here; otherwise a nonzero terrain origin
+        # would be applied twice.
+        platform_top_z = (
+            self.reference_transform_asset.data.root_pos_w[:, 2]
+            + 0.5 * platform_sizes[:, 2]
+            - self._env.scene.env_origins[:, 2]
+        )
+        return terminal_platform_z_alignment(
+            self._terminal_source_support_z[self.motion_ids],
+            platform_top_z,
+            self.motion_final_hold_count,
+            ramp_steps=self._terminal_platform_alignment_ramp_steps,
+            step_dt=self._env.step_dt,
+            terminal_clearance=self.cfg.terminal_platform_alignment_clearance,
+        )
+
     @property
     def source_joint_pos(self) -> torch.Tensor:
         """Joint positions read directly from the immutable motion dataset."""
@@ -269,6 +391,14 @@ class MotionCommand(CommandTerm):
             min=0.0,
             max=1.0,
         )
+
+    @property
+    def terminal_platform_alignment_complete(self) -> torch.Tensor:
+        """Whether terminal reference z alignment has finished for each environment."""
+
+        if self._terminal_source_support_z is None:
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        return self.motion_final_hold_count >= self._terminal_platform_alignment_ramp_steps
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -302,6 +432,8 @@ class MotionCommand(CommandTerm):
 
         transformed = positions + self._env.scene.env_origins[:, None, :]
         transformed[..., :2] = self.reference_transform_asset.data.root_pos_w[:, None, :2] + rotated_delta[..., :2]
+        terminal_z_offset, _, _ = self._terminal_platform_z_alignment()
+        transformed[..., 2] += terminal_z_offset[:, None]
         return transformed
 
     @property
@@ -319,7 +451,10 @@ class MotionCommand(CommandTerm):
         if self.reference_transform_asset is None:
             return velocities
         yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
-        return quat_apply(yaw_delta[:, None, :].expand(-1, velocities.shape[1], -1), velocities)
+        transformed = quat_apply(yaw_delta[:, None, :].expand(-1, velocities.shape[1], -1), velocities)
+        _, terminal_z_velocity, _ = self._terminal_platform_z_alignment()
+        transformed[..., 2] += terminal_z_velocity[:, None]
+        return transformed
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
@@ -641,6 +776,16 @@ class MotionCommandCfg(CommandTermCfg):
 
     reference_transform_asset_name: str | None = None
     reference_transform_nominal_xy: tuple[float, float] = (0.0, 0.0)
+
+    # Optional climb-only terminal correction.  During the extra final-frame
+    # hold, all reference bodies translate together so the source's physical
+    # sole plane meets the sampled platform top.  Joints and orientations stay
+    # exactly equal to the source motion.
+    terminal_platform_alignment_foot_body_names: tuple[str, ...] = ()
+    terminal_platform_alignment_sole_corners_b: tuple[tuple[float, float, float], ...] = ()
+    terminal_platform_alignment_base_size: tuple[float, float, float] | None = None
+    terminal_platform_alignment_clearance: float = 0.0
+    terminal_platform_alignment_ramp_time_s: float = 0.0
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}

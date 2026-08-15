@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import unittest
 from pathlib import Path
 
@@ -17,28 +18,32 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(joint_settling)
 
 
+_SCORE_KWARGS = {
+    "rms_speed_tolerance": 0.35,
+    "max_speed_tolerance": 0.5,
+    "rms_speed_scale": 0.35,
+    "max_speed_scale": 0.35,
+    "fine_max_speed_scale": 0.25,
+    "score_weights": (0.25, 0.60, 0.15),
+}
+
+
 class JointSettlingScoreTest(unittest.TestCase):
-    def test_score_is_one_at_rest_and_decreases_with_speed(self):
+    def test_success_band_is_high_and_fast_terminal_motion_is_strongly_disfavoured(self):
         velocities = torch.tensor(
             [
                 [0.0, 0.0, 0.0],
-                [0.25, 0.25, 0.25],
                 [0.5, 0.5, 0.5],
                 [1.0, 1.0, 1.0],
-                [2.0, 2.0, 2.0],
+                [3.0, 3.0, 3.0],
             ]
         )
-        score = joint_settling.joint_settling_score(
-            velocities,
-            rms_speed_scale=1.0,
-            max_speed_scale=2.0,
-            fine_max_speed_scale=0.5,
-            score_weights=(0.4, 0.3, 0.3),
-        )
+        score = joint_settling.joint_settling_score(velocities, **_SCORE_KWARGS)
 
         self.assertAlmostEqual(score[0].item(), 1.0)
-        self.assertTrue(torch.all(score[:-1] > score[1:]))
-        self.assertGreater(score[-1].item(), 0.05)
+        self.assertGreaterEqual(score[1].item(), 0.95)
+        self.assertLessEqual(score[2].item(), 0.30)
+        self.assertLessEqual(score[3].item(), 0.06)
 
     def test_maximum_component_exposes_one_fast_joint(self):
         distributed = torch.tensor([[0.5, 0.5, 0.5, 0.5]])
@@ -48,21 +53,23 @@ class JointSettlingScoreTest(unittest.TestCase):
 
         torch.testing.assert_close(distributed_rms, sparse_rms)
         self.assertGreater(sparse_max.item(), distributed_max.item())
-        distributed_score = joint_settling.joint_settling_score(
-            distributed,
-            rms_speed_scale=1.0,
-            max_speed_scale=2.0,
-            fine_max_speed_scale=0.5,
-            score_weights=(0.4, 0.3, 0.3),
-        )
-        sparse_score = joint_settling.joint_settling_score(
-            one_fast_joint,
-            rms_speed_scale=1.0,
-            max_speed_scale=2.0,
-            fine_max_speed_scale=0.5,
-            score_weights=(0.4, 0.3, 0.3),
-        )
+        distributed_score = joint_settling.joint_settling_score(distributed, **_SCORE_KWARGS)
+        sparse_score = joint_settling.joint_settling_score(one_fast_joint, **_SCORE_KWARGS)
         self.assertLess(sparse_score.item(), distributed_score.item())
+
+    def test_current_high_speed_regime_remains_low_but_has_a_finite_gradient(self):
+        # One 3.09 rad/s joint and the remaining joints chosen to give the
+        # observed approximately 1.08 rad/s RMS terminal regime.
+        other_speed = math.sqrt((29 * 1.08**2 - 3.09**2) / 28)
+        velocities = torch.full((1, 29), other_speed, requires_grad=True)
+        with torch.no_grad():
+            velocities[0, 0] = 3.09
+
+        score = joint_settling.joint_settling_score(velocities, **_SCORE_KWARGS)
+        self.assertLessEqual(score.item(), 0.06)
+        score.backward()
+        self.assertTrue(torch.isfinite(velocities.grad).all())
+        self.assertGreater(torch.linalg.vector_norm(velocities.grad).item(), 1.0e-4)
 
     def test_rejects_invalid_shapes_and_parameters(self):
         with self.assertRaisesRegex(ValueError, "shape"):
@@ -70,6 +77,8 @@ class JointSettlingScoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             joint_settling.joint_settling_score(
                 torch.zeros(1, 2),
+                rms_speed_tolerance=0.35,
+                max_speed_tolerance=0.5,
                 rms_speed_scale=0.0,
                 max_speed_scale=2.0,
                 fine_max_speed_scale=0.5,

@@ -299,6 +299,46 @@ class ClimbBoxGeometryTest(unittest.TestCase):
         torch.testing.assert_close(third, torch.tensor([[0.06, 0.00]]))
         torch.testing.assert_close(interrupted, torch.tensor([[0.00, 0.02]]))
 
+    def test_terminal_alignment_uses_the_lowest_physical_sole_and_has_quiet_endpoints(self):
+        foot_positions = torch.tensor(
+            [
+                [[0.0, 0.0, 0.70], [0.0, 0.0, 0.72]],
+                [[0.0, 0.0, 0.68], [0.0, 0.0, 0.74]],
+            ],
+            dtype=torch.float32,
+        )
+        foot_orientations = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]], dtype=torch.float32
+        ).expand(2, -1, -1)
+        corners_b = torch.tensor(
+            [[-0.09, -0.04, -0.04], [-0.09, 0.04, -0.04], [0.15, -0.04, -0.04], [0.15, 0.04, -0.04]],
+            dtype=torch.float32,
+        )
+        support_z = obstacle.terminal_sole_support_plane_z(foot_positions, foot_orientations, corners_b)
+        torch.testing.assert_close(support_z, torch.tensor([0.66, 0.64]))
+
+        position_offset, velocity_offset, complete = obstacle.terminal_platform_z_alignment(
+            support_z,
+            torch.tensor([0.60, 0.70]),
+            torch.tensor([0, 25]),
+            ramp_steps=25,
+            step_dt=0.02,
+        )
+        torch.testing.assert_close(position_offset, torch.tensor([0.0, 0.06]))
+        torch.testing.assert_close(velocity_offset, torch.zeros(2))
+        self.assertEqual(complete.tolist(), [False, True])
+
+        midpoint_offset, midpoint_velocity, midpoint_complete = obstacle.terminal_platform_z_alignment(
+            support_z[:1],
+            torch.tensor([0.60]),
+            torch.tensor([12]),
+            ramp_steps=25,
+            step_dt=0.02,
+        )
+        self.assertLess(midpoint_offset.abs().item(), 0.06)
+        self.assertGreater(midpoint_velocity.abs().item(), 0.0)
+        self.assertFalse(midpoint_complete.item())
+
 
 if __name__ == "__main__":
     unittest.main()
