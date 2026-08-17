@@ -305,10 +305,24 @@ def platform_foot_load_score(
             "Platform foot-load gating expected default_mass with shape [bodies] or [num_envs, bodies], "
             f"got {tuple(default_mass.shape)}."
         )
-    total_weight = total_mass.to(dtype=state.upward_forces.dtype) * gravity_magnitude
-    minimum_load = total_weight * min_total_load_fraction
-    if torch.any(minimum_load <= 0.0):
+    # ``min_total_load_fraction`` and ``gravity_magnitude`` were validated as
+    # strictly positive above, so this native-device mass check is equivalent
+    # to checking ``minimum_load`` below.  In the common Isaac Lab case where
+    # default masses live on CPU, doing it before the transfer avoids a CUDA
+    # scalar synchronization in a helper evaluated by several terms per step.
+    if torch.any(total_mass <= 0.0):
         raise RuntimeError("Platform foot-load gating received a non-positive robot weight.")
+
+    # Isaac Lab can keep articulation default masses on CPU while contact
+    # forces are produced on the simulation device.  Move both dtype and
+    # device explicitly before combining them; ``Tensor.to(dtype=...)`` alone
+    # deliberately preserves the CPU device and would fail on the first
+    # training step.
+    total_weight = total_mass.to(
+        device=state.upward_forces.device,
+        dtype=state.upward_forces.dtype,
+    ) * gravity_magnitude
+    minimum_load = total_weight * min_total_load_fraction
     return (state.upward_forces.sum(dim=1) / minimum_load).clamp(min=0.0, max=1.0)
 
 
