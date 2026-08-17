@@ -164,7 +164,11 @@ def _configure_playback(env_cfg: ManagerBasedRLEnvCfg) -> None:
     # frame. Terminations are disabled below, so motion_finished cannot reset
     # or teleport the robot after the clip completes.
     motion_cfg.terminate_on_motion_end = True
-    motion_cfg.motion_end_hold_time_s = 0.0
+    # Preserve the task's configured final hold.  Terminal reference alignment
+    # may use this interval to move smoothly onto the sampled platform before
+    # the stationary final pose is evaluated.  With play terminations disabled
+    # below, the final NPZ frame still remains displayed indefinitely after
+    # that configured interval has elapsed.
     motion_cfg.adaptive_failure_term_names = ()
     motion_cfg.random_phase_env_mask_attr = None
     # Remove reset-state perturbations as well as random phase selection. This

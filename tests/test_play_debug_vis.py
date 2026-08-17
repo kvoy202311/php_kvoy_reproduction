@@ -52,6 +52,22 @@ class PlayDebugVisualizationTest(unittest.TestCase):
         self.assertEqual(len(assignments), 1)
         self.assertTrue(_is_attribute(assignments[0].value, "args_cli", "debug_vis"))
 
+    def test_full_clip_configuration_preserves_the_task_final_hold(self):
+        """Playback must not disable a configured terminal alignment window."""
+
+        configure = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_configure_playback"
+        )
+        assignments = [
+            node
+            for node in ast.walk(configure)
+            if isinstance(node, ast.Assign)
+            and any(_is_attribute(target, "motion_cfg", "motion_end_hold_time_s") for target in node.targets)
+        ]
+        self.assertEqual(assignments, [])
+
 
 if __name__ == "__main__":
     unittest.main()
