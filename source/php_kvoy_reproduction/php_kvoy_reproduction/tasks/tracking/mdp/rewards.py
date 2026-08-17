@@ -6,7 +6,7 @@ import torch
 from typing import TYPE_CHECKING, NamedTuple
 
 import isaaclab.utils.math as math_utils
-from isaaclab.assets import RigidObject
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude
@@ -24,6 +24,11 @@ from php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry import (
     foothold_safety_violation,
     sole_top_height_score,
 )
+from php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support import (
+    platform_foot_load_score,
+    platform_foot_support_score,
+    platform_foot_support_state,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -31,6 +36,98 @@ if TYPE_CHECKING:
 
 def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> list[int]:
     return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
+
+
+def _terminal_expert_tracking_factor(command: MotionCommand) -> torch.Tensor:
+    """Return the source-reference weight during default-pose takeover.
+
+    The command exposes this factor only for the climb terminal mode.  The
+    fallback keeps generic tracking tasks and lightweight unit-test doubles
+    behaviorally unchanged.
+    """
+
+    dtype = command.joint_pos.dtype if hasattr(command, "joint_pos") else torch.float32
+    device = command.time_steps.device
+    factor = getattr(command, "terminal_default_pose_expert_tracking_factor", None)
+    if factor is None:
+        return torch.ones(command.time_steps.shape, dtype=dtype, device=device)
+    if factor.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_default_pose_expert_tracking_factor must match command time_steps, "
+            f"got {factor.shape} and {command.time_steps.shape}."
+        )
+    return factor.to(dtype=dtype).clamp(min=0.0, max=1.0)
+
+
+def _terminal_default_pose_latched_gate(command: MotionCommand) -> torch.Tensor:
+    """Return one after the command has switched to its sole terminal q target.
+
+    The terminal default-pose reward is climb-specific.  A generic command
+    that lacks the one-way mode must not accidentally receive this reward.
+    """
+
+    dtype = command.joint_pos.dtype if hasattr(command, "joint_pos") else torch.float32
+    device = command.time_steps.device
+    latched = getattr(command, "terminal_default_pose_latched", None)
+    if latched is None:
+        return torch.zeros(command.time_steps.shape, dtype=dtype, device=device)
+    if latched.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_default_pose_latched must match command time_steps, "
+            f"got {latched.shape} and {command.time_steps.shape}."
+        )
+    return latched.to(dtype=dtype)
+
+
+def _terminal_default_pose_complete_gate(command: MotionCommand) -> torch.Tensor:
+    """Return one only once the terminal q target has reached default."""
+
+    dtype = command.joint_pos.dtype if hasattr(command, "joint_pos") else torch.float32
+    device = command.time_steps.device
+    complete = getattr(command, "terminal_default_pose_complete", None)
+    if complete is None:
+        return torch.ones(command.time_steps.shape, dtype=dtype, device=device)
+    if complete.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_default_pose_complete must match command time_steps, "
+            f"got {complete.shape} and {command.time_steps.shape}."
+        )
+    return complete.to(dtype=dtype)
+
+
+def _terminal_stationary_target_gate(command: MotionCommand) -> torch.Tensor:
+    """Enable settling only when the current terminal target is stationary.
+
+    Before terminal default-pose mode latches, the immutable source static
+    tail is a single, stationary expert target.  During the subsequent q
+    interpolation the target deliberately moves, so high-weight stability
+    rewards must be off.  Once interpolation completes, default q is again a
+    single stationary target.  This gives a useful pre-latch settling bridge
+    without ever combining expert and default pose objectives.
+    """
+
+    dtype = command.joint_pos.dtype if hasattr(command, "joint_pos") else torch.float32
+    device = command.time_steps.device
+    complete = _terminal_default_pose_complete_gate(command).to(dtype=torch.bool)
+    latched = getattr(command, "terminal_default_pose_latched", None)
+    static_tail = getattr(command, "terminal_default_pose_static_tail", None)
+    # Keep generic commands and lightweight test doubles on their historical
+    # behavior: they only become eligible once an exposed completion gate is
+    # true.  Production MotionCommand exposes both state tensors.
+    if latched is None or static_tail is None:
+        return complete.to(dtype=dtype)
+    if latched.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_default_pose_latched must match command time_steps, "
+            f"got {latched.shape} and {command.time_steps.shape}."
+        )
+    if static_tail.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "terminal_default_pose_static_tail must match command time_steps, "
+            f"got {static_tail.shape} and {command.time_steps.shape}."
+        )
+    stationary_source = ~latched.to(dtype=torch.bool) & static_tail.to(dtype=torch.bool)
+    return (stationary_source | complete).to(dtype=dtype, device=device)
 
 
 class _FirstFootholdSettings(NamedTuple):
@@ -167,13 +264,13 @@ def _named_body_ids(
 def motion_global_anchor_position_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = torch.sum(torch.square(command.anchor_pos_w - command.robot_anchor_pos_w), dim=-1)
-    return torch.exp(-error / std**2)
+    return _terminal_expert_tracking_factor(command) * torch.exp(-error / std**2)
 
 
 def motion_global_anchor_orientation_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w) ** 2
-    return torch.exp(-error / std**2)
+    return _terminal_expert_tracking_factor(command) * torch.exp(-error / std**2)
 
 
 def motion_relative_body_position_error_exp(
@@ -198,6 +295,7 @@ def _terminal_platform_contact_gate(
     foot_height_std: float,
     min_contact_force: float,
     contact_time_scale: float,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Return a smooth gate that requires both feet to contact the platform."""
 
@@ -212,6 +310,7 @@ def _terminal_platform_contact_gate(
         foot_height_std,
         min_contact_force,
         contact_time_scale,
+        platform_support_params,
     )
     # The minimum prevents one well-supported foot from masking a missing or
     # poorly supported second foot.
@@ -324,6 +423,7 @@ def _climb_terminal_gate(
     min_contact_force: float,
     contact_time_scale: float,
     terminal_window_time_s: float,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Fade terminal objectives in only near the clip end after contact."""
 
@@ -338,6 +438,7 @@ def _climb_terminal_gate(
         foot_height_std,
         min_contact_force,
         contact_time_scale,
+        platform_support_params,
     )
 
 
@@ -359,6 +460,7 @@ def climb_motion_relative_body_position_error_exp(
     terminal_window_time_s: float,
     first_foothold_params: Mapping[str, object] | None = None,
     first_foothold_body_weights: Mapping[str, float] | None = None,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Track climb body positions while freeing an arriving physical foot."""
 
@@ -381,6 +483,7 @@ def climb_motion_relative_body_position_error_exp(
         min_contact_force,
         contact_time_scale,
         terminal_window_time_s,
+        platform_support_params,
     )
     first_foothold_gates: torch.Tensor | None = None
     first_foothold_foot_body_names: tuple[str, ...] | None = None
@@ -395,7 +498,7 @@ def climb_motion_relative_body_position_error_exp(
             first_foothold_params,
         )
         first_foothold_foot_body_names = settings.foot_body_names
-    return _terminal_weighted_body_error_exp(
+    score = _terminal_weighted_body_error_exp(
         error,
         command,
         body_indexes,
@@ -407,6 +510,7 @@ def climb_motion_relative_body_position_error_exp(
         first_foothold_foot_body_names,
         first_foothold_body_weights,
     )
+    return _terminal_expert_tracking_factor(command) * score
 
 
 def motion_relative_body_orientation_error_exp(
@@ -439,6 +543,7 @@ def climb_motion_relative_body_orientation_error_exp(
     terminal_window_time_s: float,
     first_foothold_params: Mapping[str, object] | None = None,
     first_foothold_body_weights: Mapping[str, float] | None = None,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Track body orientations while freeing an arriving ankle from the reference."""
 
@@ -460,6 +565,7 @@ def climb_motion_relative_body_orientation_error_exp(
         min_contact_force,
         contact_time_scale,
         terminal_window_time_s,
+        platform_support_params,
     )
     first_foothold_gates: torch.Tensor | None = None
     first_foothold_foot_body_names: tuple[str, ...] | None = None
@@ -476,7 +582,7 @@ def climb_motion_relative_body_orientation_error_exp(
             first_foothold_params,
         )
         first_foothold_foot_body_names = settings.foot_body_names
-    return _terminal_weighted_body_error_exp(
+    score = _terminal_weighted_body_error_exp(
         error,
         command,
         body_indexes,
@@ -488,6 +594,7 @@ def climb_motion_relative_body_orientation_error_exp(
         first_foothold_foot_body_names,
         first_foothold_body_weights,
     )
+    return _terminal_expert_tracking_factor(command) * score
 
 
 def motion_global_body_linear_velocity_error_exp(
@@ -561,7 +668,7 @@ def climb_motion_global_body_linear_velocity_error_exp(
         base_size,
         first_foothold_params,
     )
-    return _first_foothold_weighted_body_error_exp(
+    score = _first_foothold_weighted_body_error_exp(
         error,
         command,
         body_indexes,
@@ -570,6 +677,7 @@ def climb_motion_global_body_linear_velocity_error_exp(
         settings.foot_body_names,
         first_foothold_body_weights,
     )
+    return _terminal_expert_tracking_factor(command) * score
 
 
 def climb_motion_global_body_angular_velocity_error_exp(
@@ -596,7 +704,7 @@ def climb_motion_global_body_angular_velocity_error_exp(
         base_size,
         first_foothold_params,
     )
-    return _first_foothold_weighted_body_error_exp(
+    score = _first_foothold_weighted_body_error_exp(
         error,
         command,
         body_indexes,
@@ -605,6 +713,7 @@ def climb_motion_global_body_angular_velocity_error_exp(
         settings.foot_body_names,
         first_foothold_body_weights,
     )
+    return _terminal_expert_tracking_factor(command) * score
 
 
 def _smoothstep_window(value: torch.Tensor, start: float, end: float) -> torch.Tensor:
@@ -795,10 +904,35 @@ def _first_foothold_tracking_gates(
     base_size: tuple[float, float, float],
     first_foothold_params: Mapping[str, object],
 ) -> tuple[torch.Tensor, _FirstFootholdSettings]:
-    """Return one pre-contact fade gate, restricted to the reference-leading foot."""
+    """Return a post-contact fade gate, restricted to the reference-leading foot.
+
+    The old gate faded ankle tracking while a foot was merely approaching the
+    box.  That made an air-borne foot almost unconstrained and opened the
+    hand-supported shortcut.  A fade is now allowed only after the same real
+    sole geometry and filtered ``ClimbPlatform`` +z support used by terminal
+    terms are present.  This helper is deliberately stateless: the four body
+    tracking rewards may call it in one policy step without accelerating a
+    contact timer.
+    """
 
     state = _first_foothold_state(env, command, platform_cfg, base_size, first_foothold_params)
-    return state.reference_gate[:, None] * state.reference_lead_mask * state.precontact_scores, state.settings
+    support = platform_foot_support_state(
+        env,
+        command.robot,
+        command.device,
+        platform_cfg,
+        base_size,
+        first_foothold_params,
+        min_upward_force=state.settings.min_upward_force,
+        sole_height_tolerance=state.settings.foot_height_std,
+    )
+    if support.settings.foot_body_names != state.settings.foot_body_names:
+        raise RuntimeError("First-foothold physical support feet do not match the reference-foot ordering.")
+    return (
+        state.reference_gate[:, None]
+        * state.reference_lead_mask
+        * support.active_support.to(dtype=state.reference_gate.dtype)
+    ), state.settings
 
 
 def _first_foothold_sole_safety(
@@ -960,12 +1094,13 @@ def climb_platform_progress(
     lift_weight: float = 0.35,
     max_delta_per_step: float = 0.05,
     first_foothold_params: Mapping[str, object] | None = None,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Give conservative progress shaping for the physical climb geometry.
 
     The approach term saturates at the platform's near edge, so it cannot
     reward driving through the box.  The lift term uses the *sampled* platform
-    top height and is gated by an actual foot/hand support proximity score and
+    top height and is gated by an actual foot-support score and
     a broad expert-motion phase window. Both terms reward only newly reached
     episode-best progress. Their historical maxima are reset on every
     episode, so losing and regaining the same contact cannot farm reward. This
@@ -1028,24 +1163,55 @@ def climb_platform_progress(
     lift_progress = (
         (lift_positions[..., 2] - (platform_top[:, None] - lift_height_window)) / lift_height_window
     ).clamp(min=0.0, max=1.0)
-    support_scores = _climb_platform_support_score(
-        env,
-        command,
-        platform,
-        sizes,
-        support_body_names,
-        contact_sensor_cfg,
-        support_xy_margin,
-        support_height_std,
-        min_contact_force,
-        contact_time_scale,
-    )
-    # The generic contact term intentionally includes wrists as well as feet.
-    # For ankle entries, additionally require the true sole to meet the same
-    # hard footprint rule as the first-foot reward.  Thus the historical
-    # 12 cm ankle-origin support margin cannot award lift progress for a heel
-    # more than 5 cm off the near edge or a toe at the far edge.
-    if first_foothold_params is not None:
+    if platform_support_params is not None:
+        support = platform_foot_support_state(
+            env,
+            command.robot,
+            command.device,
+            platform_cfg,
+            base_size,
+            platform_support_params,
+            min_upward_force=min_contact_force,
+            sole_height_tolerance=support_height_std,
+        )
+        if (
+            tuple(support_body_names) != support.settings.foot_body_names
+            or tuple(lift_body_names) != support.settings.foot_body_names
+        ):
+            raise ValueError(
+                "Strict climb progress requires support_body_names and lift_body_names to exactly match the two "
+                "platform-support feet; hands may assist physically but cannot earn progress credit."
+            )
+        filtered_time = getattr(command, "platform_foot_filtered_contact_time", None)
+        if filtered_time is None:
+            raise RuntimeError(
+                "Strict climb progress requires command-owned filtered support time; it must be advanced by "
+                "MotionCommand update, not by the reward."
+            )
+        support_scores = platform_foot_support_score(
+            support,
+            filtered_time,
+            min_upward_force=min_contact_force,
+            contact_time_scale=contact_time_scale,
+            sole_height_tolerance=support_height_std,
+        )
+    else:
+        support_scores = _climb_platform_support_score(
+            env,
+            command,
+            platform,
+            sizes,
+            support_body_names,
+            contact_sensor_cfg,
+            support_xy_margin,
+            support_height_std,
+            min_contact_force,
+            contact_time_scale,
+        )
+    # Legacy generic callers may contain ankles alongside other support
+    # bodies.  Tighten those ankle entries with the real sole geometry.  The
+    # strict path above already uses that geometry directly.
+    if platform_support_params is None and first_foothold_params is not None:
         first_foothold_state = _first_foothold_state(
             env,
             command,
@@ -1159,6 +1325,69 @@ def climb_final_default_joint_position_error_exp(
     return hold_progress * contact_gate * torch.exp(-mean_squared_error / std**2)
 
 
+def terminal_default_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    std: float,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
+) -> torch.Tensor:
+    """Track the command's single smooth terminal q target over all joints.
+
+    This is deliberately *not* a direct reward to ``default_joint_pos``.  In
+    the 0.8 s transition the sole target is ``command.joint_pos``, which moves
+    continuously from the latched real supported q to default. The reward
+    starts when that one-way target mode latches (including its source-q
+    boundary frame), and receives strict bilateral platform/load gating, so a
+    hand-supported hover cannot earn default-pose credit.
+    """
+
+    if std <= 0.0:
+        raise ValueError(f"std must be positive, got {std}.")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+    if joint_ids is None or len(joint_ids) == 0:
+        raise RuntimeError("The terminal default-pose reward requires resolved non-empty joint_ids.")
+    terminal_mode_active = _terminal_default_pose_latched_gate(command)
+    target_joint_pos = command.joint_pos[:, joint_ids]
+    robot_joint_pos = asset.data.joint_pos[:, joint_ids]
+    mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
+    two_foot_support = _terminal_platform_contact_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        platform_support_params,
+    )
+    foot_load_score = _platform_foot_load_score(
+        env,
+        command,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_contact_force=min_contact_force,
+        foot_height_std=foot_height_std,
+        min_total_load_fraction=min_total_load_fraction,
+    )
+    return terminal_mode_active * two_foot_support * foot_load_score * torch.exp(-mean_squared_error / std**2)
+
+
 def _final_phase_gate(command: MotionCommand, window_time_s: float, step_dt: float) -> torch.Tensor:
     """Ramp a reward on during the final reference-motion window."""
 
@@ -1204,7 +1433,7 @@ def _expert_static_tail_gate(
 
 
 def _terminal_platform_alignment_gate(command: MotionCommand) -> torch.Tensor:
-    """Return one only after an optional terminal platform-z correction finishes.
+    """Return one only after the optional terminal platform Z bridge finishes.
 
     Older/generic motion commands do not configure the correction.  They are
     treated as already aligned so this climb-only gate remains backward
@@ -1291,6 +1520,7 @@ def _platform_foot_contact_scores(
     foot_height_std: float,
     min_contact_force: float,
     contact_time_scale: float,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Return one physical contact score per configured foot in ``[0, 1]``."""
 
@@ -1305,6 +1535,36 @@ def _platform_foot_contact_scores(
     ):
         if value <= 0.0:
             raise ValueError(f"{name} must be positive, got {value}.")
+
+    if platform_support_params is not None:
+        support = platform_foot_support_state(
+            env,
+            command.robot,
+            command.device,
+            platform_cfg,
+            base_size,
+            platform_support_params,
+            min_upward_force=min_contact_force,
+            sole_height_tolerance=foot_height_std,
+        )
+        if tuple(foot_body_names) != support.settings.foot_body_names:
+            raise ValueError(
+                "foot_body_names must exactly match platform_support_params['foot_body_names'] so all terminal "
+                "terms share one physical support definition."
+            )
+        filtered_time = getattr(command, "platform_foot_filtered_contact_time", None)
+        if filtered_time is None:
+            raise RuntimeError(
+                "Strict platform-foot scores require MotionCommand.platform_foot_filtered_contact_time; "
+                "advance it once from command update, not from rewards."
+            )
+        return platform_foot_support_score(
+            support,
+            filtered_time,
+            min_upward_force=min_contact_force,
+            contact_time_scale=contact_time_scale,
+            sole_height_tolerance=foot_height_std,
+        )
 
     platform: RigidObject = env.scene[platform_cfg.name]
     sizes = get_climb_box_sizes(platform, base_size=base_size, device=platform.device)
@@ -1344,6 +1604,44 @@ def _platform_foot_contact_scores(
     return feet_inside * height_score * force_score * time_score
 
 
+def _platform_foot_load_score(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    platform_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    platform_support_params: Mapping[str, object] | None,
+    *,
+    min_contact_force: float,
+    foot_height_std: float,
+    min_total_load_fraction: float,
+) -> torch.Tensor:
+    """Return foot-borne load share for strict terminal terms.
+
+    A zero requested fraction remains neutral for generic/backward-compatible
+    callers.  Climb passes 0.50, preventing the two feet from merely touching
+    the platform while a wrist carries most of the robot.
+    """
+
+    if platform_support_params is None or min_total_load_fraction == 0.0:
+        reference = command.joint_pos if hasattr(command, "joint_pos") else command.robot_joint_vel
+        return torch.ones(command.time_steps.shape, dtype=reference.dtype, device=reference.device)
+    support = platform_foot_support_state(
+        env,
+        command.robot,
+        command.device,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_upward_force=min_contact_force,
+        sole_height_tolerance=foot_height_std,
+    )
+    return platform_foot_load_score(
+        support,
+        command.robot,
+        min_total_load_fraction=min_total_load_fraction,
+    )
+
+
 def platform_foot_contact(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -1356,6 +1654,7 @@ def platform_foot_contact(
     min_contact_force: float,
     contact_time_scale: float,
     terminal_window_time_s: float,
+    platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Reward actual two-foot contact with the physical platform top."""
 
@@ -1372,8 +1671,11 @@ def platform_foot_contact(
         foot_height_std,
         min_contact_force,
         contact_time_scale,
+        platform_support_params,
     )
-    return gate * per_foot_scores.mean(dim=1)
+    # A mean would let one planted foot hide an unsupported second foot.  The
+    # minimum makes this a genuine bilateral-platform reward.
+    return gate * per_foot_scores.amin(dim=1)
 
 
 def final_standing_stability(
@@ -1393,6 +1695,8 @@ def final_standing_stability(
     joint_speed_std: float,
     torso_tilt_std: float,
     stability_weights: tuple[float, float, float, float],
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
 ) -> torch.Tensor:
     """Reward a quiet upright stand after the feet contact the platform.
 
@@ -1433,8 +1737,19 @@ def final_standing_stability(
         foot_height_std,
         min_contact_force,
         contact_time_scale,
+        platform_support_params,
     )
-    contact_score = per_foot_scores.mean(dim=1)
+    contact_score = per_foot_scores.amin(dim=1)
+    foot_load_score = _platform_foot_load_score(
+        env,
+        command,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_contact_force=min_contact_force,
+        foot_height_std=foot_height_std,
+        min_total_load_fraction=min_total_load_fraction,
+    )
 
     root_linear_speed = torch.linalg.vector_norm(command.robot_anchor_lin_vel_w, dim=-1)
     root_angular_speed = torch.linalg.vector_norm(command.robot_anchor_ang_vel_w, dim=-1)
@@ -1458,7 +1773,8 @@ def final_standing_stability(
         (weight / weight_sum) * score for weight, score in zip(stability_weights, stability_scores, strict=True)
     )
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=stability_score.dtype)
-    return alignment_complete * gate * contact_score * stability_score
+    stationary_target = _terminal_stationary_target_gate(command)
+    return alignment_complete * stationary_target * gate * contact_score * foot_load_score * stability_score
 
 
 def final_joint_settling(
@@ -1479,6 +1795,8 @@ def final_joint_settling(
     max_speed_scale: float,
     fine_max_speed_scale: float,
     score_weights: tuple[float, float, float],
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
 ) -> torch.Tensor:
     """Reward real joint settling during the expert's stationary tail.
 
@@ -1494,7 +1812,16 @@ def final_joint_settling(
             f"reference_max_joint_speed must be non-negative, got {reference_max_joint_speed}."
         )
     command: MotionCommand = env.command_manager.get_term(command_name)
-    reference_speed = torch.max(torch.abs(command.joint_vel), dim=1).values
+    # Inspect the immutable source tail, not the temporary q interpolation.
+    # The latter correctly has non-zero command velocity during default-pose
+    # takeover and is not evidence that the expert clip is still moving.
+    if hasattr(command.motion, "joint_vel"):
+        source_joint_vel = command.motion.joint_vel[command.time_steps]
+    else:
+        # Lightweight test doubles commonly expose only the current command
+        # velocity; production MotionCommand always follows the branch above.
+        source_joint_vel = command.joint_vel
+    reference_speed = torch.max(torch.abs(source_joint_vel), dim=1).values
     # The source clips also begin with a short static segment. Requiring the
     # second half of the clip prevents the settling reward from firing at the
     # initial stand before the climb has started.
@@ -1516,10 +1843,21 @@ def final_joint_settling(
         foot_height_std,
         min_contact_force,
         contact_time_scale,
+        platform_support_params,
     )
     # The minimum prevents one planted foot from opening the settling reward
     # while the other foot is unsupported or still moving onto the platform.
     two_foot_support = per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
+    foot_load_score = _platform_foot_load_score(
+        env,
+        command,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_contact_force=min_contact_force,
+        foot_height_std=foot_height_std,
+        min_total_load_fraction=min_total_load_fraction,
+    )
     settling_score = joint_settling_score(
         command.robot_joint_vel,
         rms_speed_tolerance=rms_speed_tolerance,
@@ -1530,7 +1868,15 @@ def final_joint_settling(
         score_weights=score_weights,
     )
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=settling_score.dtype)
-    return alignment_complete * reference_stopped.to(dtype=settling_score.dtype) * two_foot_support * settling_score
+    stationary_target = _terminal_stationary_target_gate(command)
+    return (
+        alignment_complete
+        * stationary_target
+        * reference_stopped.to(dtype=settling_score.dtype)
+        * two_foot_support
+        * foot_load_score
+        * settling_score
+    )
 
 
 def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:

@@ -38,8 +38,12 @@ def _load_rewards_module():
         "php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry": types.ModuleType(
             "php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry"
         ),
+        "php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support": types.ModuleType(
+            "php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support"
+        ),
     }
     stubs["isaaclab.assets"].RigidObject = object
+    stubs["isaaclab.assets"].Articulation = object
     stubs["isaaclab.managers"].SceneEntityCfg = _SceneEntityCfg
     stubs["isaaclab.sensors"].ContactSensor = object
     stubs["isaaclab.utils.math"].quat_error_magnitude = lambda *_: torch.zeros(1)
@@ -60,6 +64,10 @@ def _load_rewards_module():
     obstacle_geometry.foothold_safety_score = lambda *_args, **_kwargs: None
     obstacle_geometry.foothold_safety_violation = lambda *_args, **_kwargs: None
     obstacle_geometry.sole_top_height_score = lambda *_args, **_kwargs: None
+    platform_foot_support = stubs["php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support"]
+    platform_foot_support.platform_foot_load_score = lambda *_args, **_kwargs: None
+    platform_foot_support.platform_foot_support_score = lambda *_args, **_kwargs: None
+    platform_foot_support.platform_foot_support_state = lambda *_args, **_kwargs: None
     saved = {name: sys.modules.get(name) for name in stubs}
     try:
         sys.modules.update(stubs)
@@ -138,8 +146,40 @@ class FirstFootholdTrackingFadeTest(unittest.TestCase):
         self.assertAlmostEqual(preserved_floor[0, 1].item(), 0.15, places=6)
 
 
+class TerminalDefaultPoseModeGateTest(unittest.TestCase):
+    def test_latched_terminal_mode_disables_expert_credit_and_enables_single_q_credit(self):
+        command = SimpleNamespace(
+            joint_pos=torch.zeros(2, 1),
+            time_steps=torch.zeros(2, dtype=torch.long),
+            terminal_default_pose_expert_tracking_factor=torch.tensor([1.0, 0.0]),
+            terminal_default_pose_latched=torch.tensor([False, True]),
+        )
+
+        torch.testing.assert_close(rewards._terminal_expert_tracking_factor(command), torch.tensor([1.0, 0.0]))
+        torch.testing.assert_close(rewards._terminal_default_pose_latched_gate(command), torch.tensor([0.0, 1.0]))
+
+    def test_default_pose_reward_gate_stays_off_without_terminal_mode(self):
+        command = SimpleNamespace(
+            joint_pos=torch.zeros(2, 1),
+            time_steps=torch.zeros(2, dtype=torch.long),
+        )
+
+        torch.testing.assert_close(rewards._terminal_default_pose_latched_gate(command), torch.zeros(2))
+
+
 class FinalJointSettlingRewardTest(unittest.TestCase):
-    def _call(self, reference_velocity, robot_velocity, support_scores, *, time_step=80, alignment_complete=None):
+    def _call(
+        self,
+        reference_velocity,
+        robot_velocity,
+        support_scores,
+        *,
+        time_step=80,
+        alignment_complete=None,
+        default_pose_complete=None,
+        default_pose_latched=None,
+        default_pose_static_tail=None,
+    ):
         command = SimpleNamespace(
             joint_vel=torch.tensor(reference_velocity, dtype=torch.float32),
             robot_joint_vel=torch.tensor(robot_velocity, dtype=torch.float32),
@@ -153,6 +193,12 @@ class FinalJointSettlingRewardTest(unittest.TestCase):
         )
         if alignment_complete is not None:
             command.terminal_platform_alignment_complete = torch.tensor(alignment_complete, dtype=torch.bool)
+        if default_pose_complete is not None:
+            command.terminal_default_pose_complete = torch.tensor(default_pose_complete, dtype=torch.bool)
+        if default_pose_latched is not None:
+            command.terminal_default_pose_latched = torch.tensor(default_pose_latched, dtype=torch.bool)
+        if default_pose_static_tail is not None:
+            command.terminal_default_pose_static_tail = torch.tensor(default_pose_static_tail, dtype=torch.bool)
         env = SimpleNamespace(command_manager=_CommandManager(command))
         with patch.object(
             rewards,
@@ -255,6 +301,31 @@ class FinalJointSettlingRewardTest(unittest.TestCase):
 
         self.assertEqual(reward[0].item(), 0.0)
         self.assertGreater(reward[1].item(), 0.0)
+
+    def test_terminal_settling_waits_for_default_pose_completion(self):
+        reward = self._call(
+            reference_velocity=[[0.0, 0.0], [0.0, 0.0]],
+            robot_velocity=[[0.1, 0.1], [0.1, 0.1]],
+            support_scores=[[1.0, 1.0], [1.0, 1.0]],
+            default_pose_complete=[False, True],
+        )
+
+        self.assertEqual(reward[0].item(), 0.0)
+        self.assertGreater(reward[1].item(), 0.0)
+
+    def test_terminal_settling_bridges_static_source_but_not_moving_default_transition(self):
+        reward = self._call(
+            reference_velocity=[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            robot_velocity=[[0.1, 0.1], [0.1, 0.1], [0.1, 0.1]],
+            support_scores=[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+            default_pose_complete=[False, False, True],
+            default_pose_latched=[False, True, True],
+            default_pose_static_tail=[True, True, True],
+        )
+
+        self.assertGreater(reward[0].item(), 0.0)
+        self.assertEqual(reward[1].item(), 0.0)
+        self.assertGreater(reward[2].item(), 0.0)
 
 
 class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):

@@ -68,6 +68,9 @@ def _load_terminations_module():
         "php_kvoy_reproduction.tasks.tracking.mdp.rewards": types.ModuleType(
             "php_kvoy_reproduction.tasks.tracking.mdp.rewards"
         ),
+        "php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support": types.ModuleType(
+            "php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support"
+        ),
     }
     stub_modules["isaaclab.utils.math"].quat_apply_inverse = _quat_apply_inverse
     stub_modules["isaaclab.assets"].Articulation = object
@@ -86,6 +89,9 @@ def _load_terminations_module():
         _points_inside_oriented_box_xy
     )
     stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.rewards"]._get_body_indexes = lambda *_: []
+    platform_foot_support = stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support"]
+    platform_foot_support.platform_foot_load_valid = lambda *_args, **_kwargs: None
+    platform_foot_support.platform_foot_support_state = lambda *_args, **_kwargs: None
 
     module_names = tuple(stub_modules)
     saved_modules = {name: sys.modules.get(name) for name in module_names}
@@ -208,11 +214,13 @@ class MotionEndSuccessTest(unittest.TestCase):
             "feet_inside": torch.ones_like(valid),
             "foot_height_valid": torch.ones_like(valid),
             "foot_contact_valid": torch.ones_like(valid),
+            "foot_load_valid": torch.ones_like(valid),
             "upright": torch.ones_like(valid),
             "root_height_valid": torch.ones_like(valid),
             "root_linear_speed_valid": torch.ones_like(valid),
             "root_angular_speed_valid": torch.ones_like(valid),
             "joint_speed_valid": torch.ones_like(valid),
+            "default_joint_pos_valid": torch.ones_like(valid),
         }
         conditions[invalid_condition] = valid.clone()
         return conditions, torch.zeros(valid.shape[0])
@@ -236,11 +244,13 @@ class MotionEndSuccessTest(unittest.TestCase):
             "feet_inside",
             "foot_height_valid",
             "foot_contact_valid",
+            "foot_load_valid",
             "upright",
             "root_height_valid",
             "root_linear_speed_valid",
             "root_angular_speed_valid",
             "joint_speed_valid",
+            "default_joint_pos_valid",
         )
         for condition_name in condition_names:
             with self.subTest(condition=condition_name):
@@ -307,6 +317,24 @@ class MotionEndSuccessTest(unittest.TestCase):
             result = _call_success_term(term, env)
         self.assertTrue(torch.all(result))
         torch.testing.assert_close(command.metrics["final_standing_terminal_alignment_complete"], torch.ones(3))
+
+    def test_success_window_waits_for_terminal_default_pose_completion(self):
+        term, env, command = _make_success_term()
+        command.terminal_default_pose_complete = torch.tensor([False, False, False])
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            result = _call_success_term(term, env)
+        self.assertFalse(torch.any(result))
+        torch.testing.assert_close(term._stable_steps, torch.zeros(3, dtype=torch.long))
+        torch.testing.assert_close(command.metrics["final_standing_terminal_default_pose_complete"], torch.zeros(3))
+
+        command.terminal_default_pose_complete[:] = True
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            _call_success_term(term, env)
+            _call_success_term(term, env)
+            result = _call_success_term(term, env)
+        self.assertTrue(torch.all(result))
+        torch.testing.assert_close(command.metrics["final_standing_terminal_default_pose_complete"], torch.ones(3))
 
     def test_speed_and_contact_diagnostics_record_actual_terminal_values(self):
         term, env, command = _make_success_term()
@@ -398,7 +426,7 @@ class ClimbStandingConditionsTest(unittest.TestCase):
             def __getitem__(self, name):
                 return {"platform": platform}[name]
 
-        env = SimpleNamespace(scene=_Scene())
+        env = SimpleNamespace(num_envs=num_envs, device="cpu", scene=_Scene())
         conditions, default_pose_rms = terminations._climb_standing_conditions(
             env=env,
             command=command,
@@ -415,6 +443,7 @@ class ClimbStandingConditionsTest(unittest.TestCase):
             max_root_angular_speed=0.5,
             max_joint_speed=1.0,
             max_torso_tilt=math.radians(20.0),
+            max_default_joint_pos_rms=0.09,
         )
 
         self.assertEqual(
@@ -423,14 +452,19 @@ class ClimbStandingConditionsTest(unittest.TestCase):
                 "feet_inside",
                 "foot_height_valid",
                 "foot_contact_valid",
+                "foot_load_valid",
                 "upright",
                 "root_height_valid",
                 "root_linear_speed_valid",
                 "root_angular_speed_valid",
                 "joint_speed_valid",
+                "default_joint_pos_valid",
             },
         )
-        for condition in conditions.values():
+        for name, condition in conditions.items():
+            if name == "default_joint_pos_valid":
+                torch.testing.assert_close(condition, torch.tensor([True, False]))
+                continue
             self.assertTrue(torch.all(condition))
         torch.testing.assert_close(default_pose_rms, torch.tensor([0.0, 0.1]))
 

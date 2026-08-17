@@ -125,8 +125,6 @@ ELF3_CLIMB_END_EFFECTOR_NAMES = [
 ELF3_CLIMB_PROGRESS_SUPPORT_BODY_NAMES = [
     "l_ankle_x_link",
     "r_ankle_x_link",
-    "l_wrist_z_link",
-    "r_wrist_z_link",
 ]
 
 # During the final platform-contact window, ankle position/orientation
@@ -202,7 +200,7 @@ ELF3_CLIMB_FIRST_FOOTHOLD_ANGULAR_VELOCITY_TRACKING_WEIGHTS = {
     "l_ankle_x_link": 0.45,
     "r_ankle_x_link": 0.45,
 }
-ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS = {
+ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS = {
     "foot_body_names": ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES,
     "platform_contact_sensor_names": ELF3_CLIMB_FIRST_FOOTHOLD_PLATFORM_CONTACT_SENSOR_NAMES,
     "sole_corners_b": ELF3_CLIMB_FIRST_FOOTHOLD_SOLE_CORNERS_B,
@@ -211,6 +209,9 @@ ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS = {
     "min_forefoot_inside": ELF3_CLIMB_FIRST_FOOTHOLD_MIN_FOREFOOT_INSIDE,
     "far_edge_margin": ELF3_CLIMB_FIRST_FOOTHOLD_FAR_EDGE_MARGIN,
     "lateral_margin": ELF3_CLIMB_FIRST_FOOTHOLD_LATERAL_MARGIN,
+}
+ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS = {
+    **ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
     "foot_height_std": ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_STD,
     "precontact_approach_distance": ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_APPROACH_DISTANCE,
     "precontact_height_std": ELF3_CLIMB_FIRST_FOOTHOLD_PRECONTACT_HEIGHT_STD,
@@ -232,7 +233,11 @@ ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS = {
 # mirrored platform footprints.
 ELF3_CLIMB_PLATFORM_SIZE = (0.46, 0.80, 0.65)
 ELF3_CLIMB_PLATFORM_CENTER = (-0.95, 0.0, 0.325)
-ELF3_CLIMB_PLATFORM_LENGTH_RANGE = (0.41, 0.51)
+# At 0.46 m, the source first foothold is already near the configured heel
+# overhang limit. Shorter boxes move the approach edge away from the robot and
+# make that immutable source geometry invalid before the policy can adapt.
+# Keep the nominal/adaptive-sampling geometry and remove only this short tail.
+ELF3_CLIMB_PLATFORM_LENGTH_RANGE = (0.46, 0.51)
 ELF3_CLIMB_PLATFORM_WIDTH_RANGE = (0.80, 1.50)
 ELF3_CLIMB_PLATFORM_HEIGHT_RANGE = (0.60, 0.70)
 # All environments use the configured full geometry ranges.  This keeps the
@@ -252,12 +257,16 @@ ELF3_CLIMB_HEIGHT_SCAN_OFFSET = (0.4, 0.0, 20.0)
 ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET = 0.5
 
 
-# The source clips already contain a motionless 0.5 s tail.  The extra hold
-# first spends 0.5 s aligning that terminal reference to the sampled physical
-# platform top, then leaves more than the required 0.5 s of truly stationary
-# evaluation time.  This does not alter the NPZ joints or create a second
-# kinematic pose target.
-ELF3_CLIMB_FINAL_HOLD_TIME_S = 1.25
+# The source clips already contain a motionless 0.5 s tail.  The final hold
+# must cover, in order, the physical source-to-platform Z bridge, dual-foot
+# contact confirmation, the one-way default-q transition, and a continuous
+# stable-standing window.  This leaves roughly 0.2 s of settling margin at
+# 50 Hz after the worst-case sequence.
+ELF3_CLIMB_FINAL_HOLD_TIME_S = 2.25
+# The final source soles are not at the same height as every sampled box. In
+# the static hold, smoothly translate the whole source-body reference only in
+# Z to the actual platform top. This preserves the source x/y footprint and
+# full joint/body geometry before terminal default-pose mode may latch.
 ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S = 0.5
 ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_CLEARANCE = 0.0
 ELF3_CLIMB_MIN_STABLE_TIME_S = 0.5
@@ -266,33 +275,29 @@ ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
 ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
 ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
-# The final source frames already form a verified 0.5 s static expert tail.
-# This shorter window is used only by the upper-body pose term below, so an
-# initial default stand or a moving pre-terminal transition cannot activate it.
+# The final source frames already form a verified 0.5 s static tail.  It is
+# used only to decide when a real dual-foot stand may latch the default-pose
+# terminal transition; it is not an upper-body expert-pose target.
 ELF3_CLIMB_TERMINAL_STATIC_WINDOW_TIME_S = 0.5
-ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_JOINT_NAMES = [
-    "l_shoulder_y_joint",
-    "r_shoulder_y_joint",
-    "waist_y_joint",
-    "l_shoulder_x_joint",
-    "r_shoulder_x_joint",
-    "waist_x_joint",
-    "l_shoulder_z_joint",
-    "r_shoulder_z_joint",
-    "waist_z_joint",
-    "l_elbow_y_joint",
-    "r_elbow_y_joint",
-    "l_wrist_x_joint",
-    "r_wrist_x_joint",
-    "l_wrist_y_joint",
-    "r_wrist_y_joint",
-    "l_wrist_z_joint",
-    "r_wrist_z_joint",
-]
-# This is deliberately comparable to final_joint_settling, rather than a
-# replacement for platform contact or all-joint velocity settling.
-ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_WEIGHT = 4.0
-ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_STD = 0.35
+# Reference-foot z correction is restricted to the approaching leading foot.
+# A 10 cm cap bounds bad data while covering all but about 4 mm of the worst
+# currently measured low-box source mismatch; that residual remains below the
+# 4 cm physical support-height tolerance. It never translates the robot,
+# torso, or trailing-foot reference.
+ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_ALIGNMENT_CLEARANCE = 0.0
+ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_ALIGNMENT_MAX_OFFSET = 0.10
+
+# Strict hand-independent conditions for entering the one-way terminal
+# default-pose mode.  Wrist contact may remain physically useful, but only
+# filtered platform forces through both feet and at least half the robot's
+# weight carried by those feet can latch the mode.
+# A slower cubic transition limits the largest source-to-default target speed
+# for the roughly 0.63 rad maximum terminal mismatch, which gives the arms
+# and legs time to settle before the strict 0.5 rad/s success check.
+ELF3_CLIMB_TERMINAL_DEFAULT_POSE_TRANSITION_TIME_S = 0.8
+ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE = 0.04
+ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION = 0.50
+ELF3_CLIMB_TERMINAL_DEFAULT_POSE_REWARD_WEIGHT = 4.0
 # Bounded, non-repeatable physical progress shaping requested for the climb.
 # Expert tracking remains active throughout the dynamic trajectory.
 ELF3_CLIMB_PROGRESS_REWARD_WEIGHT = 3.2
@@ -325,6 +330,10 @@ ELF3_CLIMB_MAX_ROOT_HEIGHT_ERROR = 0.15
 ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED = 0.15
 ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED = 0.5
 ELF3_CLIMB_MAX_JOINT_SPEED = 0.5
+# Success requires a natural pose close to the configured articulation default,
+# not exact joint equality.  This RMS tolerance is intentionally permissive
+# and is evaluated only after the one-way default-q transition has completed.
+ELF3_CLIMB_MAX_DEFAULT_JOINT_POS_RMS = 0.25
 ELF3_CLIMB_MAX_TORSO_TILT = 0.35
 ELF3_CLIMB_FINAL_JOINT_SETTLING_REWARD_WEIGHT = 4.0
 ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
@@ -502,6 +511,23 @@ class ELF3ClimbCommandsCfg:
         terminal_platform_alignment_base_size=ELF3_CLIMB_PLATFORM_SIZE,
         terminal_platform_alignment_clearance=ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_CLEARANCE,
         terminal_platform_alignment_ramp_time_s=ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S,
+        first_foothold_height_alignment_params=ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+        first_foothold_height_alignment_base_size=ELF3_CLIMB_PLATFORM_SIZE,
+        first_foothold_height_alignment_clearance=ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_ALIGNMENT_CLEARANCE,
+        first_foothold_height_alignment_max_offset=ELF3_CLIMB_FIRST_FOOTHOLD_HEIGHT_ALIGNMENT_MAX_OFFSET,
+        terminal_default_pose_enabled=True,
+        terminal_default_pose_platform_support_params=ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+        terminal_default_pose_base_size=ELF3_CLIMB_PLATFORM_SIZE,
+        terminal_default_pose_transition_time_s=ELF3_CLIMB_TERMINAL_DEFAULT_POSE_TRANSITION_TIME_S,
+        terminal_default_pose_static_window_time_s=ELF3_CLIMB_TERMINAL_STATIC_WINDOW_TIME_S,
+        terminal_default_pose_contact_time_s=ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+        terminal_default_pose_sole_height_tolerance=ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
+        terminal_default_pose_min_upward_force=ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+        terminal_default_pose_min_total_load_fraction=ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
+        terminal_default_pose_max_torso_tilt=ELF3_CLIMB_MAX_TORSO_TILT,
+        terminal_default_pose_max_root_linear_speed=ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED,
+        terminal_default_pose_max_root_angular_speed=ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED,
+        terminal_default_pose_reference_max_joint_speed=ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
     )
 
 
@@ -538,6 +564,24 @@ class ELF3ClimbObservationsCfg:
             params={"command_name": "motion"},
             noise=Unoise(n_min=0.0, n_max=0.0),
         )
+        terminal_default_pose_alpha = ObsTerm(
+            func=mdp.terminal_default_pose_alpha,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=0.0, n_max=0.0),
+        )
+        terminal_default_pose_active = ObsTerm(
+            func=mdp.terminal_default_pose_active,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=0.0, n_max=0.0),
+        )
+        first_foothold_height_offsets = ObsTerm(
+            func=mdp.first_foothold_height_offsets,
+            params={
+                "command_name": "motion",
+                "foot_body_names": tuple(ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES),
+            },
+            noise=Unoise(n_min=0.0, n_max=0.0),
+        )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=0.0, n_max=0.0))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=0.0, n_max=0.0))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=0.0, n_max=0.0))
@@ -566,6 +610,15 @@ class ELF3ClimbObservationsCfg:
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
+        terminal_default_pose_alpha = ObsTerm(func=mdp.terminal_default_pose_alpha, params={"command_name": "motion"})
+        terminal_default_pose_active = ObsTerm(func=mdp.terminal_default_pose_active, params={"command_name": "motion"})
+        first_foothold_height_offsets = ObsTerm(
+            func=mdp.first_foothold_height_offsets,
+            params={
+                "command_name": "motion",
+                "foot_body_names": tuple(ELF3_CLIMB_FIRST_FOOTHOLD_FOOT_BODY_NAMES),
+            },
+        )
         body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
         body_ori = ObsTerm(func=mdp.robot_body_ori_b, params={"command_name": "motion"})
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
@@ -697,12 +750,13 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
             "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
             "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_POSITION_TRACKING_WEIGHTS,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
         },
     )
     motion_body_ori = RewTerm(
@@ -721,12 +775,13 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
             "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
             "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_ORIENTATION_TRACKING_WEIGHTS,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
         },
     )
     motion_body_lin_vel = RewTerm(
@@ -768,10 +823,11 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
         },
     )
     final_standing_stability = RewTerm(
@@ -787,7 +843,7 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
@@ -796,6 +852,8 @@ class ELF3ClimbRewardsCfg:
             "joint_speed_std": ELF3_CLIMB_JOINT_SPEED_REWARD_STD,
             "torso_tilt_std": ELF3_CLIMB_TORSO_TILT_REWARD_STD,
             "stability_weights": ELF3_CLIMB_STABILITY_REWARD_WEIGHTS,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
         },
     )
     final_joint_settling = RewTerm(
@@ -811,7 +869,7 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
@@ -821,16 +879,18 @@ class ELF3ClimbRewardsCfg:
             "max_speed_scale": ELF3_CLIMB_SETTLING_MAX_SPEED_SCALE,
             "fine_max_speed_scale": ELF3_CLIMB_SETTLING_FINE_MAX_SPEED_SCALE,
             "score_weights": ELF3_CLIMB_SETTLING_SCORE_WEIGHTS,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
         },
     )
-    final_expert_upper_body_pose = RewTerm(
-        func=mdp.final_expert_upper_body_joint_position_error_exp,
-        weight=ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_WEIGHT,
+    final_default_joint_pose = RewTerm(
+        func=mdp.terminal_default_joint_position_error_exp,
+        weight=ELF3_CLIMB_TERMINAL_DEFAULT_POSE_REWARD_WEIGHT,
         params={
             "command_name": "motion",
             "asset_cfg": SceneEntityCfg(
                 "robot",
-                joint_names=ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_JOINT_NAMES,
+                joint_names=[".*"],
                 preserve_order=True,
             ),
             "platform_cfg": SceneEntityCfg("platform"),
@@ -841,12 +901,12 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
             "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_FOOT_HEIGHT_REWARD_STD,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_TERMINAL_STATIC_WINDOW_TIME_S,
-            "std": ELF3_CLIMB_TERMINAL_EXPERT_UPPER_BODY_POSE_REWARD_STD,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
+            "std": ELF3_CLIMB_FINAL_DEFAULT_POSE_REWARD_STD,
         },
     )
     first_foothold_support_quality = RewTerm(
@@ -874,7 +934,7 @@ class ELF3ClimbRewardsCfg:
             "approach_distance": ELF3_CLIMB_PROGRESS_APPROACH_DISTANCE,
             "approach_lateral_margin": ELF3_CLIMB_PROGRESS_APPROACH_LATERAL_MARGIN,
             "support_xy_margin": ELF3_CLIMB_PROGRESS_SUPPORT_XY_MARGIN,
-            "support_height_std": ELF3_CLIMB_PROGRESS_SUPPORT_HEIGHT_STD,
+            "support_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "lift_height_window": ELF3_CLIMB_PROGRESS_LIFT_HEIGHT_WINDOW,
             "approach_side": ELF3_CLIMB_PROGRESS_APPROACH_SIDE,
             "approach_phase_end": ELF3_CLIMB_PROGRESS_APPROACH_PHASE_END,
@@ -886,6 +946,7 @@ class ELF3ClimbRewardsCfg:
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "max_delta_per_step": ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP,
             "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
         },
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0e-1)
@@ -961,8 +1022,12 @@ class ELF3ClimbTerminationsCfg:
             "max_root_linear_speed": ELF3_CLIMB_MAX_ROOT_LINEAR_SPEED,
             "max_root_angular_speed": ELF3_CLIMB_MAX_ROOT_ANGULAR_SPEED,
             "max_joint_speed": ELF3_CLIMB_MAX_JOINT_SPEED,
+            "max_default_joint_pos_rms": ELF3_CLIMB_MAX_DEFAULT_JOINT_POS_RMS,
             "max_torso_tilt": ELF3_CLIMB_MAX_TORSO_TILT,
             "min_stable_time": ELF3_CLIMB_MIN_STABLE_TIME_S,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "sole_height_tolerance": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
         },
     )
     motion_end_failure = DoneTerm(

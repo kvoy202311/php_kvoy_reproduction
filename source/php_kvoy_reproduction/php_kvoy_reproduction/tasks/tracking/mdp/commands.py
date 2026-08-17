@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.managers import CommandTerm, CommandTermCfg
+from isaaclab.managers import CommandTerm, CommandTermCfg, SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     quat_apply,
+    quat_apply_inverse,
     quat_error_magnitude,
     quat_from_euler_xyz,
     quat_inv,
@@ -26,8 +27,15 @@ from .climb_progress import bounded_episode_progress_increment
 from .obstacle import get_climb_box_sizes
 from .obstacle_geometry import (
     advance_filtered_platform_contact_time,
+    first_foothold_reference_gate,
+    foot_sole_corners_world,
     terminal_platform_z_alignment,
     terminal_sole_support_plane_z,
+)
+from .platform_foot_support import (
+    platform_foot_load_valid,
+    platform_foot_support_settings,
+    platform_foot_support_state,
 )
 from .motion_data import (
     MultiMotionAdaptiveSampler,
@@ -138,6 +146,29 @@ class MotionCommand(CommandTerm):
         # not reuse ContactSensor.current_contact_time because that timer
         # includes ground and other non-platform contacts.
         self._first_foothold_filtered_contact_time: torch.Tensor | None = None
+        # This timer is intentionally separate from the first-foothold timer:
+        # terminal rewards and success inspect both feet on every policy step,
+        # while the first-foot term is limited to one arriving lead foot.
+        self._platform_foot_filtered_contact_time: torch.Tensor | None = None
+        self._platform_foot_filtered_contact_step = -1
+
+        # Per-environment state for the one-way default-pose terminal mode.
+        # The source motion remains authoritative through the dynamic climb.
+        # Once verified dual-foot support is reached in the static tail, the
+        # command exposes one smooth joint target from that source pose to the
+        # articulation default, never two competing targets.
+        self._terminal_default_pose_latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._terminal_default_pose_age_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._terminal_default_pose_start_joint_pos = torch.zeros(
+            self.num_envs, self.motion.joint_count, dtype=self.motion.joint_pos.dtype, device=self.device
+        )
+        self._terminal_default_pose_transition_steps = 0
+        self._terminal_default_pose_static_window_steps = 0
+        self._terminal_default_anchor_to_sole_height: torch.Tensor | None = None
+        self._first_foothold_height_alignment_settings = None
+        self._terminal_default_pose_settings = None
+        self._initialize_first_foothold_height_alignment()
+        self._initialize_terminal_default_pose_mode()
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
@@ -175,6 +206,7 @@ class MotionCommand(CommandTerm):
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         """Reset command state, including the climb-progress potential baseline."""
 
+        reset_all = env_ids is None
         extras = super().reset(env_ids)
         if env_ids is None:
             env_ids = slice(None)
@@ -183,6 +215,16 @@ class MotionCommand(CommandTerm):
         self._climb_lift_max_potential[env_ids] = 0.0
         if self._first_foothold_filtered_contact_time is not None:
             self._first_foothold_filtered_contact_time[env_ids] = 0.0
+        if self._platform_foot_filtered_contact_time is not None:
+            self._platform_foot_filtered_contact_time[env_ids] = 0.0
+        # The step stamp is global, not per environment.  Clearing it for an
+        # asynchronous subset reset would let later reward terms advance the
+        # still-live environments twice in the same policy step.
+        if reset_all:
+            self._platform_foot_filtered_contact_step = -1
+        self._terminal_default_pose_latched[env_ids] = False
+        self._terminal_default_pose_age_steps[env_ids] = 0
+        self._terminal_default_pose_start_joint_pos[env_ids] = 0.0
         return extras
 
     def climb_progress_deltas(
@@ -261,6 +303,505 @@ class MotionCommand(CommandTerm):
             step_dt=step_dt,
         )
         return self._first_foothold_filtered_contact_time
+
+    def advance_platform_foot_filtered_contact_time(
+        self,
+        active_platform_support: torch.Tensor,
+        step_dt: float,
+    ) -> torch.Tensor:
+        """Advance shared two-foot platform support time exactly once per step.
+
+        Several reward terms and the success term inspect terminal support in
+        one environment step.  A generic ``ContactSensor.current_contact_time``
+        would include ground contacts, while independently advancing a custom
+        timer in every reward would make 0.25 s of support appear in a single
+        policy step.  The command owns this state and de-duplicates updates by
+        Isaac Lab's global policy-step counter.
+        """
+
+        if active_platform_support.shape != (self.num_envs, 2):
+            raise ValueError(
+                "active_platform_support must have shape "
+                f"{(self.num_envs, 2)}, got {active_platform_support.shape}."
+            )
+        if active_platform_support.device != torch.device(self.device):
+            raise ValueError(
+                "active_platform_support must be on the MotionCommand device "
+                f"{self.device}, got {active_platform_support.device}."
+            )
+        if step_dt <= 0.0:
+            raise ValueError(f"step_dt must be positive, got {step_dt}.")
+        if self._platform_foot_filtered_contact_time is None:
+            self._platform_foot_filtered_contact_time = torch.zeros(
+                (self.num_envs, 2), dtype=torch.float32, device=self.device
+            )
+
+        common_step_counter = getattr(self._env, "common_step_counter", None)
+        if common_step_counter is None:
+            # Production Isaac Lab environments always expose this counter.
+            # Keep lightweight test doubles usable while making the fallback
+            # explicit rather than silently sharing stale time between calls.
+            self._platform_foot_filtered_contact_time = advance_filtered_platform_contact_time(
+                self._platform_foot_filtered_contact_time,
+                active_platform_support,
+                step_dt=step_dt,
+            )
+            return self._platform_foot_filtered_contact_time
+
+        common_step_counter = int(common_step_counter)
+        if common_step_counter != self._platform_foot_filtered_contact_step:
+            self._platform_foot_filtered_contact_time = advance_filtered_platform_contact_time(
+                self._platform_foot_filtered_contact_time,
+                active_platform_support,
+                step_dt=step_dt,
+            )
+            self._platform_foot_filtered_contact_step = common_step_counter
+        return self._platform_foot_filtered_contact_time
+
+    @property
+    def platform_foot_filtered_contact_time(self) -> torch.Tensor:
+        """Read the two-foot filtered-support timer owned by command update.
+
+        Terminal reward and termination terms intentionally consume this
+        buffer without advancing it.  That makes support duration independent
+        of how many terms are configured and avoids test-double fallbacks that
+        do not expose a global policy-step counter.
+        """
+
+        if self._platform_foot_filtered_contact_time is None:
+            return torch.zeros((self.num_envs, 2), dtype=self.motion.joint_pos.dtype, device=self.device)
+        return self._platform_foot_filtered_contact_time
+
+    def _initialize_first_foothold_height_alignment(self) -> None:
+        """Validate the optional platform-relative leading-foot z target."""
+
+        params = self.cfg.first_foothold_height_alignment_params
+        if not params:
+            return
+        if self.reference_transform_asset is None:
+            raise ValueError(
+                "first_foothold_height_alignment_params requires reference_transform_asset_name to name the platform."
+            )
+        if self.cfg.first_foothold_height_alignment_base_size is None:
+            raise ValueError("first foothold height alignment requires a platform base size.")
+        base_size = self.cfg.first_foothold_height_alignment_base_size
+        if len(base_size) != 3 or any(size <= 0.0 for size in base_size):
+            raise ValueError(
+                "first_foothold_height_alignment_base_size must contain three positive values, "
+                f"got {base_size}."
+            )
+        if (
+            not math.isfinite(self.cfg.first_foothold_height_alignment_max_offset)
+            or self.cfg.first_foothold_height_alignment_max_offset <= 0.0
+        ):
+            raise ValueError(
+                "first_foothold_height_alignment_max_offset must be finite and positive when alignment is enabled."
+            )
+        if not math.isfinite(self.cfg.first_foothold_height_alignment_clearance):
+            raise ValueError("first_foothold_height_alignment_clearance must be finite.")
+        self._first_foothold_height_alignment_settings = platform_foot_support_settings(params)
+
+        required_keys = (
+            "reference_activation_distance",
+            "reference_activation_inside",
+            "reference_release_distance",
+            "reference_release_inside",
+            "phase_start",
+            "phase_ramp",
+            "phase_end",
+            "phase_fade",
+        )
+        missing = [key for key in required_keys if key not in params]
+        if missing:
+            raise ValueError(
+                "first_foothold_height_alignment_params is missing reference-gate keys: "
+                f"{missing}."
+            )
+
+    def _source_body_quat_w_at(self, time_steps: torch.Tensor) -> torch.Tensor:
+        """Return source body orientations after the platform yaw transform."""
+
+        orientations = self.motion.body_quat_w[time_steps]
+        if self.reference_transform_asset is None:
+            return orientations
+        yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
+        return quat_mul(yaw_delta[:, None, :].expand(-1, orientations.shape[1], -1), orientations)
+
+    def _source_body_pos_w_without_foothold_alignment(self, time_steps: torch.Tensor) -> torch.Tensor:
+        """Return source positions after only the platform x/y/yaw transform."""
+
+        positions = self.motion.body_pos_w[time_steps]
+        if self.reference_transform_asset is None:
+            return positions + self._env.scene.env_origins[:, None, :]
+
+        yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
+        nominal_xy = torch.tensor(
+            self.cfg.reference_transform_nominal_xy, dtype=positions.dtype, device=self.device
+        )
+        delta = torch.zeros_like(positions)
+        delta[..., :2] = positions[..., :2] - nominal_xy
+        rotated_delta = quat_apply(yaw_delta[:, None, :].expand(-1, positions.shape[1], -1), delta)
+
+        transformed = positions + self._env.scene.env_origins[:, None, :]
+        transformed[..., :2] = self.reference_transform_asset.data.root_pos_w[:, None, :2] + rotated_delta[..., :2]
+        return transformed
+
+    def _first_foothold_height_offsets(
+        self,
+        time_steps: torch.Tensor,
+        source_positions_w: torch.Tensor,
+        source_orientations_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a bounded platform-relative z correction for the lead foot.
+
+        The correction is intentionally computed from the immutable source
+        foot geometry and only changes the z component of that one arriving
+        ankle's body target.  It never moves the root, torso, other foot, or
+        source x/y footprint.  Therefore a 0.60--0.70 m sampled platform can
+        be accommodated without inventing a translated full-body expert.
+        """
+
+        zero = torch.zeros(
+            (self.num_envs, len(self.cfg.body_names)),
+            dtype=source_positions_w.dtype,
+            device=self.device,
+        )
+        settings = self._first_foothold_height_alignment_settings
+        if settings is None:
+            return zero
+        if self.reference_transform_asset is None:
+            raise RuntimeError("First-foothold height alignment lost its configured platform asset.")
+        base_size = self.cfg.first_foothold_height_alignment_base_size
+        if base_size is None:
+            raise RuntimeError("First-foothold height alignment lost its configured base size.")
+        if time_steps.shape != (self.num_envs,):
+            raise ValueError(
+                "First-foothold height alignment expects one time step per environment, "
+                f"got {tuple(time_steps.shape)}."
+            )
+
+        sizes = get_climb_box_sizes(
+            self.reference_transform_asset,
+            base_size=base_size,
+            device=self.device,
+        )
+        if sizes.shape != (self.num_envs, 3):
+            raise RuntimeError(
+                "First-foothold height alignment received invalid platform sizes: "
+                f"expected {(self.num_envs, 3)}, got {tuple(sizes.shape)}."
+            )
+        foot_body_ids = torch.tensor(
+            [self.cfg.body_names.index(name) for name in settings.foot_body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        reference_feet = source_positions_w[:, foot_body_ids]
+        motion_starts = self.motion.motion_start_idx[self.motion_ids]
+        motion_lengths = self.motion.motion_lengths[self.motion_ids].to(dtype=source_positions_w.dtype)
+        phase = (
+            (time_steps - motion_starts).to(dtype=source_positions_w.dtype) / (motion_lengths - 1.0).clamp_min(1.0)
+        ).clamp(
+            min=0.0,
+            max=1.0,
+        )
+        reference_gate, reference_lead_mask = first_foothold_reference_gate(
+            reference_feet,
+            self.reference_transform_asset.data.root_pos_w,
+            self.reference_transform_asset.data.root_quat_w,
+            sizes,
+            phase,
+            approach_side=settings.approach_side,
+            reference_activation_distance=float(
+                self.cfg.first_foothold_height_alignment_params["reference_activation_distance"]
+            ),
+            reference_activation_inside=float(
+                self.cfg.first_foothold_height_alignment_params["reference_activation_inside"]
+            ),
+            reference_release_distance=float(
+                self.cfg.first_foothold_height_alignment_params["reference_release_distance"]
+            ),
+            reference_release_inside=float(
+                self.cfg.first_foothold_height_alignment_params["reference_release_inside"]
+            ),
+            phase_start=float(self.cfg.first_foothold_height_alignment_params["phase_start"]),
+            phase_ramp=float(self.cfg.first_foothold_height_alignment_params["phase_ramp"]),
+            phase_end=float(self.cfg.first_foothold_height_alignment_params["phase_end"]),
+            phase_fade=float(self.cfg.first_foothold_height_alignment_params["phase_fade"]),
+        )
+        sole_corners_b = torch.as_tensor(
+            settings.sole_corners_b,
+            dtype=source_positions_w.dtype,
+            device=self.device,
+        )
+        reference_sole_corners_w = foot_sole_corners_world(
+            reference_feet,
+            source_orientations_w[:, foot_body_ids],
+            sole_corners_b,
+        )
+        source_sole_z = reference_sole_corners_w[..., 2].amin(dim=-1)
+        platform_top_z = self.reference_transform_asset.data.root_pos_w[:, 2] + 0.5 * sizes[:, 2]
+        target_offset = (
+            platform_top_z[:, None]
+            + self.cfg.first_foothold_height_alignment_clearance
+            - source_sole_z
+        ).clamp(
+            min=-self.cfg.first_foothold_height_alignment_max_offset,
+            max=self.cfg.first_foothold_height_alignment_max_offset,
+        )
+        foot_offsets = reference_gate[:, None] * reference_lead_mask.to(dtype=source_positions_w.dtype) * target_offset
+        zero[:, foot_body_ids] = foot_offsets
+        return zero
+
+    def _source_body_pos_w_at(self, time_steps: torch.Tensor) -> torch.Tensor:
+        """Return the source body target with an optional lead-foot z correction."""
+
+        positions = self._source_body_pos_w_without_foothold_alignment(time_steps)
+        if self._first_foothold_height_alignment_settings is None:
+            return positions
+        orientations = self._source_body_quat_w_at(time_steps)
+        z_offsets = self._first_foothold_height_offsets(time_steps, positions, orientations)
+        positions = positions.clone()
+        positions[..., 2] += z_offsets
+        return positions
+
+    def _initialize_terminal_default_pose_mode(self) -> None:
+        """Validate and precompute the platform-relative default terminal mode."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return
+        if self.reference_transform_asset is None:
+            raise ValueError("terminal default-pose mode requires reference_transform_asset_name='platform'.")
+        if not self.cfg.terminate_on_motion_end:
+            raise ValueError("terminal default-pose mode requires terminate_on_motion_end=True.")
+        if self.cfg.terminal_default_pose_platform_support_params is None:
+            raise ValueError("terminal default-pose mode requires terminal_default_pose_platform_support_params.")
+        if self.cfg.terminal_default_pose_base_size is None:
+            raise ValueError("terminal default-pose mode requires terminal_default_pose_base_size.")
+        base_size = self.cfg.terminal_default_pose_base_size
+        if len(base_size) != 3 or any(size <= 0.0 for size in base_size):
+            raise ValueError(
+                "terminal_default_pose_base_size must contain three positive values, "
+                f"got {base_size}."
+            )
+        if self.cfg.terminal_default_pose_transition_time_s <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_transition_time_s must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_static_window_time_s <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_static_window_time_s must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_contact_time_s <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_contact_time_s must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_sole_height_tolerance <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_sole_height_tolerance must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_min_upward_force <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_min_upward_force must be positive when terminal mode is enabled."
+            )
+        if not 0.0 <= self.cfg.terminal_default_pose_min_total_load_fraction <= 1.0:
+            raise ValueError("terminal_default_pose_min_total_load_fraction must lie in [0, 1].")
+        if not 0.0 <= self.cfg.terminal_default_pose_max_torso_tilt < math.pi:
+            raise ValueError("terminal_default_pose_max_torso_tilt must lie in [0, pi).")
+        if self.cfg.terminal_default_pose_max_root_linear_speed <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_max_root_linear_speed must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_max_root_angular_speed <= 0.0:
+            raise ValueError(
+                "terminal_default_pose_max_root_angular_speed must be positive when terminal mode is enabled."
+            )
+        if self.cfg.terminal_default_pose_reference_max_joint_speed < 0.0:
+            raise ValueError(
+                "terminal_default_pose_reference_max_joint_speed must be non-negative when terminal mode is enabled."
+            )
+
+        settings = platform_foot_support_settings(self.cfg.terminal_default_pose_platform_support_params)
+        self._terminal_default_pose_settings = settings
+        missing_foot_names = [name for name in settings.foot_body_names if name not in self.cfg.body_names]
+        if missing_foot_names:
+            raise ValueError(
+                "terminal default-pose foot bodies must be tracked by MotionCommand, "
+                f"missing {missing_foot_names}."
+            )
+        self._terminal_default_pose_transition_steps = max(
+            1, math.ceil(self.cfg.terminal_default_pose_transition_time_s / self._env.step_dt - 1.0e-9)
+        )
+        self._terminal_default_pose_static_window_steps = max(
+            1, math.ceil(self.cfg.terminal_default_pose_static_window_time_s / self._env.step_dt - 1.0e-9)
+        )
+        terminal_contact_steps = max(
+            1, math.ceil(self.cfg.terminal_default_pose_contact_time_s / self._env.step_dt - 1.0e-9)
+        )
+        # In the worst case, both feet only make contact after the source
+        # reference has completed its platform-height ramp.  Reserve the
+        # alignment, contact confirmation, q transition, and final stable
+        # window explicitly so a configuration cannot make success impossible
+        # merely by shortening the final hold.
+        required_terminal_hold_steps = (
+            self._terminal_platform_alignment_ramp_steps
+            + terminal_contact_steps
+            + self._terminal_default_pose_transition_steps
+            + self._terminal_default_pose_static_window_steps
+        )
+        if self.motion_end_hold_steps < required_terminal_hold_steps:
+            raise ValueError(
+                "motion_end_hold_time_s is too short for terminal platform alignment, contact confirmation, "
+                "default-pose transition, and stable evaluation."
+            )
+
+        # The supplied default-start motion is deliberately checked instead of
+        # assuming that every arbitrary source clip begins at the robot's
+        # default joint pose.  This gives a physical platform-relative torso
+        # height for the same default pose used as the terminal q target.
+        source_start_joint_pos = self.motion.joint_pos[self.motion.motion_start_idx]
+        default_joint_pos = self.robot.data.default_joint_pos
+        if default_joint_pos.ndim != 2 or default_joint_pos.shape[1] != self.motion.joint_count:
+            raise ValueError(
+                "Robot default_joint_pos must have shape [num_envs, joint_count] for terminal default-pose mode, "
+                f"got {tuple(default_joint_pos.shape)}."
+            )
+        if not torch.allclose(default_joint_pos, default_joint_pos[:1], atol=1.0e-6, rtol=1.0e-6):
+            raise ValueError(
+                "terminal default-pose mode requires one shared articulation default across environments; "
+                "per-environment default-joint randomization would invalidate its precomputed standing geometry."
+            )
+        # Source has one initial pose per clip, while the articulation stores
+        # one default pose per environment.  Compare every source start with
+        # the shared nominal default, then broadcast the live per-environment
+        # default only when forming the terminal target below.
+        nominal_default_joint_pos = default_joint_pos[0]
+        if not torch.allclose(source_start_joint_pos, nominal_default_joint_pos, atol=1.0e-4, rtol=1.0e-4):
+            max_error = torch.max(torch.abs(source_start_joint_pos - nominal_default_joint_pos)).item()
+            raise ValueError(
+                "terminal default-pose mode requires default-start expert clips; "
+                f"the largest source/default joint mismatch is {max_error:.6f} rad."
+            )
+        foot_body_ids = torch.tensor(
+            [self.cfg.body_names.index(name) for name in settings.foot_body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        sole_corners_b = torch.tensor(
+            settings.sole_corners_b,
+            dtype=self.motion.body_pos_w.dtype,
+            device=self.device,
+        )
+        source_start_sole = foot_sole_corners_world(
+            self.motion.body_pos_w[self.motion.motion_start_idx][:, foot_body_ids],
+            self.motion.body_quat_w[self.motion.motion_start_idx][:, foot_body_ids],
+            sole_corners_b,
+        )
+        source_start_sole_z = source_start_sole[..., 2].amin(dim=(1, 2))
+        source_start_anchor_z = self.motion.body_pos_w[
+            self.motion.motion_start_idx, self.motion_anchor_body_index, 2
+        ]
+        self._terminal_default_anchor_to_sole_height = source_start_anchor_z - source_start_sole_z
+
+    def _terminal_default_static_tail(self) -> torch.Tensor:
+        """Return the final stationary source window, excluding the initial stand."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        final_frames = self.motion.motion_end_idx[self.motion_ids] - 1
+        window_start = final_frames - (self._terminal_default_pose_static_window_steps - 1)
+        in_final_window = self.time_steps >= window_start
+        source_speed = torch.max(torch.abs(self.motion.joint_vel[self.time_steps]), dim=1).values
+        source_static = source_speed <= self.cfg.terminal_default_pose_reference_max_joint_speed
+        return in_final_window & source_static
+
+    def _terminal_default_pose_support_candidate(self) -> torch.Tensor:
+        """Return a strict, physical candidate for entering terminal default pose."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.cfg.terminal_default_pose_platform_support_params is None:
+            raise RuntimeError("Terminal default-pose support parameters disappeared after initialization.")
+        if self.cfg.terminal_default_pose_base_size is None:
+            raise RuntimeError("Terminal default-pose base size disappeared after initialization.")
+
+        support = platform_foot_support_state(
+            self._env,
+            self.robot,
+            self.device,
+            SceneEntityCfg(self.cfg.reference_transform_asset_name),
+            self.cfg.terminal_default_pose_base_size,
+            self.cfg.terminal_default_pose_platform_support_params,
+            min_upward_force=self.cfg.terminal_default_pose_min_upward_force,
+            sole_height_tolerance=self.cfg.terminal_default_pose_sole_height_tolerance,
+        )
+        filtered_time = self.advance_platform_foot_filtered_contact_time(support.active_support, self._env.step_dt)
+        dual_foot_support = torch.all(
+            support.active_support & (filtered_time >= self.cfg.terminal_default_pose_contact_time_s), dim=1
+        )
+        feet_carry_load = platform_foot_load_valid(
+            support,
+            self.robot,
+            min_total_load_fraction=self.cfg.terminal_default_pose_min_total_load_fraction,
+        )
+        root_linear_speed = torch.linalg.vector_norm(self.robot_anchor_lin_vel_w, dim=-1)
+        root_angular_speed = torch.linalg.vector_norm(self.robot_anchor_ang_vel_w, dim=-1)
+        projected_gravity_b = quat_apply_inverse(self.robot_anchor_quat_w, self.robot.data.GRAVITY_VEC_W)
+        upright = projected_gravity_b[:, 2] <= -math.cos(self.cfg.terminal_default_pose_max_torso_tilt)
+        quiet_enough = (
+            (root_linear_speed <= self.cfg.terminal_default_pose_max_root_linear_speed)
+            & (root_angular_speed <= self.cfg.terminal_default_pose_max_root_angular_speed)
+            & upright
+        )
+        # The source reference must first finish its smooth Z bridge to the
+        # sampled platform. Otherwise, a low box would require real support
+        # while body/anchor rewards still point at a floating source pose.
+        return (
+            self._terminal_default_static_tail()
+            & self.terminal_platform_alignment_complete
+            & dual_foot_support
+            & feet_carry_load
+            & quiet_enough
+        )
+
+    def _update_terminal_default_pose_mode(self) -> None:
+        """Latch the default-pose transition only after real bilateral support."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return
+        candidate = self._terminal_default_pose_support_candidate()
+        newly_latched = candidate & ~self._terminal_default_pose_latched
+        if torch.any(newly_latched):
+            # Capture the *real supported articulation pose*, not raw source
+            # q. Starting at the actual pose makes alpha=0 reward/target-
+            # continuous, so the default-q handoff cannot create an abrupt
+            # joint-target jump after the physical support check.
+            self._terminal_default_pose_start_joint_pos[newly_latched] = self.robot.data.joint_pos[
+                newly_latched
+            ].to(dtype=self.motion.joint_pos.dtype)
+            self._terminal_default_pose_latched[newly_latched] = True
+            self._terminal_default_pose_age_steps[newly_latched] = 0
+        already_latched = self._terminal_default_pose_latched & ~newly_latched
+        self._terminal_default_pose_age_steps[already_latched] += 1
+
+    def _terminal_default_pose_alpha_and_rate(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return smooth command interpolation progress and its time derivative."""
+
+        dtype = self.motion.joint_pos.dtype
+        if not self.cfg.terminal_default_pose_enabled:
+            zero = torch.zeros(self.num_envs, dtype=dtype, device=self.device)
+            return zero, zero
+        progress = (
+            self._terminal_default_pose_age_steps.to(dtype=dtype) / float(self._terminal_default_pose_transition_steps)
+        ).clamp(min=0.0, max=1.0)
+        alpha = progress * progress * (3.0 - 2.0 * progress)
+        alpha = alpha * self._terminal_default_pose_latched.to(dtype=dtype)
+        alpha_rate = (
+            6.0
+            * progress
+            * (1.0 - progress)
+            / (float(self._terminal_default_pose_transition_steps) * self._env.step_dt)
+        ) * self._terminal_default_pose_latched.to(dtype=dtype)
+        return alpha, alpha_rate
 
     def _initialize_terminal_platform_z_alignment(self) -> None:
         """Precompute each clip's physical terminal sole plane when enabled."""
@@ -381,6 +922,62 @@ class MotionCommand(CommandTerm):
         return self.motion.joint_pos[self.time_steps]
 
     @property
+    def terminal_default_pose_latched(self) -> torch.Tensor:
+        """Whether each environment has irrevocably entered terminal q mode."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return self._terminal_default_pose_latched
+
+    @property
+    def terminal_default_pose_alpha(self) -> torch.Tensor:
+        """Smooth [0, 1] progress from captured supported q to default q."""
+
+        alpha, _ = self._terminal_default_pose_alpha_and_rate()
+        return alpha
+
+    @property
+    def terminal_default_pose_complete(self) -> torch.Tensor:
+        """Whether the terminal default-pose interpolation has completed."""
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        return self._terminal_default_pose_latched & (
+            self._terminal_default_pose_age_steps >= self._terminal_default_pose_transition_steps
+        )
+
+    @property
+    def terminal_default_pose_static_tail(self) -> torch.Tensor:
+        """Whether the immutable source reference is in its verified static tail.
+
+        This exposes only a source-data fact.  Reward terms use it to provide
+        a settling signal before the terminal q switch, while still disabling
+        that signal during the moving default-q interpolation.
+        """
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        return self._terminal_default_static_tail()
+
+    @property
+    def terminal_default_pose_expert_tracking_factor(self) -> torch.Tensor:
+        """Scale for source-body/anchor objectives during terminal q takeover.
+
+        The switch is intentionally discrete at the *mode* boundary, rather
+        than a reward cross-fade. At the latch boundary the sole joint target
+        is the current physically supported articulation pose, so turning off
+        source-body objectives cannot pull the robot back toward a stale
+        reference placement. Every subsequent step has exactly one pose
+        objective: the smooth command q trajectory to the articulation
+        default. This avoids asking the policy to satisfy a stale expert body
+        pose and a default-pose joint target at the same time.
+        """
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return torch.ones(self.num_envs, dtype=self.motion.joint_pos.dtype, device=self.device)
+        return (~self._terminal_default_pose_latched).to(dtype=self.motion.joint_pos.dtype)
+
+    @property
     def final_hold_progress(self) -> torch.Tensor:
         """Normalized progress through the extra final-frame hold."""
 
@@ -394,64 +991,100 @@ class MotionCommand(CommandTerm):
 
     @property
     def terminal_platform_alignment_complete(self) -> torch.Tensor:
-        """Whether terminal reference z alignment has finished for each environment."""
+        """Whether the terminal reference Z bridge has finished."""
 
         if self._terminal_source_support_z is None:
             return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         return self.motion_final_hold_count >= self._terminal_platform_alignment_ramp_steps
 
     @property
-    def joint_pos(self) -> torch.Tensor:
-        """Observable joint target taken directly from the immutable motion data.
+    def first_foothold_height_offsets(self) -> torch.Tensor:
+        """Return the current per-body leading-foot source Z corrections.
 
-        The final-frame hold must preserve one kinematically consistent
-        reference. Moving only the joint target toward the articulation
-        default while body targets remain at the NPZ final frame creates two
-        incompatible objectives and makes a settled robot move again.
+        The Actor/Critic receive the two configured ankle entries explicitly.
+        Exposing the exact correction avoids asking them to infer a hidden
+        reward/reference change solely from the height scan, while all
+        non-leading bodies remain exactly zero.
         """
 
-        return self.source_joint_pos
+        positions = self._source_body_pos_w_without_foothold_alignment(self.time_steps)
+        orientations = self._source_body_quat_w_at(self.time_steps)
+        return self._first_foothold_height_offsets(self.time_steps, positions, orientations)
+
+    @property
+    def joint_pos(self) -> torch.Tensor:
+        """Return one joint target, smoothly switching only after real support.
+
+        Before latching this is exactly the immutable source motion. After
+        latching it is the sole q objective: a smooth interpolation from the
+        captured real supported pose to ``ELF3_CFG.init_state.joint_pos``.
+        """
+
+        if not self.cfg.terminal_default_pose_enabled:
+            return self.source_joint_pos
+        alpha, _ = self._terminal_default_pose_alpha_and_rate()
+        default_joint_pos = self.robot.data.default_joint_pos.to(dtype=self.source_joint_pos.dtype)
+        terminal_target = torch.lerp(self._terminal_default_pose_start_joint_pos, default_joint_pos, alpha[:, None])
+        return torch.where(self._terminal_default_pose_latched[:, None], terminal_target, self.source_joint_pos)
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.joint_vel[self.time_steps]
+        if not self.cfg.terminal_default_pose_enabled:
+            return self.motion.joint_vel[self.time_steps]
+        _, alpha_rate = self._terminal_default_pose_alpha_and_rate()
+        default_joint_pos = self.robot.data.default_joint_pos.to(dtype=self.motion.joint_vel.dtype)
+        terminal_velocity = (default_joint_pos - self._terminal_default_pose_start_joint_pos) * alpha_rate[:, None]
+        return torch.where(
+            self._terminal_default_pose_latched[:, None], terminal_velocity, self.motion.joint_vel[self.time_steps]
+        )
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        positions = self.motion.body_pos_w[self.time_steps]
-        if self.reference_transform_asset is None:
-            return positions + self._env.scene.env_origins[:, None, :]
-
-        yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
-        nominal_xy = torch.tensor(
-            self.cfg.reference_transform_nominal_xy, dtype=positions.dtype, device=self.device
-        )
-        delta = torch.zeros_like(positions)
-        delta[..., :2] = positions[..., :2] - nominal_xy
-        rotated_delta = quat_apply(yaw_delta[:, None, :].expand(-1, positions.shape[1], -1), delta)
-
-        transformed = positions + self._env.scene.env_origins[:, None, :]
-        transformed[..., :2] = self.reference_transform_asset.data.root_pos_w[:, None, :2] + rotated_delta[..., :2]
+        positions = self._source_body_pos_w_without_foothold_alignment(self.time_steps)
+        positions = positions.clone()
+        if self._first_foothold_height_alignment_settings is not None:
+            positions[..., 2] += self.first_foothold_height_offsets
+        transformed = positions
         terminal_z_offset, _, _ = self._terminal_platform_z_alignment()
         transformed[..., 2] += terminal_z_offset[:, None]
         return transformed
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        orientations = self.motion.body_quat_w[self.time_steps]
-        if self.reference_transform_asset is None:
-            return orientations
-        yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
-        yaw_delta = yaw_delta[:, None, :].expand(-1, orientations.shape[1], -1)
-        return quat_mul(yaw_delta, orientations)
+        return self._source_body_quat_w_at(self.time_steps)
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
         velocities = self.motion.body_lin_vel_w[self.time_steps]
         if self.reference_transform_asset is None:
-            return velocities
-        yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
-        transformed = quat_apply(yaw_delta[:, None, :].expand(-1, velocities.shape[1], -1), velocities)
+            transformed = velocities
+        else:
+            yaw_delta = yaw_quat(self.reference_transform_asset.data.root_quat_w)
+            transformed = quat_apply(yaw_delta[:, None, :].expand(-1, velocities.shape[1], -1), velocities)
+
+        # The lead-foot z reference is position-corrected for sampled platform
+        # height.  Give velocity tracking the derivative of that exact same
+        # correction, rather than asking it to match an incompatible raw NPZ
+        # vertical velocity while position tracking has a different target.
+        if self._first_foothold_height_alignment_settings is not None:
+            current_positions = self._source_body_pos_w_without_foothold_alignment(self.time_steps)
+            current_orientations = self._source_body_quat_w_at(self.time_steps)
+            current_offsets = self._first_foothold_height_offsets(
+                self.time_steps,
+                current_positions,
+                current_orientations,
+            )
+            final_frames = self.motion.motion_end_idx[self.motion_ids] - 1
+            next_time_steps = torch.minimum(self.time_steps + 1, final_frames)
+            next_positions = self._source_body_pos_w_without_foothold_alignment(next_time_steps)
+            next_orientations = self._source_body_quat_w_at(next_time_steps)
+            next_offsets = self._first_foothold_height_offsets(
+                next_time_steps,
+                next_positions,
+                next_orientations,
+            )
+            transformed = transformed.clone()
+            transformed[..., 2] += (next_offsets - current_offsets) / self._env.step_dt
         _, terminal_z_velocity, _ = self._terminal_platform_z_alignment()
         transformed[..., 2] += terminal_z_velocity[:, None]
         return transformed
@@ -479,6 +1112,31 @@ class MotionCommand(CommandTerm):
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
         return self.body_ang_vel_w[:, self.motion_anchor_body_index]
+
+    @property
+    def terminal_default_anchor_pos_w(self) -> torch.Tensor:
+        """Platform-relative anchor-height target for the default standing q.
+
+        Only the z component is meaningful to the final-standing classifier.
+        It uses the start clip's default standing anchor-to-sole distance and
+        the *sampled* platform top, so a 0.60 m and a 0.70 m box receive the
+        same natural default pose without translating an expert terminal body.
+        """
+
+        source_anchor = self.anchor_pos_w.clone()
+        if not self.cfg.terminal_default_pose_enabled:
+            return source_anchor
+        if self.reference_transform_asset is None or self._terminal_default_anchor_to_sole_height is None:
+            raise RuntimeError("Terminal default anchor target is missing validated platform geometry.")
+        base_size = self.cfg.terminal_default_pose_base_size
+        if base_size is None:
+            raise RuntimeError("Terminal default anchor target is missing its platform base size.")
+        sizes = get_climb_box_sizes(self.reference_transform_asset, base_size=base_size, device=self.device)
+        platform_top_z = self.reference_transform_asset.data.root_pos_w[:, 2] + 0.5 * sizes[:, 2]
+        default_anchor_z = platform_top_z + self._terminal_default_anchor_to_sole_height[self.motion_ids]
+        alpha = self.terminal_default_pose_alpha
+        source_anchor[:, 2] = torch.lerp(source_anchor[:, 2], default_anchor_z, alpha)
+        return source_anchor
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -625,6 +1283,13 @@ class MotionCommand(CommandTerm):
         ]
         self.motion_finished[env_ids] = False
         self.motion_final_hold_count[env_ids] = 0
+        if self._first_foothold_filtered_contact_time is not None:
+            self._first_foothold_filtered_contact_time[env_ids] = 0.0
+        if self._platform_foot_filtered_contact_time is not None:
+            self._platform_foot_filtered_contact_time[env_ids] = 0.0
+        self._terminal_default_pose_latched[env_ids] = False
+        self._terminal_default_pose_age_steps[env_ids] = 0
+        self._terminal_default_pose_start_joint_pos[env_ids] = 0.0
         self._has_sampled_motion[env_ids] = True
 
         root_pos = self.body_pos_w[:, self.motion_root_body_index].clone()
@@ -673,6 +1338,15 @@ class MotionCommand(CommandTerm):
         else:
             self.time_steps, _ = advance_motion_frames(self.motion_ids, self.time_steps, self.motion.motion_end_idx)
             self._resample_command(torch.where(was_on_final_frame)[0])
+
+        # This state machine owns the filtered platform-contact timer, so it
+        # runs exactly once per policy step.  Isaac Lab evaluates reward and
+        # termination terms before CommandManager.compute, therefore those
+        # terms consume the completed timer from the preceding physics step;
+        # current contact loss is still rejected immediately by their current
+        # force/geometry checks.  Keeping the update here prevents several
+        # reward terms from advancing the duration multiple times in one step.
+        self._update_terminal_default_pose_mode()
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -786,6 +1460,32 @@ class MotionCommandCfg(CommandTermCfg):
     terminal_platform_alignment_base_size: tuple[float, float, float] | None = None
     terminal_platform_alignment_clearance: float = 0.0
     terminal_platform_alignment_ramp_time_s: float = 0.0
+    # Optional climb-only correction for the *reference leading foot* while
+    # it approaches a platform whose height was sampled independently of the
+    # source clip.  This is deliberately local to that arriving foot: it
+    # never translates the whole expert body or changes the source x/y path.
+    first_foothold_height_alignment_params: dict[str, object] | None = None
+    first_foothold_height_alignment_base_size: tuple[float, float, float] | None = None
+    first_foothold_height_alignment_clearance: float = 0.0
+    first_foothold_height_alignment_max_offset: float = 0.0
+
+    # One-way terminal mode for climb clips with a verified static tail.  It
+    # latches only after two real platform-supported feet carry sufficient
+    # load, then replaces the source joint target with one smooth path to the
+    # articulation's configured default pose.
+    terminal_default_pose_enabled: bool = False
+    terminal_default_pose_platform_support_params: dict[str, object] | None = None
+    terminal_default_pose_base_size: tuple[float, float, float] | None = None
+    terminal_default_pose_transition_time_s: float = 0.0
+    terminal_default_pose_static_window_time_s: float = 0.0
+    terminal_default_pose_contact_time_s: float = 0.0
+    terminal_default_pose_sole_height_tolerance: float = 0.0
+    terminal_default_pose_min_upward_force: float = 0.0
+    terminal_default_pose_min_total_load_fraction: float = 0.0
+    terminal_default_pose_max_torso_tilt: float = 0.0
+    terminal_default_pose_max_root_linear_speed: float = 0.0
+    terminal_default_pose_max_root_angular_speed: float = 0.0
+    terminal_default_pose_reference_max_joint_speed: float = 0.0
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}

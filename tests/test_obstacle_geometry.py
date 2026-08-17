@@ -328,6 +328,21 @@ class ClimbBoxGeometryTest(unittest.TestCase):
         torch.testing.assert_close(velocity_offset, torch.zeros(2))
         self.assertEqual(complete.tolist(), [False, True])
 
+        # A low sampled box needs the terminal source reference to move down,
+        # not merely a high-box upward correction.  At the end of the 0.5 s
+        # ramp its lowest physical sole lies exactly on the actual top.
+        low_offset, low_velocity, low_complete = obstacle.terminal_platform_z_alignment(
+            support_z[:1],
+            torch.tensor([0.60]),
+            torch.tensor([25]),
+            ramp_steps=25,
+            step_dt=0.02,
+        )
+        torch.testing.assert_close(low_offset, torch.tensor([-0.06]))
+        torch.testing.assert_close(low_velocity, torch.zeros(1))
+        self.assertTrue(low_complete.item())
+        torch.testing.assert_close(support_z[:1] + low_offset, torch.tensor([0.60]))
+
         midpoint_offset, midpoint_velocity, midpoint_complete = obstacle.terminal_platform_z_alignment(
             support_z[:1],
             torch.tensor([0.60]),
@@ -338,7 +353,6 @@ class ClimbBoxGeometryTest(unittest.TestCase):
         self.assertLess(midpoint_offset.abs().item(), 0.06)
         self.assertGreater(midpoint_velocity.abs().item(), 0.0)
         self.assertFalse(midpoint_complete.item())
-
 
 if __name__ == "__main__":
     unittest.main()
