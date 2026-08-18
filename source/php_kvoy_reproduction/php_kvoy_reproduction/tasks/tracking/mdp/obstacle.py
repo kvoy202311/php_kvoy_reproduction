@@ -39,8 +39,11 @@ def randomize_climb_box_geometry(
     subsequently shared by pose reset, the analytical height scan, and the
     evaluation checks.  ``nominal_size_fraction`` reserves an exact-size group
     for physically valid random-phase initialization; the remaining group
-    carries the configured geometry randomization.  This event must run in
-    ``prestartup`` mode with ``scene.replicate_physics=False``.
+    carries the configured geometry randomization.  The initialization group
+    is exposed as ``_climb_box_random_phase_env_mask``.  The old
+    ``_climb_box_nominal_geometry_mask`` name remains a compatibility alias
+    for externally configured tasks.  This event must run in ``prestartup``
+    mode with ``scene.replicate_physics=False``.
     """
 
     if env.sim.is_playing():
@@ -64,7 +67,7 @@ def randomize_climb_box_geometry(
         height_range=height_range,
         device="cpu",
     )
-    nominal_mask = nominal_environment_mask(
+    random_phase_mask = nominal_environment_mask(
         env_ids_cpu,
         num_envs=num_envs,
         nominal_fraction=nominal_size_fraction,
@@ -76,15 +79,19 @@ def randomize_climb_box_geometry(
                 raise ValueError(
                     f"base_size[{dimension}]={nominal_size} must lie inside its sampling range {size_range}."
                 )
-        sampled_sizes[nominal_mask] = base_size_tensor
+        sampled_sizes[random_phase_mask] = base_size_tensor
 
     all_sizes = base_size_tensor.repeat(num_envs, 1)
     all_sizes[env_ids_cpu] = sampled_sizes
     asset._climb_box_sizes = all_sizes
     asset._climb_box_scales = all_sizes / base_size_tensor
-    all_nominal_mask = torch.zeros(num_envs, dtype=torch.bool, device="cpu")
-    all_nominal_mask[env_ids_cpu] = nominal_mask
-    asset._climb_box_nominal_geometry_mask = all_nominal_mask
+    all_random_phase_mask = torch.zeros(num_envs, dtype=torch.bool, device="cpu")
+    all_random_phase_mask[env_ids_cpu] = random_phase_mask
+    asset._climb_box_random_phase_env_mask = all_random_phase_mask
+    # Keep the historical attribute as an alias so existing external configs
+    # continue to initialize safely.  Current climb code uses the explicit
+    # random-phase name above and never interprets this as geometry metadata.
+    asset._climb_box_nominal_geometry_mask = all_random_phase_mask
 
     # Import USD modules lazily so pure geometry helpers remain unit-testable
     # without launching Isaac Sim.

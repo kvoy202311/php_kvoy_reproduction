@@ -111,6 +111,24 @@ def _terminal_stationary_target_gate(command: MotionCommand) -> torch.Tensor:
     complete = _terminal_default_pose_complete_gate(command).to(dtype=torch.bool)
     latched = getattr(command, "terminal_default_pose_latched", None)
     static_tail = getattr(command, "terminal_default_pose_static_tail", None)
+    # Disabling default-q means that there is no interpolation to complete;
+    # its compatibility ``complete=True`` value must not be mistaken for a
+    # stationary expert target.  The immutable source is guaranteed fixed at
+    # its final frame, which is the only phase eligible for terminal settling
+    # in this mode.  Keep the generic/test-double fallback below when a motion
+    # command does not expose the required source-frame metadata.
+    default_q_enabled = getattr(getattr(command, "cfg", None), "terminal_default_pose_enabled", None)
+    if default_q_enabled is False:
+        motion_end_idx = getattr(getattr(command, "motion", None), "motion_end_idx", None)
+        motion_ids = getattr(command, "motion_ids", None)
+        if motion_end_idx is not None and motion_ids is not None:
+            final_frames = motion_end_idx[motion_ids] - 1
+            if final_frames.shape != command.time_steps.shape:
+                raise RuntimeError(
+                    "terminal motion final frames must match command time_steps, "
+                    f"got {final_frames.shape} and {command.time_steps.shape}."
+                )
+            return (command.time_steps >= final_frames).to(dtype=dtype)
     # Keep generic commands and lightweight test doubles on their historical
     # behavior: they only become eligible once an exposed completion gate is
     # true.  Production MotionCommand exposes both state tensors.
@@ -1642,6 +1660,96 @@ def _platform_foot_load_score(
     )
 
 
+def _expert_joint_pose_score(command: MotionCommand, std: float) -> torch.Tensor:
+    """Return a broad all-joint score around the immutable expert pose.
+
+    The source joint configuration is invariant to the terminal whole-body Z
+    translation, so it remains a consistent natural-pose target for every
+    platform height.  A broad Gaussian is intentional: the policy may retain
+    small physically useful deviations, but crossed legs or folded/raised
+    arms cannot maximize a terminal settling objective merely by stopping.
+    """
+
+    if std <= 0.0:
+        raise ValueError(f"std must be positive, got {std}.")
+    robot_joint_pos = command.robot_joint_pos
+    target_joint_pos = getattr(command, "source_joint_pos", None)
+    if target_joint_pos is None:
+        target_joint_pos = getattr(command, "joint_pos", None)
+    if target_joint_pos is None:
+        raise RuntimeError("The expert joint-pose score requires source_joint_pos or joint_pos.")
+    if target_joint_pos.shape != robot_joint_pos.shape:
+        raise RuntimeError(
+            "Expert and robot joint-position tensors must have the same shape, "
+            f"got {target_joint_pos.shape} and {robot_joint_pos.shape}."
+        )
+    mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
+    return torch.exp(-mean_squared_error / std**2)
+
+
+def final_expert_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    std: float,
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
+) -> torch.Tensor:
+    """Reward a natural full-body expert pose during real final support.
+
+    This term starts only in the verified stationary source tail and requires
+    sustained support from both soles plus the configured foot-borne load. It
+    therefore cannot alter the dynamic climb, activate on a single planted
+    foot, or reward a hand-supported terminal shortcut.  It deliberately does
+    not wait for the terminal Z bridge: joint angles are unchanged by a rigid
+    whole-body vertical translation, and early static-tail guidance prevents
+    the policy from drifting into an unnatural pose before the hold begins.
+    """
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    pose_score = _expert_joint_pose_score(command, std)
+    per_foot_scores = _platform_foot_contact_scores(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        platform_support_params,
+    )
+    two_foot_support = per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
+    foot_load_score = _platform_foot_load_score(
+        env,
+        command,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_contact_force=min_contact_force,
+        foot_height_std=foot_height_std,
+        min_total_load_fraction=min_total_load_fraction,
+    )
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+    )
+    return static_tail * two_foot_support * foot_load_score * pose_score
+
+
 def platform_foot_contact(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -1697,6 +1805,7 @@ def final_standing_stability(
     stability_weights: tuple[float, float, float, float],
     platform_support_params: Mapping[str, object] | None = None,
     min_total_load_fraction: float = 0.0,
+    expert_joint_pose_std: float | None = None,
 ) -> torch.Tensor:
     """Reward a quiet upright stand after the feet contact the platform.
 
@@ -1766,7 +1875,12 @@ def final_standing_stability(
     stability_scores = (
         gaussian_score(root_linear_speed, root_linear_speed_std),
         gaussian_score(root_angular_speed, root_angular_speed_std),
-        gaussian_score(joint_speed, joint_speed_std),
+        gaussian_score(joint_speed, joint_speed_std)
+        * (
+            _expert_joint_pose_score(command, expert_joint_pose_std)
+            if expert_joint_pose_std is not None
+            else torch.ones_like(joint_speed)
+        ),
         gaussian_score(torso_tilt, torso_tilt_std),
     )
     stability_score = sum(
@@ -1797,6 +1911,7 @@ def final_joint_settling(
     score_weights: tuple[float, float, float],
     platform_support_params: Mapping[str, object] | None = None,
     min_total_load_fraction: float = 0.0,
+    expert_joint_pose_std: float | None = None,
 ) -> torch.Tensor:
     """Reward real joint settling during the expert's stationary tail.
 
@@ -1867,6 +1982,12 @@ def final_joint_settling(
         fine_max_speed_scale=fine_max_speed_scale,
         score_weights=score_weights,
     )
+    if expert_joint_pose_std is not None:
+        # Do not teach the policy to freeze whichever posture it happened to
+        # reach.  Full settling credit is available only near the immutable
+        # natural expert pose; the dedicated pose reward provides the broad
+        # direction for reaching it.
+        settling_score *= _expert_joint_pose_score(command, expert_joint_pose_std)
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=settling_score.dtype)
     stationary_target = _terminal_stationary_target_gate(command)
     return (

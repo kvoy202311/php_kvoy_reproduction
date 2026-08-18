@@ -119,6 +119,29 @@ def motion_clip_end(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
 
 
+def _expert_joint_position_rms(command: MotionCommand) -> torch.Tensor:
+    """Return all-joint RMS error to the immutable source pose."""
+
+    robot_joint_pos = getattr(command, "robot_joint_pos", None)
+    if robot_joint_pos is None:
+        reference = command.robot_joint_vel
+        return torch.zeros(reference.shape[0], dtype=reference.dtype, device=reference.device)
+    target_joint_pos = getattr(command, "source_joint_pos", None)
+    if target_joint_pos is None:
+        target_joint_pos = getattr(command, "joint_pos", None)
+    if target_joint_pos is None:
+        # Generic test doubles and non-tracking callers may not expose an
+        # expert command.  Keep this optional climb-only condition neutral for
+        # those callers; production MotionCommand always exposes source q.
+        return torch.zeros(robot_joint_pos.shape[0], dtype=robot_joint_pos.dtype, device=robot_joint_pos.device)
+    if target_joint_pos.shape != robot_joint_pos.shape:
+        raise RuntimeError(
+            "Expert and robot joint-position tensors must have the same shape, "
+            f"got {target_joint_pos.shape} and {robot_joint_pos.shape}."
+        )
+    return torch.sqrt(torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1))
+
+
 def _climb_standing_conditions(
     env: ManagerBasedRLEnv,
     command: MotionCommand,
@@ -139,6 +162,7 @@ def _climb_standing_conditions(
     sole_height_tolerance: float | None = None,
     min_total_load_fraction: float = 0.0,
     max_default_joint_pos_rms: float | None = None,
+    max_expert_joint_pos_rms: float | None = None,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     if not foot_body_names:
         raise ValueError("foot_body_names must contain at least one body.")
@@ -167,6 +191,11 @@ def _climb_standing_conditions(
         raise ValueError(
             "max_default_joint_pos_rms must be positive when provided, "
             f"got {max_default_joint_pos_rms}."
+        )
+    if max_expert_joint_pos_rms is not None and max_expert_joint_pos_rms <= 0.0:
+        raise ValueError(
+            "max_expert_joint_pos_rms must be positive when provided, "
+            f"got {max_expert_joint_pos_rms}."
         )
 
     # The strict climb path deliberately uses the two filtered platform
@@ -299,6 +328,10 @@ def _climb_standing_conditions(
         "joint_speed_valid": joint_speed_valid,
         "default_joint_pos_valid": default_joint_pos_valid,
     }
+    if max_expert_joint_pos_rms is not None:
+        conditions["expert_joint_pos_valid"] = (
+            _expert_joint_position_rms(command) <= max_expert_joint_pos_rms
+        )
     return conditions, default_joint_pos_rms
 
 
@@ -319,12 +352,11 @@ def _terminal_platform_alignment_complete(command: MotionCommand) -> torch.Tenso
 class motion_end_success(ManagerTermBase):
     """Classify a clip as successful only after a continuous stable final stand.
 
-    For the climb task, the command first latches a one-way interpolation from
-    the static source tail to the articulation default pose.  Success begins
-    only after that interpolation has completed and the robot then maintains
-    the strict physical stand continuously.  A permissive all-joint RMS
-    threshold confirms that the final pose is *near* the articulation default,
-    rather than requiring exact joint equality.
+    Success requires real bilateral platform load, quiet motion and a broad
+    all-joint RMS bound around the immutable final expert pose.  The bound does
+    not require exact imitation; it rejects only terminal configurations such
+    as crossed legs or strongly folded/raised arms that otherwise satisfy the
+    pose-independent stability checks.
     """
 
     _METRIC_PREFIX = "final_standing_"
@@ -342,6 +374,13 @@ class motion_end_success(ManagerTermBase):
         self._required_stable_steps = max(1, math.ceil(float(cfg.params["min_stable_time"]) / env.step_dt - 1.0e-9))
 
         command: MotionCommand = env.command_manager.get_term(cfg.params["command_name"])
+        self._expert_joint_pos_gate_enabled = cfg.params.get("max_expert_joint_pos_rms") is not None
+        if self._expert_joint_pos_gate_enabled and getattr(command.cfg, "terminal_default_pose_enabled", False):
+            raise ValueError(
+                "motion_end_success cannot combine max_expert_joint_pos_rms with "
+                "terminal_default_pose_enabled: terminal default-q handoff replaces the source expert q, "
+                "so a final source-q RMS success gate would be contradictory. Disable one of these options."
+            )
         self._joint_group_ids = {
             group_name: torch.tensor(
                 [
@@ -400,8 +439,10 @@ class motion_end_success(ManagerTermBase):
             "default_joint_pos_rms",
             "stable_time",
             "longest_stable_time",
-            "nominal_geometry",
+            "random_phase_allowed",
         )
+        if self._expert_joint_pos_gate_enabled:
+            metric_names += ("expert_joint_pos_valid", "expert_joint_pos_rms")
         for name in metric_names:
             command.metrics.setdefault(self._METRIC_PREFIX + name, torch.zeros(env.num_envs, device=env.device))
 
@@ -433,6 +474,7 @@ class motion_end_success(ManagerTermBase):
         sole_height_tolerance: float | None = None,
         min_total_load_fraction: float = 0.0,
         max_default_joint_pos_rms: float | None = None,
+        max_expert_joint_pos_rms: float | None = None,
     ) -> torch.Tensor:
         if min_stable_time <= 0.0:
             raise ValueError(f"min_stable_time must be positive, got {min_stable_time}.")
@@ -461,6 +503,10 @@ class motion_end_success(ManagerTermBase):
             sole_height_tolerance,
             min_total_load_fraction,
             max_default_joint_pos_rms,
+            max_expert_joint_pos_rms,
+        )
+        expert_joint_pos_rms = (
+            _expert_joint_position_rms(command) if self._expert_joint_pos_gate_enabled else None
         )
         final_frames = command.motion.motion_end_idx[command.motion_ids] - 1
         at_final_frame = command.time_steps >= final_frames
@@ -500,6 +546,10 @@ class motion_end_success(ManagerTermBase):
         command.metrics[self._METRIC_PREFIX + "default_joint_pos_rms"].copy_(
             torch.where(eligible_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
         )
+        if expert_joint_pos_rms is not None:
+            command.metrics[self._METRIC_PREFIX + "expert_joint_pos_rms"].copy_(
+                torch.where(eligible_final_frame, expert_joint_pos_rms, torch.zeros_like(expert_joint_pos_rms))
+            )
         command.metrics[self._METRIC_PREFIX + "stable_time"].copy_(self._stable_steps.float() * env.step_dt)
         final_float = eligible_final_frame.to(dtype=max_joint_speed_value.dtype)
         command.metrics[self._METRIC_PREFIX + "final_frame_fraction"].copy_(final_float)
@@ -533,11 +583,17 @@ class motion_end_success(ManagerTermBase):
         command.metrics[self._METRIC_PREFIX + "longest_stable_time"].copy_(
             self._longest_stable_steps.float() * env.step_dt
         )
-        nominal_mask = getattr(env.scene[platform_cfg.name], "_climb_box_nominal_geometry_mask", None)
-        if nominal_mask is None:
-            raise RuntimeError("Platform does not expose the nominal-geometry diagnostic mask.")
-        command.metrics[self._METRIC_PREFIX + "nominal_geometry"].copy_(
-            nominal_mask.to(device=env.device, dtype=max_joint_speed_value.dtype)
+        platform = env.scene[platform_cfg.name]
+        random_phase_mask = getattr(platform, "_climb_box_random_phase_env_mask", None)
+        if random_phase_mask is None:
+            # Old externally configured environments may still expose only the
+            # historical alias.  Its semantics were always the safe
+            # random-phase subset, even when its name implied geometry.
+            random_phase_mask = getattr(platform, "_climb_box_nominal_geometry_mask", None)
+        if random_phase_mask is None:
+            raise RuntimeError("Platform does not expose the random-phase environment diagnostic mask.")
+        command.metrics[self._METRIC_PREFIX + "random_phase_allowed"].copy_(
+            random_phase_mask.to(device=env.device, dtype=max_joint_speed_value.dtype)
         )
 
         continuously_stable = self._stable_steps >= self._required_stable_steps

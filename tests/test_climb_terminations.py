@@ -147,7 +147,7 @@ class _SuccessScene:
     def __init__(self, num_envs):
         self.sensors = {"contact_forces": _DiagnosticContactSensor(num_envs)}
         self.platform = SimpleNamespace(
-            _climb_box_nominal_geometry_mask=torch.tensor([index == 0 for index in range(num_envs)])
+            _climb_box_random_phase_env_mask=torch.tensor([index == 0 for index in range(num_envs)])
         )
 
     def __getitem__(self, name):
@@ -155,7 +155,7 @@ class _SuccessScene:
         return self.platform
 
 
-def _make_success_term(num_envs=3, step_dt=0.02, min_stable_time=0.05):
+def _make_success_term(num_envs=3, step_dt=0.02, min_stable_time=0.05, max_expert_joint_pos_rms=None):
     command = SimpleNamespace(
         cfg=SimpleNamespace(terminate_on_motion_end=True),
         metrics={},
@@ -175,6 +175,8 @@ def _make_success_term(num_envs=3, step_dt=0.02, min_stable_time=0.05):
         "contact_sensor_cfg": _SceneEntityCfg("contact_forces", body_ids=[0, 1]),
         "min_stable_time": min_stable_time,
     }
+    if max_expert_joint_pos_rms is not None:
+        params["max_expert_joint_pos_rms"] = max_expert_joint_pos_rms
     env = SimpleNamespace(
         num_envs=num_envs,
         device="cpu",
@@ -187,7 +189,7 @@ def _make_success_term(num_envs=3, step_dt=0.02, min_stable_time=0.05):
     return term, env, command
 
 
-def _call_success_term(term, env, min_stable_time=0.05):
+def _call_success_term(term, env, min_stable_time=0.05, max_expert_joint_pos_rms=None):
     return term(
         env,
         command_name="motion",
@@ -205,6 +207,7 @@ def _call_success_term(term, env, min_stable_time=0.05):
         max_joint_speed=1.0,
         max_torso_tilt=0.35,
         min_stable_time=min_stable_time,
+        max_expert_joint_pos_rms=max_expert_joint_pos_rms,
     )
 
 
@@ -238,6 +241,51 @@ class MotionEndSuccessTest(unittest.TestCase):
             self.assertTrue(torch.all(_call_success_term(term, env)))
         torch.testing.assert_close(term._stable_steps, torch.full((3,), 3, dtype=torch.long))
         torch.testing.assert_close(term._longest_stable_steps, torch.full((3,), 3, dtype=torch.long))
+
+    def test_rejects_source_joint_success_gate_with_default_pose_handoff(self):
+        _, env, command = _make_success_term()
+        command.cfg.terminal_default_pose_enabled = True
+        params = {
+            "command_name": "motion",
+            "contact_sensor_cfg": _SceneEntityCfg("contact_forces", body_ids=[0, 1]),
+            "min_stable_time": 0.05,
+            "max_expert_joint_pos_rms": 0.5,
+        }
+
+        with self.assertRaisesRegex(ValueError, "max_expert_joint_pos_rms.*terminal_default_pose_enabled"):
+            terminations.motion_end_success(SimpleNamespace(params=params), env)
+
+    def test_omitted_expert_joint_gate_does_not_compute_or_publish_expert_metric(self):
+        term, env, command = _make_success_term()
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+
+        with (
+            patch.object(terminations, "_climb_standing_conditions", return_value=all_valid),
+            patch.object(
+                terminations,
+                "_expert_joint_position_rms",
+                side_effect=AssertionError("expert RMS must not be evaluated when no gate is configured"),
+            ),
+        ):
+            _call_success_term(term, env)
+
+        self.assertNotIn("final_standing_expert_joint_pos_valid", command.metrics)
+        self.assertNotIn("final_standing_expert_joint_pos_rms", command.metrics)
+
+    def test_configured_expert_joint_gate_records_expert_metric(self):
+        term, env, command = _make_success_term(max_expert_joint_pos_rms=0.5)
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+        all_valid[0]["expert_joint_pos_valid"] = torch.ones(3, dtype=torch.bool)
+        expert_rms = torch.tensor([0.1, 0.2, 0.3])
+
+        with (
+            patch.object(terminations, "_climb_standing_conditions", return_value=all_valid),
+            patch.object(terminations, "_expert_joint_position_rms", return_value=expert_rms),
+        ):
+            _call_success_term(term, env, max_expert_joint_pos_rms=0.5)
+
+        torch.testing.assert_close(command.metrics["final_standing_expert_joint_pos_valid"], torch.ones(3))
+        torch.testing.assert_close(command.metrics["final_standing_expert_joint_pos_rms"], expert_rms)
 
     def test_any_failed_condition_resets_only_that_environment(self):
         condition_names = (
@@ -368,8 +416,23 @@ class MotionEndSuccessTest(unittest.TestCase):
         torch.testing.assert_close(metrics["final_standing_right_wrist_contact_force"], torch.tensor([6.0, 8.0, 10.0]))
         torch.testing.assert_close(metrics["final_standing_left_wrist_contact_time"], torch.tensor([0.1, 0.3, 0.5]))
         torch.testing.assert_close(metrics["final_standing_right_wrist_contact_time"], torch.tensor([0.2, 0.4, 0.6]))
-        torch.testing.assert_close(metrics["final_standing_nominal_geometry"], torch.tensor([1.0, 0.0, 0.0]))
+        torch.testing.assert_close(metrics["final_standing_random_phase_allowed"], torch.tensor([1.0, 0.0, 0.0]))
         torch.testing.assert_close(metrics["final_standing_longest_stable_time"], torch.full((3,), 0.02))
+
+    def test_legacy_phase_mask_attribute_remains_supported(self):
+        term, env, command = _make_success_term()
+        platform = env.scene.platform
+        legacy_mask = torch.tensor([False, True, False])
+        delattr(platform, "_climb_box_random_phase_env_mask")
+        platform._climb_box_nominal_geometry_mask = legacy_mask
+        all_valid = self._standing_result(torch.ones(3, dtype=torch.bool))
+
+        with patch.object(terminations, "_climb_standing_conditions", return_value=all_valid):
+            _call_success_term(term, env)
+
+        torch.testing.assert_close(
+            command.metrics["final_standing_random_phase_allowed"], legacy_mask.float()
+        )
 
 
 class ClimbStandingConditionsTest(unittest.TestCase):

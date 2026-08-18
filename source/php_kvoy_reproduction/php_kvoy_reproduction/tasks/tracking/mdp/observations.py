@@ -138,47 +138,6 @@ def terminal_default_pose_active(env: ManagerBasedEnv, command_name: str) -> tor
     return active.to(dtype=command.joint_pos.dtype).unsqueeze(-1)
 
 
-def first_foothold_height_offsets(
-    env: ManagerBasedEnv,
-    command_name: str,
-    foot_body_names: tuple[str, ...] | list[str],
-) -> torch.Tensor:
-    """Expose the current source Z correction for each configured foot.
-
-    Height randomization changes only the arriving expert foot's body-position
-    target.  The exact correction is therefore part of the command state, not
-    hidden reward information.  Keeping it in the Actor and Critic makes the
-    local foothold adaptation fully observable while preserving the original
-    source joint command and all non-foot body targets.
-    """
-
-    if not foot_body_names:
-        raise ValueError("foot_body_names must contain at least one body name.")
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    body_names = getattr(command.cfg, "body_names", None)
-    if body_names is None:
-        raise RuntimeError("First-foothold offset observation requires command.cfg.body_names.")
-    missing_body_names = [name for name in foot_body_names if name not in body_names]
-    if missing_body_names:
-        raise ValueError(
-            "First-foothold offset observation requested bodies not tracked by the motion command: "
-            f"{missing_body_names}."
-        )
-
-    offsets = getattr(command, "first_foothold_height_offsets", None)
-    dtype = command.joint_pos.dtype
-    device = command.time_steps.device
-    if offsets is None:
-        return torch.zeros((env.num_envs, len(foot_body_names)), dtype=dtype, device=device)
-    if offsets.shape != (env.num_envs, len(body_names)):
-        raise RuntimeError(
-            "first_foothold_height_offsets must have shape "
-            f"({env.num_envs}, {len(body_names)}), got {tuple(offsets.shape)}."
-        )
-    body_ids = torch.tensor([body_names.index(name) for name in foot_body_names], dtype=torch.long, device=device)
-    return offsets[:, body_ids].to(dtype=dtype)
-
-
 def box_obstacle_height_scan(
     env: ManagerBasedEnv,
     sensor_cfg: SceneEntityCfg,

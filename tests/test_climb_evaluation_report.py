@@ -203,18 +203,18 @@ class ClimbEvaluationReportTest(unittest.TestCase):
             self.assertEqual(rows[0]["standing_condition_failure__feet_inside"], "1")
             self.assertEqual(rows[1]["completed_motion_ends"], "0")
 
-    def test_reports_speed_percentiles_and_nominal_randomized_groups(self):
+    def test_reports_speed_percentiles_and_random_phase_initialization_groups(self):
         diagnostic_a = {
             "max_joint_speed": 0.6,
             "joint_speed_rms": 0.2,
             "root_angular_speed": 0.4,
-            "nominal_geometry": 1.0,
+            "random_phase_allowed": 1.0,
         }
         diagnostic_b = {
             "max_joint_speed": 1.8,
             "joint_speed_rms": 0.7,
             "root_angular_speed": 0.9,
-            "nominal_geometry": 0.0,
+            "random_phase_allowed": 0.0,
         }
         trials = [
             self._trial(
@@ -251,8 +251,36 @@ class ClimbEvaluationReportTest(unittest.TestCase):
         diagnostic = report["motions"][0]["terminal_diagnostics"]
         self.assertEqual(diagnostic["speed_and_contact_percentiles"]["max_joint_speed"]["p50"], 0.6)
         self.assertEqual(diagnostic["speed_and_contact_percentiles"]["max_joint_speed"]["p95"], 1.8)
-        self.assertEqual(diagnostic["geometry_groups"]["nominal"]["completed_motion_ends"], 1)
-        self.assertEqual(diagnostic["geometry_groups"]["randomized"]["max_joint_speed"]["p50"], 1.8)
+        self.assertEqual(diagnostic["initialization_groups"]["random_phase_allowed"]["completed_motion_ends"], 1)
+        self.assertEqual(diagnostic["initialization_groups"]["forced_clip_start"]["max_joint_speed"]["p50"], 1.8)
+
+        legacy_trials = [
+            {
+                **trial,
+                "terminal_diagnostics": {
+                    ("nominal_geometry" if name == "random_phase_allowed" else name): value
+                    for name, value in trial["terminal_diagnostics"].items()
+                },
+            }
+            for trial in trials
+        ]
+        legacy_report = reporting.build_climb_evaluation_report(
+            task="task",
+            checkpoint=Path("model.pt"),
+            motion_dir=Path("motions"),
+            motion_files=self.motion_files,
+            trials_per_motion=2,
+            randomized_obstacles=True,
+            seed=1,
+            min_success_rate=0.5,
+            required_stable_time_s=0.25,
+            condition_names=self.conditions,
+            trials=legacy_trials,
+        )
+        legacy_diagnostic = legacy_report["motions"][0]["terminal_diagnostics"]
+        self.assertEqual(
+            legacy_diagnostic["initialization_groups"]["random_phase_allowed"]["completed_motion_ends"], 1
+        )
 
     def test_rejects_missing_or_duplicate_terminal_snapshots(self):
         with self.assertRaisesRegex(ValueError, "Expected 4 terminal snapshots"):

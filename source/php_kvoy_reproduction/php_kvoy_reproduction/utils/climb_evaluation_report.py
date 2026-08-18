@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 
-CLIMB_EVALUATION_REPORT_VERSION = 1
+CLIMB_EVALUATION_REPORT_VERSION = 2
 
 OUTCOME_SUCCESS = "success"
 OUTCOME_STANDING_FAILURE = "standing_failure"
@@ -269,15 +269,28 @@ def build_climb_evaluation_report(
             )
             for name in diagnostic_names
         }
-        geometry_groups: dict[str, dict[str, Any]] = {}
-        if "nominal_geometry" in diagnostic_names:
-            for group_name, is_nominal in (("nominal", True), ("randomized", False)):
+        initialization_groups: dict[str, dict[str, Any]] = {}
+        # ``nominal_geometry`` was the legacy name for this deterministic
+        # random-phase eligibility mask.  Accept old snapshots but always
+        # report the current, accurate initialization terminology.
+        phase_mask_name = (
+            "random_phase_allowed"
+            if "random_phase_allowed" in diagnostic_names
+            else "nominal_geometry"
+            if "nominal_geometry" in diagnostic_names
+            else None
+        )
+        if phase_mask_name is not None:
+            for group_name, random_phase_allowed in (
+                ("random_phase_allowed", True),
+                ("forced_clip_start", False),
+            ):
                 group_trials = [
                     trial
                     for trial in completed_trials
-                    if (float(trial["terminal_diagnostics"]["nominal_geometry"]) >= 0.5) == is_nominal
+                    if (float(trial["terminal_diagnostics"][phase_mask_name]) >= 0.5) == random_phase_allowed
                 ]
-                geometry_groups[group_name] = {
+                initialization_groups[group_name] = {
                     "completed_motion_ends": len(group_trials),
                     "max_joint_speed": _percentile_summary(
                         [float(trial["terminal_diagnostics"]["max_joint_speed"]) for trial in group_trials]
@@ -310,7 +323,7 @@ def build_climb_evaluation_report(
                     "default_joint_pos_rms": _summary(default_rms, include_min=False),
                     "stable_time_s": _summary(stable_times, include_min=True),
                     "speed_and_contact_percentiles": speed_diagnostics,
-                    "geometry_groups": geometry_groups,
+                    "initialization_groups": initialization_groups,
                     "required_stable_time_s": float(required_stable_time_s),
                 },
                 "accepted": success_rate >= min_success_rate,

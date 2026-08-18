@@ -18,7 +18,7 @@ parser.add_argument("--seed", type=int, default=42, help="Seed controlling all e
 parser.add_argument(
     "--randomized_obstacles",
     action="store_true",
-    help="Use the configured size/position/yaw ranges instead of the fixed nominal platform.",
+    help="Use the configured size/position/yaw ranges instead of the fixed source-aligned platform.",
 )
 parser.add_argument(
     "--min_success_rate",
@@ -79,7 +79,7 @@ import php_kvoy_reproduction.tasks  # noqa: F401
 import php_kvoy_reproduction.tasks.tracking.mdp as mdp
 from php_kvoy_reproduction.tasks.tracking.config.elf3.climb_env_cfg import (
     ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET,
-    ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION,
+    ELF3_CLIMB_RANDOM_PHASE_ENV_FRACTION,
     ELF3_CLIMB_PLATFORM_CENTER,
     ELF3_CLIMB_PLATFORM_HEIGHT_RANGE,
     ELF3_CLIMB_PLATFORM_LENGTH_RANGE,
@@ -116,9 +116,10 @@ _FINAL_STANDING_DIAGNOSTIC_NAMES = (
     "left_wrist_contact_time",
     "right_wrist_contact_time",
     "default_joint_pos_rms",
+    "expert_joint_pos_rms",
     "stable_time",
     "longest_stable_time",
-    "nominal_geometry",
+    "random_phase_allowed",
 )
 _TERMINAL_TERM_NAMES = ("motion_clip_end", "motion_end_success", "motion_end_failure")
 
@@ -226,25 +227,33 @@ def _audit_platform_and_height_map(env, randomized: bool, tolerance: float) -> N
         )
         _assert_in_range("yaw", yaw, ELF3_CLIMB_PLATFORM_YAW_RANGE, tolerance)
 
-        nominal_mask = getattr(platform, "_climb_box_nominal_geometry_mask", None)
-        if nominal_mask is None:
-            raise RuntimeError("Platform audit failed: nominal-geometry environment mask is missing.")
-        nominal_mask = nominal_mask.to(device=env.device, dtype=torch.bool)
-        expected_nominal_count = int(env.num_envs * ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION + 0.5)
-        actual_nominal_count = int(torch.count_nonzero(nominal_mask).item())
-        if actual_nominal_count != expected_nominal_count:
+        random_phase_mask = getattr(platform, "_climb_box_random_phase_env_mask", None)
+        if random_phase_mask is None:
+            # Accept snapshots/configurations created before the explicit
+            # random-phase attribute was introduced.
+            random_phase_mask = getattr(platform, "_climb_box_nominal_geometry_mask", None)
+        if random_phase_mask is None:
+            raise RuntimeError("Platform audit failed: random-phase environment mask is missing.")
+        random_phase_mask = random_phase_mask.to(device=env.device, dtype=torch.bool)
+        expected_random_phase_count = int(env.num_envs * ELF3_CLIMB_RANDOM_PHASE_ENV_FRACTION + 0.5)
+        actual_random_phase_count = int(torch.count_nonzero(random_phase_mask).item())
+        if actual_random_phase_count != expected_random_phase_count:
             raise RuntimeError(
-                f"Platform audit failed: expected {expected_nominal_count} nominal-geometry environments, "
-                f"got {actual_nominal_count}."
+                f"Platform audit failed: expected {expected_random_phase_count} random-phase environments, "
+                f"got {actual_random_phase_count}."
             )
-        nominal_sizes = torch.tensor(ELF3_CLIMB_PLATFORM_SIZE, device=env.device).expand(
-            actual_nominal_count, -1
-        )
-        nominal_error = torch.max(torch.abs(sizes[nominal_mask] - nominal_sizes)).item()
-        if nominal_error > tolerance:
-            raise RuntimeError(
-                f"Platform audit failed: nominal-group size error {nominal_error:.9g} exceeds {tolerance:g}."
-            )
+        if actual_random_phase_count:
+            expected_random_phase_sizes = torch.tensor(
+                ELF3_CLIMB_PLATFORM_SIZE, device=env.device
+            ).expand(actual_random_phase_count, -1)
+            random_phase_size_error = torch.max(
+                torch.abs(sizes[random_phase_mask] - expected_random_phase_sizes)
+            ).item()
+            if random_phase_size_error > tolerance:
+                raise RuntimeError(
+                    "Platform audit failed: random-phase group size error "
+                    f"{random_phase_size_error:.9g} exceeds {tolerance:g}."
+                )
     else:
         expected_sizes = torch.tensor(ELF3_CLIMB_PLATFORM_SIZE, device=env.device).expand_as(sizes)
         expected_positions = torch.tensor(ELF3_CLIMB_PLATFORM_CENTER, device=env.device).expand_as(local_positions)
@@ -331,8 +340,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
     env_cfg.commands.motion.terminate_on_motion_end = True
     env_cfg.commands.motion.debug_vis = False
     env_cfg.terminations.time_out = None
-    # Acceptance evaluates either the exact nominal platform or the complete
-    # configured randomization range; a training curriculum must not narrow it.
+    # Acceptance evaluates either the exact source-aligned platform or the
+    # complete configured randomization range; a training curriculum must not
+    # narrow it.
     env_cfg.curriculum.platform_pose = None
     env_cfg.scene.contact_forces.debug_vis = False
     env_cfg.scene.height_scanner.debug_vis = False

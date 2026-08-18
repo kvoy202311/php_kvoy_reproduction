@@ -166,6 +166,20 @@ class TerminalDefaultPoseModeGateTest(unittest.TestCase):
 
         torch.testing.assert_close(rewards._terminal_default_pose_latched_gate(command), torch.zeros(2))
 
+    def test_disabled_default_q_waits_for_the_final_source_frame_before_settling(self):
+        command = SimpleNamespace(
+            cfg=SimpleNamespace(terminal_default_pose_enabled=False),
+            joint_pos=torch.zeros(2, 1),
+            time_steps=torch.tensor([98, 99], dtype=torch.long),
+            motion_ids=torch.zeros(2, dtype=torch.long),
+            motion=SimpleNamespace(motion_end_idx=torch.tensor([100], dtype=torch.long)),
+            terminal_default_pose_complete=torch.ones(2, dtype=torch.bool),
+            terminal_default_pose_latched=torch.zeros(2, dtype=torch.bool),
+            terminal_default_pose_static_tail=torch.ones(2, dtype=torch.bool),
+        )
+
+        torch.testing.assert_close(rewards._terminal_stationary_target_gate(command), torch.tensor([0.0, 1.0]))
+
 
 class FinalJointSettlingRewardTest(unittest.TestCase):
     def _call(
@@ -442,6 +456,109 @@ class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
         self.assertEqual(moving_tail.item(), 0.0)
         self.assertEqual(single_foot.item(), 0.0)
         self.assertEqual(alignment_in_progress.item(), 0.0)
+
+
+class FinalExpertFullJointPoseRewardTest(unittest.TestCase):
+    """Behavioral coverage for the terminal full-joint expert-pose terms."""
+
+    def test_pose_score_uses_immutable_source_pose_not_mutable_command_target(self):
+        command = SimpleNamespace(
+            robot_joint_pos=torch.tensor([[0.2, -0.3, 0.4]], dtype=torch.float32),
+            source_joint_pos=torch.tensor([[0.2, -0.3, 0.4]], dtype=torch.float32),
+            # This deliberately disagrees with the source pose.  A terminal
+            # alignment/interpolation target must not replace the expert pose.
+            joint_pos=torch.tensor([[1.2, -1.3, 1.4]], dtype=torch.float32),
+        )
+
+        score = rewards._expert_joint_pose_score(command, std=0.35)
+
+        torch.testing.assert_close(score, torch.ones(1))
+
+    def test_pose_score_is_gaussian_of_mean_squared_all_joint_error(self):
+        std = 0.4
+        source_joint_pos = torch.zeros(2, 4)
+        robot_joint_pos = torch.tensor(
+            [
+                [0.4, 0.0, 0.0, 0.0],
+                [0.4, -0.4, 0.4, -0.4],
+            ],
+            dtype=torch.float32,
+        )
+        command = SimpleNamespace(
+            robot_joint_pos=robot_joint_pos,
+            source_joint_pos=source_joint_pos,
+            # Keep an incompatible mutable target present to ensure the
+            # calculation still covers every source-joint coordinate.
+            joint_pos=torch.full_like(source_joint_pos, 5.0),
+        )
+
+        score = rewards._expert_joint_pose_score(command, std=std)
+        expected = torch.exp(-torch.mean(torch.square(robot_joint_pos - source_joint_pos), dim=1) / std**2)
+
+        torch.testing.assert_close(score, expected)
+        self.assertGreater(score[0].item(), score[1].item())
+
+    def test_full_joint_reward_requires_static_bilateral_loaded_support(self):
+        std = 0.4
+        source_joint_pos = torch.zeros(5, 3)
+        robot_joint_pos = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, -0.2, 0.4],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        command = SimpleNamespace(
+            robot_joint_pos=robot_joint_pos,
+            source_joint_pos=source_joint_pos,
+            # This must not be used as the pose target even when the static
+            # tail, contacts, and load gates all permit reward.
+            joint_pos=torch.full_like(source_joint_pos, 3.0),
+        )
+        env = SimpleNamespace(
+            command_manager=_CommandManager(command),
+            step_dt=0.02,
+        )
+        support_scores = torch.tensor(
+            [
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        foot_load_scores = torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0], dtype=torch.float32)
+        static_tail = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0], dtype=torch.float32)
+        with (
+            patch.object(rewards, "_platform_foot_contact_scores", return_value=support_scores),
+            patch.object(rewards, "_platform_foot_load_score", return_value=foot_load_scores),
+            patch.object(rewards, "_expert_static_tail_gate", return_value=static_tail),
+        ):
+            reward = rewards.final_expert_joint_position_error_exp(
+                env,
+                command_name="motion",
+                platform_cfg=_SceneEntityCfg("platform"),
+                contact_sensor_cfg=_SceneEntityCfg("contact_forces", body_ids=[0, 1]),
+                base_size=(0.51, 0.8, 0.66),
+                foot_body_names=["left", "right"],
+                footprint_inset=0.02,
+                foot_height_std=0.08,
+                min_contact_force=10.0,
+                contact_time_scale=0.25,
+                reference_max_joint_speed=0.1,
+                static_window_time_s=0.5,
+                std=std,
+                min_total_load_fraction=0.5,
+            )
+
+        expected_second = torch.exp(-torch.mean(torch.square(robot_joint_pos[1])) / std**2)
+        torch.testing.assert_close(reward[:2], torch.tensor([1.0, expected_second]))
+        torch.testing.assert_close(reward[2:], torch.zeros(3))
 
 
 if __name__ == "__main__":
