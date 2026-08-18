@@ -90,67 +90,16 @@ from php_kvoy_reproduction.tasks.tracking.config.elf3.climb_env_cfg import (
     ELF3_CLIMB_PLATFORM_YAW_RANGE,
 )
 from php_kvoy_reproduction.utils.climb_evaluation_report import (
-    OUTCOME_STANDING_FAILURE,
+    COMPLETION_ONLY_CONDITION_NAME,
     TerminalSnapshotRecorder,
     build_climb_evaluation_report,
-    classify_terminal_outcome,
+    build_completion_only_trial_record,
     write_climb_evaluation_csv,
     write_climb_evaluation_json,
 )
 
 
-_FINAL_STANDING_DIAGNOSTIC_NAMES = (
-    "final_frame_fraction",
-    "max_joint_speed",
-    "joint_speed_rms",
-    "joints_over_0_5",
-    "joints_over_0_75",
-    "joints_over_1_0",
-    "joints_over_2_0",
-    "root_angular_speed",
-    "arm_max_joint_speed",
-    "waist_max_joint_speed",
-    "leg_max_joint_speed",
-    "left_wrist_contact_force",
-    "right_wrist_contact_force",
-    "left_wrist_contact_time",
-    "right_wrist_contact_time",
-    "default_joint_pos_rms",
-    "expert_joint_pos_rms",
-    "stable_time",
-    "longest_stable_time",
-    "random_phase_allowed",
-)
-_TERMINAL_TERM_NAMES = ("motion_clip_end", "motion_end_success", "motion_end_failure")
-
-
-def _final_standing_contract(env, command) -> tuple[str, tuple[str, ...], float]:
-    """Read the metric names and exact stability threshold from the active term."""
-
-    manager = env.termination_manager
-    try:
-        term_index = manager._term_names.index("motion_end_success")
-    except ValueError as exc:
-        raise RuntimeError("Evaluation requires the active motion_end_success termination term.") from exc
-    success_term = manager._term_cfgs[term_index].func
-    metric_prefix = getattr(success_term, "_METRIC_PREFIX", None)
-    required_stable_steps = getattr(success_term, "_required_stable_steps", None)
-    if not isinstance(metric_prefix, str) or not metric_prefix:
-        raise RuntimeError("motion_end_success does not expose its final-standing metric prefix.")
-    if not isinstance(required_stable_steps, int) or required_stable_steps <= 0:
-        raise RuntimeError("motion_end_success does not expose a valid required stable-step count.")
-
-    registered_names = tuple(
-        name.removeprefix(metric_prefix) for name in command.metrics if name.startswith(metric_prefix)
-    )
-    missing_diagnostics = set(_FINAL_STANDING_DIAGNOSTIC_NAMES).difference(registered_names)
-    if missing_diagnostics:
-        raise RuntimeError(f"Missing final-standing diagnostic metrics: {sorted(missing_diagnostics)}.")
-    condition_names = tuple(name for name in registered_names if name not in _FINAL_STANDING_DIAGNOSTIC_NAMES)
-    if not condition_names:
-        raise RuntimeError("motion_end_success exposes no final-standing Boolean condition metrics.")
-    required_stable_time = required_stable_steps * env.step_dt
-    return metric_prefix, condition_names, required_stable_time
+_TERMINAL_TERM_NAMES = ("motion_clip_end",)
 
 
 def _read_motion_metadata(files: tuple[Path, ...]) -> tuple[float, list[int]]:
@@ -312,15 +261,26 @@ def _audit_motion_contract(command, expected_files: tuple[Path, ...]) -> None:
     if not torch.equal(command.time_steps, expected_starts):
         raise RuntimeError("At least one evaluation environment did not start at its NPZ frame zero.")
 
-    final_frames = command.motion.motion_end_idx - 1
-    _, completed = mdp.advance_motion_frames(
+    if command.motion_end_hold_steps != 0:
+        raise RuntimeError(
+            "ELF3 completion-only evaluation requires motion_end_hold_steps=0; "
+            f"got {command.motion_end_hold_steps}."
+        )
+
+    # Start one source frame before each end.  With zero configured hold, that
+    # same update must arrive at the final frame and mark the clip complete;
+    # it must not require a repeated final-source-frame update to complete.
+    penultimate_frames = command.motion.motion_end_idx - 2
+    _, hold_counts, completed = mdp.advance_motion_frames_with_final_hold(
         torch.arange(command.motion.num_motions, device=command.device),
-        final_frames,
+        penultimate_frames,
         command.motion.motion_end_idx,
+        torch.zeros_like(penultimate_frames),
+        command.motion_end_hold_steps,
     )
-    if not torch.all(completed):
-        raise RuntimeError("Motion boundary contract failed at a final frame.")
-    print("[PASS] NPZ sort order, frame-zero starts, and end-of-clip boundary contract.")
+    if not torch.all(completed) or torch.any(hold_counts != 0):
+        raise RuntimeError("Motion boundary contract requires completion on the first final-source-frame update.")
+    print("[PASS] NPZ sort order, frame-zero starts, and zero-hold end-of-clip boundary contract.")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -369,13 +329,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
         obs, _ = env.get_observations()
 
         expected_ids = torch.arange(env.num_envs, device=env.device) % num_motions
-        metric_prefix, standing_condition_names, required_stable_time_s = _final_standing_contract(
-            env.unwrapped, command
-        )
-        report_condition_names = (*standing_condition_names, "continuous_stability")
-        metric_keys = tuple(
-            metric_prefix + name for name in (*standing_condition_names, *_FINAL_STANDING_DIAGNOSTIC_NAMES)
-        )
+        # This task accepts an episode when it reaches the authored source
+        # boundary without a preceding physical failure.  No post-expert
+        # standing interval or final-standing metric contract is evaluated.
+        report_condition_names = (COMPLETION_ONLY_CONDITION_NAME,)
+        metric_keys: tuple[str, ...] = ()
         # ManagerBasedRLEnv clears termination terms and command metrics inside
         # step() before returning, so take the terminal snapshot in _reset_idx.
         recorder = TerminalSnapshotRecorder(
@@ -384,7 +342,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             termination_term_names=_TERMINAL_TERM_NAMES,
             metric_keys=metric_keys,
         )
-        maximum_steps = max(motion_lengths) + command.motion_end_hold_steps + 2
+        maximum_steps = max(motion_lengths) + 2
         threshold = args_cli.min_success_rate
         if threshold is None:
             threshold = 0.9 if args_cli.randomized_obstacles else 1.0
@@ -410,44 +368,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
 
         trial_records = []
         for env_id in range(env.num_envs):
-            motion_end_success = bool(recorder.termination_terms["motion_end_success"][env_id].item())
-            motion_end_failure = bool(recorder.termination_terms["motion_end_failure"][env_id].item())
             physically_terminated = bool(recorder.physically_terminated[env_id].item())
             completed_motion_end = bool(recorder.termination_terms["motion_clip_end"][env_id].item())
-            outcome = classify_terminal_outcome(
-                motion_end_success=motion_end_success,
-                motion_end_failure=motion_end_failure,
-                physically_terminated=physically_terminated,
-                completed_motion_end=completed_motion_end,
-            )
-            condition_pass = {
-                name: bool(recorder.metrics[metric_prefix + name][env_id].item() >= 0.5)
-                for name in standing_condition_names
-            }
-            default_rms = float(recorder.metrics[metric_prefix + "default_joint_pos_rms"][env_id].item())
-            stable_time = float(recorder.metrics[metric_prefix + "stable_time"][env_id].item())
-            terminal_diagnostics = {
-                name: float(recorder.metrics[metric_prefix + name][env_id].item())
-                for name in _FINAL_STANDING_DIAGNOSTIC_NAMES
-                if name not in ("default_joint_pos_rms", "stable_time")
-            }
-            condition_pass["continuous_stability"] = stable_time + 1.0e-9 >= required_stable_time_s
-            # Early tracking failures occur before the final-frame diagnostics
-            # become meaningful; encode neutral finite values for strict JSON.
-            if outcome != OUTCOME_STANDING_FAILURE and not (motion_end_success and completed_motion_end):
-                default_rms = 0.0
-                stable_time = 0.0
-                terminal_diagnostics = {name: 0.0 for name in terminal_diagnostics}
             trial_records.append(
-                {
-                    "env_id": env_id,
-                    "motion_id": int(recorder.motion_ids[env_id].item()),
-                    "outcome": outcome,
-                    "standing_condition_pass": condition_pass,
-                    "default_joint_pos_rms": default_rms,
-                    "stable_time_s": stable_time,
-                    "terminal_diagnostics": terminal_diagnostics,
-                }
+                build_completion_only_trial_record(
+                    env_id=env_id,
+                    motion_id=int(recorder.motion_ids[env_id].item()),
+                    completed_motion_end=completed_motion_end,
+                    physically_terminated=physically_terminated,
+                )
             )
 
         report = build_climb_evaluation_report(
@@ -459,25 +388,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             randomized_obstacles=args_cli.randomized_obstacles,
             seed=args_cli.seed,
             min_success_rate=threshold,
-            required_stable_time_s=required_stable_time_s,
+            required_stable_time_s=0.0,
             condition_names=report_condition_names,
             trials=trial_records,
         )
 
-        print("\nfile | trials | success | rate | tracking_fail | standing_fail | unexpected | acceptance")
-        print("--- | ---: | ---: | ---: | ---: | ---: | ---: | ---")
+        print("\nfile | trials | completed | rate | tracking_fail | unexpected | acceptance")
+        print("--- | ---: | ---: | ---: | ---: | ---: | ---")
         for motion in report["motions"]:
             print(
                 f"{motion['motion_file']} | {motion['trials']} | {motion['successes']} | "
                 f"{motion['success_rate']:.1%} | {motion['tracking_failures']} | "
-                f"{motion['standing_failures']} | {motion['unexpected_failures']} | "
+                f"{motion['unexpected_failures']} | "
                 f"{'PASS' if motion['accepted'] else 'FAIL'}"
             )
-            if motion["standing_failures"]:
-                failure_summary = ", ".join(
-                    f"{name}={motion['standing_condition_failures'][name]}" for name in report_condition_names
-                )
-                print(f"  standing condition failures: {failure_summary}")
 
         if args_cli.json_output is not None:
             write_climb_evaluation_json(report, args_cli.json_output)

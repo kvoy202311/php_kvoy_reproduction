@@ -27,24 +27,14 @@ def _top_level_assignments(tree: ast.Module) -> dict[str, ast.expr]:
 
 
 class ClimbTerminalConfigTest(unittest.TestCase):
-    def test_short_terminal_hold_keeps_strict_support_and_disables_default_q_handoff(self):
+    def test_source_motion_ends_without_an_extra_terminal_hold(self):
         tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))
         assignments = _top_level_assignments(tree)
-        expected_values = {
-            "ELF3_CLIMB_FINAL_HOLD_TIME_S": 1.30,
-            "ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S": 0.5,
-        }
-        for name, expected in expected_values.items():
-            with self.subTest(name=name):
-                self.assertIn(name, assignments)
-                self.assertIsInstance(assignments[name], ast.Constant)
-                self.assertEqual(assignments[name].value, expected)
-        self.assertGreaterEqual(
-            assignments["ELF3_CLIMB_FINAL_HOLD_TIME_S"].value,
-            assignments["ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S"].value
-            + assignments["ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S"].value
-            + assignments["ELF3_CLIMB_MIN_STABLE_TIME_S"].value,
-        )
+        self.assertIn("ELF3_CLIMB_FINAL_HOLD_TIME_S", assignments)
+        self.assertIsInstance(assignments["ELF3_CLIMB_FINAL_HOLD_TIME_S"], ast.Constant)
+        self.assertEqual(assignments["ELF3_CLIMB_FINAL_HOLD_TIME_S"].value, 0.0)
+        self.assertNotIn("ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S", assignments)
+        self.assertNotIn("ELF3_CLIMB_MIN_STABLE_TIME_S", assignments)
 
         commands_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbCommandsCfg"
@@ -57,16 +47,23 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         )
         self.assertIsInstance(motion_assignment.value, ast.Call)
         keywords = {keyword.arg: keyword.value for keyword in motion_assignment.value.keywords}
-        expected_wiring = {
-            "motion_end_hold_time_s": "ELF3_CLIMB_FINAL_HOLD_TIME_S",
-            "terminal_platform_alignment_ramp_time_s": "ELF3_CLIMB_TERMINAL_PLATFORM_ALIGNMENT_RAMP_TIME_S",
-            "terminal_support_confirmation_time_s": "ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S",
-            "terminal_stable_time_s": "ELF3_CLIMB_MIN_STABLE_TIME_S",
-        }
-        for keyword_name, expected_name in expected_wiring.items():
+        self.assertIsInstance(keywords["motion_end_hold_time_s"], ast.Name)
+        self.assertEqual(keywords["motion_end_hold_time_s"].id, "ELF3_CLIMB_FINAL_HOLD_TIME_S")
+        self.assertIsInstance(keywords["terminate_on_motion_end"], ast.Constant)
+        self.assertTrue(keywords["terminate_on_motion_end"].value)
+        self.assertIsInstance(keywords["adaptive_failure_term_names"], ast.Tuple)
+        self.assertEqual(keywords["adaptive_failure_term_names"].elts, [])
+        for keyword_name in (
+            "terminal_platform_alignment_foot_body_names",
+            "terminal_platform_alignment_sole_corners_b",
+            "terminal_platform_alignment_base_size",
+            "terminal_platform_alignment_clearance",
+            "terminal_platform_alignment_ramp_time_s",
+            "terminal_support_confirmation_time_s",
+            "terminal_stable_time_s",
+        ):
             with self.subTest(keyword=keyword_name):
-                self.assertIsInstance(keywords[keyword_name], ast.Name)
-                self.assertEqual(keywords[keyword_name].id, expected_name)
+                self.assertNotIn(keyword_name, keywords)
 
         self.assertIsInstance(keywords["terminal_default_pose_enabled"], ast.Constant)
         self.assertFalse(keywords["terminal_default_pose_enabled"].value)
@@ -75,6 +72,75 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertNotIn("first_foothold_height_alignment_params", keywords)
         self.assertNotIn("terminal_default_pose_transition_time_s", keywords)
         self.assertNotIn("terminal_platform_xy_alignment_enabled", keywords)
+
+        rewards_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbRewardsCfg"
+        )
+        reward_names = {
+            target.id
+            for node in rewards_class.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self.assertNotIn("final_standing_stability", reward_names)
+        self.assertNotIn("final_joint_settling", reward_names)
+        self.assertIn("final_expert_joint_pose", reward_names)
+
+        terminations_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbTerminationsCfg"
+        )
+        termination_names = {
+            target.id
+            for node in terminations_class.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self.assertIn("motion_clip_end", termination_names)
+        self.assertNotIn("motion_end_success", termination_names)
+        self.assertNotIn("motion_end_failure", termination_names)
+        motion_clip_end_assignment = next(
+            node
+            for node in terminations_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "motion_clip_end" for target in node.targets)
+        )
+        self.assertIsInstance(motion_clip_end_assignment.value, ast.Call)
+        self.assertEqual(ast.unparse(motion_clip_end_assignment.value.func), "DoneTerm")
+        motion_clip_end_keywords = {
+            keyword.arg: keyword.value for keyword in motion_clip_end_assignment.value.keywords
+        }
+        self.assertEqual(ast.unparse(motion_clip_end_keywords["func"]), "mdp.motion_clip_end")
+        self.assertIsInstance(motion_clip_end_keywords["time_out"], ast.Constant)
+        self.assertTrue(motion_clip_end_keywords["time_out"].value)
+        self.assertIsInstance(motion_clip_end_keywords["params"], ast.Dict)
+        motion_clip_end_params = {
+            ast.literal_eval(key): ast.literal_eval(value)
+            for key, value in zip(
+                motion_clip_end_keywords["params"].keys,
+                motion_clip_end_keywords["params"].values,
+                strict=True,
+            )
+        }
+        self.assertEqual(motion_clip_end_params, {"command_name": "motion"})
+
+        curriculum_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbCurriculumCfg"
+        )
+        curriculum_assignment = next(
+            node
+            for node in curriculum_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "platform_pose" for target in node.targets)
+        )
+        curriculum_keywords = {keyword.arg: keyword.value for keyword in curriculum_assignment.value.keywords}
+        self.assertIsInstance(curriculum_keywords["params"], ast.Dict)
+        curriculum_params = {
+            ast.literal_eval(key): value
+            for key, value in zip(curriculum_keywords["params"].keys, curriculum_keywords["params"].values, strict=True)
+        }
+        self.assertEqual(ast.literal_eval(curriculum_params["success_term_name"]), "motion_clip_end")
 
         observations_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbObservationsCfg"
@@ -147,7 +213,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             calls.index("self._update_terminal_default_pose_mode"),
         )
 
-    def test_short_hold_has_an_independent_physical_budget_validation(self):
+    def test_optional_motion_command_hold_budget_validation_remains_available(self):
         tree = ast.parse(_COMMANDS_PATH.read_text(encoding="utf-8"))
         motion_command = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MotionCommand")
         method_names = {node.name for node in motion_command.body if isinstance(node, ast.FunctionDef)}
@@ -165,6 +231,27 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             calls.index("self._initialize_terminal_platform_z_alignment"),
             calls.index("self._validate_terminal_physical_hold_budget"),
         )
+
+    def test_optional_terminal_mechanisms_default_to_disabled(self):
+        tree = ast.parse(_COMMANDS_PATH.read_text(encoding="utf-8"))
+        motion_command_cfg = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MotionCommandCfg"
+        )
+        defaults = {
+            node.target.id: node.value
+            for node in motion_command_cfg.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        }
+        for name in (
+            "terminal_platform_alignment_ramp_time_s",
+            "terminal_support_confirmation_time_s",
+            "terminal_stable_time_s",
+        ):
+            with self.subTest(name=name):
+                self.assertIsInstance(defaults[name], ast.Constant)
+                self.assertEqual(defaults[name].value, 0.0)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ VALID_OUTCOMES = (
     OUTCOME_TRACKING_FAILURE,
     OUTCOME_UNEXPECTED_FAILURE,
 )
+COMPLETION_ONLY_CONDITION_NAME = "expert_motion_completed"
 
 
 class TerminalSnapshotRecorder:
@@ -123,6 +124,42 @@ def classify_terminal_outcome(
     return OUTCOME_UNEXPECTED_FAILURE
 
 
+def build_completion_only_trial_record(
+    *,
+    env_id: int,
+    motion_id: int,
+    completed_motion_end: bool,
+    physically_terminated: bool,
+) -> dict[str, Any]:
+    """Create one report record for an authored-motion-boundary contract.
+
+    The completion-only ELF3 task deliberately has no post-expert standing
+    window.  A record is successful only when the source boundary was reached
+    without a simultaneous physical termination; an invalid overlap remains
+    visible as ``unexpected_failure`` rather than being silently accepted.
+    The legacy diagnostic fields stay finite so JSON/CSV report consumers do
+    not need a second schema for completion-only evaluations.
+    """
+
+    outcome = classify_terminal_outcome(
+        motion_end_success=completed_motion_end,
+        motion_end_failure=False,
+        physically_terminated=physically_terminated,
+        completed_motion_end=completed_motion_end,
+    )
+    return {
+        "env_id": int(env_id),
+        "motion_id": int(motion_id),
+        "outcome": outcome,
+        "standing_condition_pass": {
+            COMPLETION_ONLY_CONDITION_NAME: outcome == OUTCOME_SUCCESS,
+        },
+        "default_joint_pos_rms": 0.0,
+        "stable_time_s": 0.0,
+        "terminal_diagnostics": {},
+    }
+
+
 def _finite_values(values: Sequence[float]) -> list[float]:
     result = [float(value) for value in values]
     if any(not math.isfinite(value) for value in result):
@@ -174,14 +211,21 @@ def build_climb_evaluation_report(
     condition_names: Sequence[str],
     trials: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Aggregate exactly one terminal snapshot per environment into a report."""
+    """Aggregate exactly one terminal snapshot per environment into a report.
+
+    ``required_stable_time_s=0.0`` is a valid completion-only contract: an
+    episode is accepted when it reaches the authored motion boundary without a
+    physical tracking termination.  Positive values retain the optional
+    continuous-standing evaluation semantics used by tasks that configure a
+    post-motion stability interval.
+    """
 
     if trials_per_motion <= 0:
         raise ValueError("trials_per_motion must be positive.")
     if not 0.0 <= min_success_rate <= 1.0:
         raise ValueError("min_success_rate must lie in [0, 1].")
-    if not math.isfinite(required_stable_time_s) or required_stable_time_s <= 0.0:
-        raise ValueError("required_stable_time_s must be finite and positive.")
+    if not math.isfinite(required_stable_time_s) or required_stable_time_s < 0.0:
+        raise ValueError("required_stable_time_s must be finite and non-negative.")
 
     resolved_files = tuple(Path(path).resolve() for path in motion_files)
     if not resolved_files:

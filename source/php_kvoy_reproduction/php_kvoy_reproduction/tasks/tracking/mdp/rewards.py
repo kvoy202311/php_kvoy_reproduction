@@ -1709,10 +1709,9 @@ def final_expert_joint_position_error_exp(
     This term starts only in the verified stationary source tail and requires
     sustained support from both soles plus the configured foot-borne load. It
     therefore cannot alter the dynamic climb, activate on a single planted
-    foot, or reward a hand-supported terminal shortcut.  It deliberately does
-    not wait for the terminal Z bridge: joint angles are unchanged by a rigid
-    whole-body vertical translation, and early static-tail guidance prevents
-    the policy from drifting into an unnatural pose before the hold begins.
+    foot, or reward a hand-supported terminal shortcut.  It acts only inside
+    the authored stationary source tail, so it reinforces the expert's final
+    pose without creating a post-expert standing interval.
     """
 
     command: MotionCommand = env.command_manager.get_term(command_name)

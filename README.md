@@ -133,7 +133,7 @@ python scripts/rsl_rl/play.py \
   --device cuda:0
 ```
 
-播放模式：`training` 保持训练配置；`full_clip` 从第 0 帧按顺序播放全部动作；`fixed_clip` 从第 0 帧固定播放一个动作。`--free_camera` 使用世界坐标相机，可以在 Isaac Sim 窗口中手动拖动视角。
+播放模式：`training` 保持训练配置；`full_clip` 从第 0 帧按顺序播放全部动作；`fixed_clip` 从第 0 帧固定播放一个动作。`full_clip` / `fixed_clip` 默认在第一个环境执行完专家末帧后停止；仅在需要观察末帧之后的自由物理演化时加入 `--no-stop_at_motion_end`。`--free_camera` 使用世界坐标相机，可以在 Isaac Sim 窗口中手动拖动视角。
 
 需要核对跟踪姿态时，可在 `full_clip` 或 `fixed_clip` 播放中加入 `--debug_vis`。它显示当前机器人和专家目标的关键 body 三维坐标轴（不是 29 个关节的数值）；建议使用 `--num_envs 1`、配合 `--free_camera`，且不要加 `--headless`：
 
@@ -160,6 +160,7 @@ python scripts/rsl_rl/play.py \
 --motion_dir DIR            播放目录中的多个 NPZ
 --playback_mode MODE        training / full_clip / fixed_clip
 --motion_id N               fixed_clip 使用的动作编号，从 0 开始
+--[no-]stop_at_motion_end   full/fixed 默认在专家末帧停止；no- 前缀允许无限保持末帧
 --load_run NAME             日志运行目录名
 --checkpoint FILE           checkpoint 文件名
 --wandb_path PATH           从 W&B 运行下载模型（可选）
@@ -173,7 +174,7 @@ python scripts/rsl_rl/play.py \
 
 ## 确定性验收评估
 
-该脚本让每个 NPZ 的独立试验都从第 0 帧开始，并分别统计成功率、跟踪失败和最终站立失败，同时检查动作边界以及固定平台与高程图的一致性。
+该脚本让每个 NPZ 的独立试验都从第 0 帧开始，并统计专家轨迹完成率与提前跟踪失败，同时检查动作边界以及固定平台与高程图的一致性。当前攀爬任务在专家末帧结束，不再追加额外的最终站立保持阶段。
 
 ```bash
 python scripts/rsl_rl/evaluate_elf3_climb.py \

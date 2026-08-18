@@ -131,6 +131,44 @@ class _TerminationManager:
         self.terminated = torch.zeros(num_envs, dtype=torch.bool)
 
 
+class MotionClipEndTerminationTest(unittest.TestCase):
+    def _env(self, *, terminate_on_motion_end: bool, motion_finished: torch.Tensor, terminated: torch.Tensor):
+        command = SimpleNamespace(
+            cfg=SimpleNamespace(terminate_on_motion_end=terminate_on_motion_end),
+            motion_finished=motion_finished,
+        )
+        env = SimpleNamespace(
+            num_envs=motion_finished.numel(),
+            device=motion_finished.device,
+            command_manager=_CommandManager(command),
+            termination_manager=_TerminationManager(motion_finished.numel()),
+        )
+        env.termination_manager.terminated[:] = terminated
+        return env
+
+    def test_completed_motion_is_a_timeout_only_when_physics_has_not_terminated(self):
+        env = self._env(
+            terminate_on_motion_end=True,
+            motion_finished=torch.tensor([True, True, False]),
+            terminated=torch.tensor([False, True, False]),
+        )
+
+        result = terminations.motion_clip_end(env, "motion")
+
+        self.assertTrue(torch.equal(result, torch.tensor([True, False, False])))
+
+    def test_disabled_motion_end_never_requests_a_clip_timeout(self):
+        env = self._env(
+            terminate_on_motion_end=False,
+            motion_finished=torch.tensor([True, True]),
+            terminated=torch.tensor([False, False]),
+        )
+
+        result = terminations.motion_clip_end(env, "motion")
+
+        self.assertTrue(torch.equal(result, torch.tensor([False, False])))
+
+
 class _DiagnosticContactSensor:
     def __init__(self, num_envs):
         self.data = SimpleNamespace(

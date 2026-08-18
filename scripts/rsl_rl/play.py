@@ -34,7 +34,7 @@ parser.add_argument(
     help=(
         "Motion playback behavior. 'training' preserves the task configuration; 'full_clip' assigns clips "
         "round-robin from frame zero; 'fixed_clip' plays --motion_id from frame zero. Full-clip modes hold "
-        "the last reference frame without resetting the episode."
+        "the last reference frame without resetting the episode only when --no-stop_at_motion_end is selected."
     ),
 )
 parser.add_argument(
@@ -42,6 +42,15 @@ parser.add_argument(
     type=int,
     default=None,
     help="Zero-based clip index used by --playback_mode fixed_clip.",
+)
+parser.add_argument(
+    "--stop_at_motion_end",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Stop full/fixed-clip playback after executing the final expert source frame for the first completed "
+        "environment (default). Use --no-stop_at_motion_end only to inspect an indefinite final-frame hold."
+    ),
 )
 parser.add_argument(
     "--free_camera",
@@ -164,11 +173,8 @@ def _configure_playback(env_cfg: ManagerBasedRLEnvCfg) -> None:
     # frame. Terminations are disabled below, so motion_finished cannot reset
     # or teleport the robot after the clip completes.
     motion_cfg.terminate_on_motion_end = True
-    # Preserve the task's configured final hold.  Terminal reference alignment
-    # may use this interval to move smoothly onto the sampled platform before
-    # the stationary final pose is evaluated.  With play terminations disabled
-    # below, the final NPZ frame still remains displayed indefinitely after
-    # that configured interval has elapsed.
+    # Preserve the task's configured reference horizon.  The climb task ends
+    # on the source final frame, while other tasks may still configure a hold.
     motion_cfg.adaptive_failure_term_names = ()
     motion_cfg.random_phase_env_mask_attr = None
     # Remove reset-state perturbations as well as random phase selection. This
@@ -202,7 +208,18 @@ def _configure_playback(env_cfg: ManagerBasedRLEnvCfg) -> None:
 
     mode_label = "one fixed clip" if args_cli.playback_mode == "fixed_clip" else "all clips round-robin"
     print(f"[INFO]: Playback mode: {args_cli.playback_mode} ({mode_label}, frame zero, nominal platform).")
-    print("[INFO]: The final NPZ frame will be held indefinitely; all terminations and curricula are disabled.")
+    if args_cli.stop_at_motion_end:
+        print(
+            "[INFO]: Playback will stop after the first completed expert source frame; "
+            "all terminations and curricula remain disabled."
+        )
+        if args_cli.playback_mode == "full_clip":
+            print(
+                "[INFO]: full_clip stops when its first assigned clip completes; "
+                "use fixed_clip for one-clip diagnosis."
+            )
+    else:
+        print("[INFO]: The final NPZ frame will be held indefinitely; all terminations and curricula are disabled.")
     if args_cli.debug_vis:
         print("[INFO]: Motion debug visualization enabled: current-robot and expert-target body frames are shown.")
 
@@ -332,15 +349,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
     # reset environment
     obs, _ = env.get_observations()
+    motion_command = None
+    if args_cli.stop_at_motion_end and args_cli.playback_mode != "training":
+        motion_command = env.unwrapped.command_manager.get_term("motion")
+        motion_finished = motion_command.motion_finished
+        if motion_finished.dtype != torch.bool or motion_finished.shape != (env.unwrapped.num_envs,):
+            raise RuntimeError(
+                "The playback motion command must expose a boolean motion_finished mask with shape "
+                f"({env.unwrapped.num_envs},), got dtype={motion_finished.dtype}, shape={tuple(motion_finished.shape)}."
+            )
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
+        # MotionCommand marks ``motion_finished`` when its update advances the
+        # reference onto the final source frame.  Execute that frame once, as
+        # training does, then stop before a viewer-only repeated-final-frame
+        # step can occur.  Checking only after ``env.step`` would stop one
+        # source control step early.
+        execute_final_source_frame = motion_command is not None and torch.any(motion_command.motion_finished)
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+        if execute_final_source_frame:
+            completed_envs = int(torch.count_nonzero(motion_command.motion_finished).item())
+            print(
+                "[INFO]: Stopping playback after the final expert source frame "
+                f"({completed_envs}/{motion_command.motion_finished.numel()} environment(s) completed)."
+            )
+            break
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

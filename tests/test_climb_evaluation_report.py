@@ -42,9 +42,35 @@ class TerminalOutcomeClassificationTest(unittest.TestCase):
                                     motion_end_failure=standing_failure,
                                     physically_terminated=terminated,
                                     completed_motion_end=completed,
-                                ),
-                                expected,
-                            )
+                            ),
+                            expected,
+                        )
+
+    def test_completion_only_trial_records_preserve_all_terminal_contracts(self):
+        cases = {
+            (False, True): (reporting.OUTCOME_SUCCESS, True),
+            (True, False): (reporting.OUTCOME_TRACKING_FAILURE, False),
+            (True, True): (reporting.OUTCOME_UNEXPECTED_FAILURE, False),
+        }
+        for (physically_terminated, completed_motion_end), (expected_outcome, expected_condition) in cases.items():
+            with self.subTest(
+                physically_terminated=physically_terminated,
+                completed_motion_end=completed_motion_end,
+            ):
+                record = reporting.build_completion_only_trial_record(
+                    env_id=3,
+                    motion_id=1,
+                    physically_terminated=physically_terminated,
+                    completed_motion_end=completed_motion_end,
+                )
+                self.assertEqual(record["outcome"], expected_outcome)
+                self.assertEqual(
+                    record["standing_condition_pass"],
+                    {reporting.COMPLETION_ONLY_CONDITION_NAME: expected_condition},
+                )
+                self.assertEqual(record["default_joint_pos_rms"], 0.0)
+                self.assertEqual(record["stable_time_s"], 0.0)
+                self.assertEqual(record["terminal_diagnostics"], {})
 
 
 class TerminalSnapshotRecorderTest(unittest.TestCase):
@@ -132,7 +158,7 @@ class ClimbEvaluationReportTest(unittest.TestCase):
             "terminal_diagnostics": terminal_diagnostics or {},
         }
 
-    def _build(self):
+    def _build(self, required_stable_time_s: float = 0.25):
         trials = [
             self._trial(0, 0, reporting.OUTCOME_SUCCESS, (True, True, True), 0.4, 0.26),
             self._trial(2, 0, reporting.OUTCOME_STANDING_FAILURE, (False, True, False), 0.6, 0.10),
@@ -148,7 +174,7 @@ class ClimbEvaluationReportTest(unittest.TestCase):
             randomized_obstacles=False,
             seed=42,
             min_success_rate=0.5,
-            required_stable_time_s=0.25,
+            required_stable_time_s=required_stable_time_s,
             condition_names=self.conditions,
             trials=trials,
         )
@@ -185,6 +211,46 @@ class ClimbEvaluationReportTest(unittest.TestCase):
                 "unexpected_failures": 1,
             },
         )
+
+    def test_allows_a_zero_second_completion_only_contract(self):
+        """No final-hold stability interval is a valid evaluation contract."""
+
+        condition_names = (reporting.COMPLETION_ONLY_CONDITION_NAME,)
+        trials = [
+            reporting.build_completion_only_trial_record(
+                env_id=0,
+                motion_id=0,
+                physically_terminated=False,
+                completed_motion_end=True,
+            ),
+            reporting.build_completion_only_trial_record(
+                env_id=1,
+                motion_id=1,
+                physically_terminated=False,
+                completed_motion_end=True,
+            ),
+        ]
+        report = reporting.build_climb_evaluation_report(
+            task="Tracking-Climb-ELF3-v0",
+            checkpoint=Path("/checkpoints/model.pt"),
+            motion_dir=Path("/motions"),
+            motion_files=self.motion_files,
+            trials_per_motion=1,
+            randomized_obstacles=False,
+            seed=42,
+            min_success_rate=1.0,
+            required_stable_time_s=0.0,
+            condition_names=condition_names,
+            trials=trials,
+        )
+
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["required_stable_time_s"], 0.0)
+        self.assertEqual(report["totals"]["successes"], 2)
+
+    def test_rejects_negative_stability_time(self):
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            self._build(required_stable_time_s=-1.0e-3)
 
     def test_json_and_csv_reports_are_strict_and_per_motion(self):
         report = self._build()

@@ -63,7 +63,7 @@ class _TerminationManager:
         self.success = torch.zeros(num_envs, dtype=torch.bool)
 
     def get_term(self, name):
-        assert name == "motion_end_success"
+        assert name == "motion_clip_end"
         return self.success
 
 
@@ -80,7 +80,7 @@ class ClimbBoxPoseCurriculumTest(unittest.TestCase):
     def setUp(self):
         self.params = {
             "event_term_name": "platform_pose",
-            "success_term_name": "motion_end_success",
+            "success_term_name": "motion_clip_end",
             "command_name": "motion",
             "full_position_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
             "full_yaw_range": (-0.8, 0.8),
