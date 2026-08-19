@@ -267,6 +267,7 @@ ELF3_CLIMB_FINAL_HOLD_TIME_S = 0.0
 ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S = 0.25
 ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N = 10.0
 ELF3_CLIMB_FOOTPRINT_INSET = 0.02
+ELF3_CLIMB_FOOT_HEIGHT_RANGE = (-0.03, 0.15)
 ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S = 1.5
 # These shared strict platform-foot support tolerances retain their existing
 # names for configuration compatibility.  They are used by physical
@@ -289,19 +290,40 @@ ELF3_CLIMB_PROGRESS_LIFT_PHASE_END = 0.75
 ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT = 0.65
 ELF3_CLIMB_PROGRESS_LIFT_WEIGHT = 0.35
 ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
-# The final source pose is already a natural stable posture.  Score waist,
-# arms and legs separately so a local abnormal pose cannot disappear inside a
-# 29-joint average.  Legs use the broadest tolerance and the smallest total
-# share because they still need freedom for physical balance corrections.  The
-# grouped pose and measured-speed terms use an inverse-quadratic score, so a
-# group's score is 0.5 when its RMS equals the configured scale; unlike a
-# narrow Gaussian, gross resumed-policy errors retain a corrective signal.
+# The final source pose is already a natural stable posture.  Each joint is
+# scored before the group mean, the worst joints receive an explicit share,
+# and the weighted harmonic result is blended strongly with the worst of the
+# five anatomical groups.  A bad arm or isolated leg joint can therefore no
+# longer hide behind already-correct groups or a low normal leg weight.
+# The inverse-square-root tail retains useful gradients for resumed policies
+# whose shoulders or wrists are still several radians from the expert pose.
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT = 6.0
-ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT = 1.5
+ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT = 3.0
+ELF3_CLIMB_FINAL_ROOT_ORIENTATION_REWARD_WEIGHT = 2.0
+ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_REWARD_WEIGHT = 1.0
+ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_REWARD_WEIGHT = 1.5
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S = 0.50
 ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S = 0.10
 ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
-ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR = 0.25
+# Expert-pose correction must not become weaker merely because the current
+# robot has poor support.  Physical support remains an independent reward and
+# a mandatory terminal-quality condition.
+ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR = 1.0
+ELF3_CLIMB_FINAL_SCORE_EXPONENT = 0.5
+ELF3_CLIMB_FINAL_WORST_JOINT_COUNT = {
+    "waist": 1,
+    "left_arm": 1,
+    "right_arm": 1,
+    "left_leg": 1,
+    "right_leg": 1,
+}
+ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT = 0.75
+ELF3_CLIMB_FINAL_GROUP_AGGREGATION = "harmonic"
+ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT = 0.75
+ELF3_CLIMB_FINAL_SPEED_POSE_QUALITY_FLOOR = 0.25
+ELF3_CLIMB_FINAL_ROOT_ORIENTATION_STD = 0.20
+ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_STD = 0.20
+ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_STD = 0.30
 ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS = {
     "waist": ["waist_y_joint", "waist_x_joint", "waist_z_joint"],
     "left_arm": [
@@ -354,11 +376,11 @@ ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS = {
     "right_leg": 0.75,
 }
 ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS = {
-    "waist": 0.35,
-    "left_arm": 0.55,
-    "right_arm": 0.55,
-    "left_leg": 0.85,
-    "right_leg": 0.85,
+    "waist": 0.30,
+    "left_arm": 0.45,
+    "right_arm": 0.45,
+    "left_leg": 0.70,
+    "right_leg": 0.70,
 }
 ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS = {
     "waist": 2.0,
@@ -366,6 +388,39 @@ ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS = {
     "right_arm": 2.0,
     "left_leg": 0.50,
     "right_leg": 0.50,
+}
+
+# A completed clip is classified from the authored static tail; no post-expert
+# hold is added.  These are deliberately broad first-stage quality limits: the
+# group RMS checks tolerate physical balance corrections, while the per-group
+# maxima reject a single folded arm or rotated leg that an RMS alone can hide.
+ELF3_CLIMB_FINAL_QUALITY_MIN_STABLE_TIME_S = 0.10
+ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_HEIGHT_ERROR = 0.15
+ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_LINEAR_SPEED = 0.20
+ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_ANGULAR_SPEED = 0.30
+ELF3_CLIMB_FINAL_QUALITY_MAX_JOINT_SPEED = 1.50
+ELF3_CLIMB_FINAL_QUALITY_MAX_TORSO_TILT = 0.35
+ELF3_CLIMB_FINAL_QUALITY_MAX_TORSO_ORIENTATION_ERROR = 0.20
+ELF3_CLIMB_FINAL_QUALITY_POSE_RMS_THRESHOLDS = {
+    "waist": 0.35,
+    "left_arm": 0.60,
+    "right_arm": 0.60,
+    "left_leg": 0.80,
+    "right_leg": 0.80,
+}
+ELF3_CLIMB_FINAL_QUALITY_POSE_MAX_THRESHOLDS = {
+    "waist": 0.60,
+    "left_arm": 1.00,
+    "right_arm": 1.00,
+    "left_leg": 1.20,
+    "right_leg": 1.20,
+}
+ELF3_CLIMB_FINAL_QUALITY_VELOCITY_RMS_THRESHOLDS = {
+    "waist": 0.50,
+    "left_arm": 0.80,
+    "right_arm": 0.80,
+    "left_leg": 1.00,
+    "right_leg": 1.00,
 }
 
 
@@ -520,9 +575,12 @@ class ELF3ClimbCommandsCfg:
         joint_position_range=(0.0, 0.0),
         terminate_on_motion_end=True,
         motion_end_hold_time_s=ELF3_CLIMB_FINAL_HOLD_TIME_S,
-        # Physical terminations are already collected by the adaptive sampler.
-        # Reaching the expert boundary is a normal completion, not a failure.
-        adaptive_failure_term_names=(),
+        # Physical failures remain automatic.  A complete-start clip whose
+        # authored static tail is not high-quality is additionally recorded at
+        # the final phase bin.  Random-phase clips are deliberately excluded
+        # from this classifier because they may begin with too little time to
+        # satisfy the contact/stability durations.
+        adaptive_failure_term_names=("motion_end_failure",),
         random_phase_env_mask_attr="_climb_box_random_phase_env_mask",
         reference_transform_asset_name="platform",
         reference_transform_nominal_xy=ELF3_CLIMB_PLATFORM_CENTER[:2],
@@ -843,6 +901,11 @@ class ELF3ClimbRewardsCfg:
             "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
             "group_stds": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS,
             "group_weights": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS,
+            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
+            "worst_joint_count": ELF3_CLIMB_FINAL_WORST_JOINT_COUNT,
+            "worst_joint_weight": ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT,
+            "group_aggregation": ELF3_CLIMB_FINAL_GROUP_AGGREGATION,
+            "worst_group_weight": ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT,
             "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
             "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
             "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
@@ -870,9 +933,53 @@ class ELF3ClimbRewardsCfg:
             "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
             "group_stds": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS,
             "group_weights": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS,
+            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
+            "worst_joint_count": ELF3_CLIMB_FINAL_WORST_JOINT_COUNT,
+            "worst_joint_weight": ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT,
+            "group_aggregation": ELF3_CLIMB_FINAL_GROUP_AGGREGATION,
+            "worst_group_weight": ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT,
+            "pose_quality_floor": ELF3_CLIMB_FINAL_SPEED_POSE_QUALITY_FLOOR,
+            "pose_quality_group_stds": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS,
+            "pose_quality_group_weights": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS,
             "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
             "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
             "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
+        },
+    )
+    final_expert_root_orientation = RewTerm(
+        func=mdp.final_expert_root_orientation_error_exp,
+        weight=ELF3_CLIMB_FINAL_ROOT_ORIENTATION_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
+            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
+            "std": ELF3_CLIMB_FINAL_ROOT_ORIENTATION_STD,
+            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
+        },
+    )
+    final_expert_root_linear_velocity = RewTerm(
+        func=mdp.final_expert_root_linear_velocity_error_exp,
+        weight=ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
+            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
+            "std": ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_STD,
+            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
+        },
+    )
+    final_expert_root_angular_velocity = RewTerm(
+        func=mdp.final_expert_root_angular_velocity_error_exp,
+        weight=ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
+            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
+            "std": ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_STD,
+            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
         },
     )
     first_foothold_support_quality = RewTerm(
@@ -955,11 +1062,53 @@ class ELF3ClimbTerminationsCfg:
             "body_names": ELF3_CLIMB_END_EFFECTOR_NAMES,
         },
     )
-    # Keep all physical failures above the clip-boundary terms.  The timeout
-    # functions inspect the accumulated terminated mask so a transition can
-    # never be both a physical termination and a bootstrapped timeout.
-    # A reference clip ending is an external data boundary, not a physical
-    # failure.  Reset the environment and let PPO bootstrap the value target.
+    # Keep physical failures above all boundary classifiers.  Success is
+    # accumulated inside the authored static tail; success, quality failure,
+    # and the generic clip boundary remain timeouts, so this classification
+    # changes curriculum/sampling semantics without adding a terminal reward
+    # or changing PPO value bootstrapping.
+    motion_end_success = DoneTerm(
+        func=mdp.motion_end_success,
+        time_out=True,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_range": ELF3_CLIMB_FOOT_HEIGHT_RANGE,
+            "min_foot_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "min_foot_contact_time": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "max_root_height_error": ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_HEIGHT_ERROR,
+            "max_root_linear_speed": ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_LINEAR_SPEED,
+            "max_root_angular_speed": ELF3_CLIMB_FINAL_QUALITY_MAX_ROOT_ANGULAR_SPEED,
+            "max_joint_speed": ELF3_CLIMB_FINAL_QUALITY_MAX_JOINT_SPEED,
+            "max_torso_tilt": ELF3_CLIMB_FINAL_QUALITY_MAX_TORSO_TILT,
+            "min_stable_time": ELF3_CLIMB_FINAL_QUALITY_MIN_STABLE_TIME_S,
+            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
+            "group_pose_rms_thresholds": ELF3_CLIMB_FINAL_QUALITY_POSE_RMS_THRESHOLDS,
+            "group_pose_max_thresholds": ELF3_CLIMB_FINAL_QUALITY_POSE_MAX_THRESHOLDS,
+            "group_velocity_rms_thresholds": ELF3_CLIMB_FINAL_QUALITY_VELOCITY_RMS_THRESHOLDS,
+            "max_torso_orientation_error": ELF3_CLIMB_FINAL_QUALITY_MAX_TORSO_ORIENTATION_ERROR,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "sole_height_tolerance": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
+        },
+    )
+    motion_end_failure = DoneTerm(
+        func=mdp.motion_end_failure,
+        time_out=True,
+        params={
+            "command_name": "motion",
+            "success_term_name": "motion_end_success",
+        },
+    )
     motion_clip_end = DoneTerm(
         func=mdp.motion_clip_end,
         time_out=True,
@@ -975,9 +1124,9 @@ class ELF3ClimbCurriculumCfg:
         func=mdp.climb_box_pose_curriculum,
         params={
             "event_term_name": "platform_pose",
-            # Reaching the source boundary without a prior physical
-            # termination is the completion signal for this task.
-            "success_term_name": "motion_clip_end",
+            # Geometry advances only after a contiguous high-quality source
+            # tail, not merely after reaching the clip boundary.
+            "success_term_name": "motion_end_success",
             "command_name": "motion",
             "full_position_range": {
                 "x": ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE,

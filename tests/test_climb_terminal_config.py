@@ -52,7 +52,10 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertIsInstance(keywords["terminate_on_motion_end"], ast.Constant)
         self.assertTrue(keywords["terminate_on_motion_end"].value)
         self.assertIsInstance(keywords["adaptive_failure_term_names"], ast.Tuple)
-        self.assertEqual(keywords["adaptive_failure_term_names"].elts, [])
+        self.assertEqual(
+            [ast.literal_eval(value) for value in keywords["adaptive_failure_term_names"].elts],
+            ["motion_end_failure"],
+        )
         for keyword_name in (
             "terminal_platform_alignment_foot_body_names",
             "terminal_platform_alignment_sole_corners_b",
@@ -87,6 +90,9 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertNotIn("final_joint_settling", reward_names)
         self.assertIn("final_expert_joint_pose", reward_names)
         self.assertIn("final_actual_joint_velocity", reward_names)
+        self.assertIn("final_expert_root_orientation", reward_names)
+        self.assertIn("final_expert_root_linear_velocity", reward_names)
+        self.assertIn("final_expert_root_angular_velocity", reward_names)
 
         reward_functions = {
             target.id: ast.unparse(
@@ -106,6 +112,44 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             reward_functions["final_actual_joint_velocity"],
             "mdp.final_grouped_actual_joint_velocity_exp",
         )
+        self.assertEqual(
+            reward_functions["final_expert_root_orientation"],
+            "mdp.final_expert_root_orientation_error_exp",
+        )
+        self.assertEqual(
+            reward_functions["final_expert_root_linear_velocity"],
+            "mdp.final_expert_root_linear_velocity_error_exp",
+        )
+        self.assertEqual(
+            reward_functions["final_expert_root_angular_velocity"],
+            "mdp.final_expert_root_angular_velocity_error_exp",
+        )
+        for reward_name in ("final_expert_joint_pose", "final_actual_joint_velocity"):
+            with self.subTest(reward=reward_name):
+                assignment = next(
+                    node
+                    for node in rewards_class.body
+                    if isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == reward_name
+                        for target in node.targets
+                    )
+                )
+                reward_keywords = {
+                    keyword.arg: keyword.value for keyword in assignment.value.keywords
+                }
+                reward_params = {
+                    ast.literal_eval(key): value
+                    for key, value in zip(
+                        reward_keywords["params"].keys,
+                        reward_keywords["params"].values,
+                        strict=True,
+                    )
+                }
+                self.assertEqual(
+                    ast.unparse(reward_params["worst_group_weight"]),
+                    "ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT",
+                )
 
         terminations_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbTerminationsCfg"
@@ -118,8 +162,61 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             if isinstance(target, ast.Name)
         }
         self.assertIn("motion_clip_end", termination_names)
-        self.assertNotIn("motion_end_success", termination_names)
-        self.assertNotIn("motion_end_failure", termination_names)
+        self.assertIn("motion_end_success", termination_names)
+        self.assertIn("motion_end_failure", termination_names)
+        boundary_order = [
+            target.id
+            for node in terminations_class.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+            and target.id in {"motion_end_success", "motion_end_failure", "motion_clip_end"}
+        ]
+        self.assertEqual(
+            boundary_order,
+            ["motion_end_success", "motion_end_failure", "motion_clip_end"],
+        )
+        for term_name, function_name in (
+            ("motion_end_success", "mdp.motion_end_success"),
+            ("motion_end_failure", "mdp.motion_end_failure"),
+        ):
+            with self.subTest(termination=term_name):
+                assignment = next(
+                    node
+                    for node in terminations_class.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == term_name for target in node.targets)
+                )
+                term_keywords = {keyword.arg: keyword.value for keyword in assignment.value.keywords}
+                self.assertEqual(ast.unparse(term_keywords["func"]), function_name)
+                self.assertTrue(ast.literal_eval(term_keywords["time_out"]))
+
+        success_assignment = next(
+            node
+            for node in terminations_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "motion_end_success" for target in node.targets)
+        )
+        success_keywords = {keyword.arg: keyword.value for keyword in success_assignment.value.keywords}
+        success_params = {
+            ast.literal_eval(key): value
+            for key, value in zip(
+                success_keywords["params"].keys,
+                success_keywords["params"].values,
+                strict=True,
+            )
+        }
+        for parameter_name in (
+            "static_window_time_s",
+            "reference_max_joint_speed",
+            "joint_groups",
+            "group_pose_rms_thresholds",
+            "group_pose_max_thresholds",
+            "group_velocity_rms_thresholds",
+            "max_torso_orientation_error",
+        ):
+            with self.subTest(success_parameter=parameter_name):
+                self.assertIn(parameter_name, success_params)
         motion_clip_end_assignment = next(
             node
             for node in terminations_class.body
@@ -160,7 +257,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             ast.literal_eval(key): value
             for key, value in zip(curriculum_keywords["params"].keys, curriculum_keywords["params"].values, strict=True)
         }
-        self.assertEqual(ast.literal_eval(curriculum_params["success_term_name"]), "motion_clip_end")
+        self.assertEqual(ast.literal_eval(curriculum_params["success_term_name"]), "motion_end_success")
 
         observations_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbObservationsCfg"
@@ -206,7 +303,32 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR"]),
-            0.25,
+            1.0,
+        )
+        self.assertEqual(ast.literal_eval(assignments["ELF3_CLIMB_FINAL_SCORE_EXPONENT"]), 0.5)
+        self.assertEqual(ast.literal_eval(assignments["ELF3_CLIMB_FINAL_GROUP_AGGREGATION"]), "harmonic")
+        self.assertEqual(ast.literal_eval(assignments["ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT"]), 0.75)
+        self.assertEqual(ast.literal_eval(assignments["ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT"]), 0.75)
+        worst_counts = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_WORST_JOINT_COUNT"])
+        for group_name in groups:
+            with self.subTest(worst_group=group_name):
+                self.assertEqual(worst_counts[group_name], 1)
+
+        pose_rms_thresholds = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_QUALITY_POSE_RMS_THRESHOLDS"]
+        )
+        pose_max_thresholds = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_QUALITY_POSE_MAX_THRESHOLDS"]
+        )
+        velocity_rms_thresholds = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_QUALITY_VELOCITY_RMS_THRESHOLDS"]
+        )
+        self.assertEqual(set(pose_rms_thresholds), set(groups))
+        self.assertEqual(set(pose_max_thresholds), set(groups))
+        self.assertEqual(set(velocity_rms_thresholds), set(groups))
+        self.assertLessEqual(
+            ast.literal_eval(assignments["ELF3_CLIMB_FINAL_QUALITY_MIN_STABLE_TIME_S"]),
+            ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S"]),
         )
 
     def test_length_range_is_fixed_to_the_source_aligned_platform(self):

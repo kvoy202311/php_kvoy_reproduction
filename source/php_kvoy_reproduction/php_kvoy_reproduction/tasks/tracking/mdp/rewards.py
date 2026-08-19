@@ -1439,19 +1439,19 @@ def _expert_static_tail_gate(
     final-frame hold, :func:`_final_phase_gate` remains one.
     """
 
-    if reference_max_joint_speed < 0.0:
+    if not math.isfinite(reference_max_joint_speed) or reference_max_joint_speed < 0.0:
         raise ValueError(
-            "reference_max_joint_speed must be non-negative, "
+            "reference_max_joint_speed must be finite and non-negative, "
             f"got {reference_max_joint_speed}."
         )
-    if static_window_time_s <= 0.0:
-        raise ValueError(f"static_window_time_s must be positive, got {static_window_time_s}.")
-    if step_dt <= 0.0:
-        raise ValueError(f"step_dt must be positive, got {step_dt}.")
+    if not math.isfinite(static_window_time_s) or static_window_time_s <= 0.0:
+        raise ValueError(f"static_window_time_s must be finite and positive, got {static_window_time_s}.")
+    if not math.isfinite(step_dt) or step_dt <= 0.0:
+        raise ValueError(f"step_dt must be finite and positive, got {step_dt}.")
     if ramp_time_s is None:
         ramp_time_s = static_window_time_s
-    if ramp_time_s <= 0.0:
-        raise ValueError(f"ramp_time_s must be positive, got {ramp_time_s}.")
+    if not math.isfinite(ramp_time_s) or ramp_time_s <= 0.0:
+        raise ValueError(f"ramp_time_s must be finite and positive, got {ramp_time_s}.")
     if ramp_time_s > static_window_time_s:
         raise ValueError(
             "ramp_time_s cannot exceed static_window_time_s, "
@@ -1492,9 +1492,15 @@ def _validate_terminal_joint_groups(
         raise ValueError("group_stds keys must exactly match joint_groups keys.")
     if set(group_weights) != set(group_names):
         raise ValueError("group_weights keys must exactly match joint_groups keys.")
-    if any(float(group_stds[name]) <= 0.0 for name in group_names):
+    if any(
+        not math.isfinite(float(group_stds[name])) or float(group_stds[name]) <= 0.0
+        for name in group_names
+    ):
         raise ValueError("Every terminal joint-group std must be positive.")
-    if any(float(group_weights[name]) < 0.0 for name in group_names):
+    if any(
+        not math.isfinite(float(group_weights[name])) or float(group_weights[name]) < 0.0
+        for name in group_names
+    ):
         raise ValueError("Terminal joint-group weights must be non-negative.")
     if sum(float(group_weights[name]) for name in group_names) <= 0.0:
         raise ValueError("At least one terminal joint-group weight must be positive.")
@@ -1537,19 +1543,265 @@ def _validate_terminal_joint_groups(
     return resolved
 
 
-def _grouped_expert_joint_pose_score(
+class _GroupedJointScoreDetails(NamedTuple):
+    """Aggregate score plus per-group diagnostics for a terminal joint objective."""
+
+    aggregate: torch.Tensor
+    rms: dict[str, torch.Tensor]
+    maximum: dict[str, torch.Tensor]
+    mean_score: dict[str, torch.Tensor]
+    worst_score: dict[str, torch.Tensor]
+    group_score: dict[str, torch.Tensor]
+
+
+def _validate_score_exponent(score_exponent: float | None) -> float | None:
+    """Validate an optional inverse-power exponent.
+
+    ``None`` deliberately selects the legacy group-RMS inverse-quadratic
+    calculation.  An explicit value enables per-joint inverse-power scores;
+    in particular, ``0.5`` is the intended inverse-square-root heavy tail.
+    """
+
+    if score_exponent is None:
+        return None
+    if isinstance(score_exponent, bool):
+        raise TypeError("score_exponent must be a positive finite scalar or None.")
+    try:
+        exponent = float(score_exponent)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("score_exponent must be a positive finite scalar or None.") from exc
+    if not math.isfinite(exponent) or exponent <= 0.0:
+        raise ValueError(f"score_exponent must be positive and finite, got {score_exponent}.")
+    return exponent
+
+
+def _resolve_group_option(
+    value: int | float | Mapping[str, int] | Mapping[str, float],
+    group_names: Sequence[str],
+    *,
+    option_name: str,
+) -> dict[str, int | float]:
+    """Expand a scalar or exact-key mapping into one value per joint group."""
+
+    if isinstance(value, Mapping):
+        if set(value) != set(group_names):
+            raise ValueError(f"{option_name} mapping keys must exactly match joint_groups keys.")
+        return {name: value[name] for name in group_names}
+    return {name: value for name in group_names}
+
+
+def _terminal_group_scoring_options(
+    joint_groups: Mapping[str, Sequence[str]],
+    score_exponent: float | None,
+    worst_joint_count: int | Mapping[str, int],
+    worst_joint_weight: float | Mapping[str, float],
+    group_aggregation: str,
+) -> tuple[float | None, dict[str, int], dict[str, float]]:
+    """Validate configurable within-group and across-group score aggregation."""
+
+    exponent = _validate_score_exponent(score_exponent)
+    group_names = tuple(joint_groups)
+    raw_counts = _resolve_group_option(
+        worst_joint_count, group_names, option_name="worst_joint_count"
+    )
+    raw_weights = _resolve_group_option(
+        worst_joint_weight, group_names, option_name="worst_joint_weight"
+    )
+    counts: dict[str, int] = {}
+    weights: dict[str, float] = {}
+    for group_name, joint_names in joint_groups.items():
+        count = raw_counts[group_name]
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise TypeError(
+                "worst_joint_count values must be integers, "
+                f"got {count!r} for group {group_name!r}."
+            )
+        if count < 0 or count > len(joint_names):
+            raise ValueError(
+                f"worst_joint_count for group {group_name!r} must be in "
+                f"[0, {len(joint_names)}], got {count}."
+            )
+        try:
+            weight = float(raw_weights[group_name])
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "worst_joint_weight values must be finite scalars in [0, 1]."
+            ) from exc
+        if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+            raise ValueError(
+                f"worst_joint_weight for group {group_name!r} must be in [0, 1], got {weight}."
+            )
+        if weight > 0.0 and count == 0:
+            raise ValueError(
+                f"worst_joint_count for group {group_name!r} must be positive when "
+                "worst_joint_weight is positive."
+            )
+        counts[group_name] = count
+        weights[group_name] = weight
+
+    if group_aggregation not in ("arithmetic", "harmonic"):
+        raise ValueError(
+            "group_aggregation must be either 'arithmetic' or 'harmonic', "
+            f"got {group_aggregation!r}."
+        )
+    if exponent is None and any(counts.values()):
+        raise ValueError(
+            "An explicit score_exponent is required when worst_joint_count is non-zero."
+        )
+    return exponent, counts, weights
+
+
+def _inverse_power_score(error: torch.Tensor, std: float, exponent: float) -> torch.Tensor:
+    """Return ``(1 + (error / std)^2)^(-exponent)`` without exponential saturation."""
+
+    base = 1.0 + torch.square(error / std)
+    if exponent == 0.5:
+        return torch.rsqrt(base)
+    return torch.pow(base, -exponent)
+
+
+def _aggregate_terminal_group_scores(
+    group_scores: Mapping[str, torch.Tensor],
+    group_weights: Mapping[str, float],
+    group_aggregation: str,
+    worst_group_weight: float = 0.0,
+) -> torch.Tensor:
+    """Combine group scores while retaining an explicit worst-group signal.
+
+    ``worst_group_weight=0`` preserves the historical weighted aggregation.
+    A positive value blends in the lowest anatomical-group score regardless
+    of that group's normal averaging weight.  This prevents a single rotated
+    leg or folded arm from being diluted by four already-correct groups.
+    """
+
+    if isinstance(worst_group_weight, bool):
+        raise TypeError("worst_group_weight must be a finite scalar in [0, 1].")
+    try:
+        worst_weight = float(worst_group_weight)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("worst_group_weight must be a finite scalar in [0, 1].") from exc
+    if not math.isfinite(worst_weight) or not 0.0 <= worst_weight <= 1.0:
+        raise ValueError(
+            f"worst_group_weight must be finite and in [0, 1], got {worst_group_weight}."
+        )
+
+    group_names = tuple(group_scores)
+    active_group_names = tuple(
+        name for name in group_names if float(group_weights[name]) > 0.0
+    )
+    weight_sum = sum(float(group_weights[name]) for name in active_group_names)
+    if group_aggregation == "arithmetic":
+        weighted_score = sum(
+            (float(group_weights[name]) / weight_sum) * group_scores[name]
+            for name in active_group_names
+        )
+    else:
+        # Inverse-power scores are strictly positive for finite errors.  The
+        # tiny clamp only protects a numerical underflow/overflow edge and
+        # preserves an exact score of one when every group is perfect.
+        reference = group_scores[active_group_names[0]]
+        denominator = torch.zeros_like(reference)
+        tiny = torch.finfo(reference.dtype).tiny
+        for name in active_group_names:
+            weight = float(group_weights[name])
+            denominator += weight / group_scores[name].clamp_min(tiny)
+        weighted_score = weight_sum / denominator
+
+    if worst_weight == 0.0:
+        return weighted_score
+    worst_group_score = torch.stack(
+        [group_scores[name] for name in active_group_names], dim=1
+    ).amin(dim=1)
+    return (1.0 - worst_weight) * weighted_score + worst_weight * worst_group_score
+
+
+def _grouped_joint_score_details(
+    values: torch.Tensor,
+    target: torch.Tensor,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_ids: Mapping[str, torch.Tensor],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None,
+    worst_joint_count: int | Mapping[str, int],
+    worst_joint_weight: float | Mapping[str, float],
+    group_aggregation: str,
+    worst_group_weight: float = 0.0,
+) -> _GroupedJointScoreDetails:
+    """Score grouped joint errors with legacy or explicit heavy-tail semantics."""
+
+    exponent, worst_counts, worst_weights = _terminal_group_scoring_options(
+        joint_groups,
+        score_exponent,
+        worst_joint_count,
+        worst_joint_weight,
+        group_aggregation,
+    )
+    rms: dict[str, torch.Tensor] = {}
+    maximum: dict[str, torch.Tensor] = {}
+    mean_scores: dict[str, torch.Tensor] = {}
+    worst_scores: dict[str, torch.Tensor] = {}
+    group_scores: dict[str, torch.Tensor] = {}
+    for group_name, joint_ids in group_ids.items():
+        absolute_error = torch.abs(values[:, joint_ids] - target[:, joint_ids])
+        mean_squared_error = torch.mean(torch.square(absolute_error), dim=1)
+        rms[group_name] = torch.sqrt(mean_squared_error)
+        maximum[group_name] = torch.max(absolute_error, dim=1).values
+        std = float(group_stds[group_name])
+
+        if exponent is None:
+            # Exact pre-existing behavior for callers that omit every new
+            # scoring option: inverse quadratic of the group RMS.
+            legacy_score = torch.reciprocal(1.0 + mean_squared_error / std**2)
+            mean_scores[group_name] = legacy_score
+            worst_scores[group_name] = legacy_score
+            group_scores[group_name] = legacy_score
+            continue
+
+        joint_scores = _inverse_power_score(absolute_error, std, exponent)
+        mean_score = torch.mean(joint_scores, dim=1)
+        count = worst_counts[group_name]
+        worst_score = (
+            torch.topk(joint_scores, k=count, dim=1, largest=False).values.mean(dim=1)
+            if count > 0
+            else mean_score
+        )
+        worst_weight = worst_weights[group_name]
+        mean_scores[group_name] = mean_score
+        worst_scores[group_name] = worst_score
+        group_scores[group_name] = (1.0 - worst_weight) * mean_score + worst_weight * worst_score
+
+    aggregate = _aggregate_terminal_group_scores(
+        group_scores,
+        group_weights,
+        group_aggregation,
+        worst_group_weight,
+    )
+    return _GroupedJointScoreDetails(
+        aggregate, rms, maximum, mean_scores, worst_scores, group_scores
+    )
+
+
+def _grouped_expert_joint_pose_score_details(
     command: MotionCommand,
     joint_groups: Mapping[str, Sequence[str]],
     group_stds: Mapping[str, float],
     group_weights: Mapping[str, float],
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Return a robust weighted expert-pose score and group diagnostics.
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> _GroupedJointScoreDetails:
+    """Return complete grouped expert-pose score diagnostics.
 
-    The inverse-quadratic score has the same local quadratic behavior as the
-    former Gaussian around the expert pose, but its polynomial tail preserves
-    a useful improvement signal when a resumed policy starts with a grossly
-    displaced arm.  This avoids freezing a far-away pose merely because its
-    exponential score has already underflowed to an effectively flat value.
+    Omitting ``score_exponent`` preserves the historical inverse quadratic of
+    each group's RMS error.  Supplying an exponent scores every joint first;
+    ``0.5`` selects the intended inverse-square-root heavy tail.  The optional
+    worst-k blend exposes isolated shoulder, wrist, hip, or ankle failures
+    that a plain group mean could otherwise dilute.
     """
 
     group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
@@ -1564,31 +1816,62 @@ def _grouped_expert_joint_pose_score(
             f"got {target_shape} and {robot_joint_pos.shape}."
         )
 
-    weighted_score = torch.zeros(
-        robot_joint_pos.shape[0], dtype=robot_joint_pos.dtype, device=robot_joint_pos.device
+    return _grouped_joint_score_details(
+        robot_joint_pos,
+        target_joint_pos,
+        joint_groups,
+        group_ids,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
     )
-    weight_sum = sum(float(group_weights[name]) for name in joint_groups)
-    group_rms: dict[str, torch.Tensor] = {}
-    group_max: dict[str, torch.Tensor] = {}
-    for group_name, joint_ids in group_ids.items():
-        error = robot_joint_pos[:, joint_ids] - target_joint_pos[:, joint_ids]
-        mean_squared_error = torch.mean(torch.square(error), dim=1)
-        group_rms[group_name] = torch.sqrt(mean_squared_error)
-        group_max[group_name] = torch.max(torch.abs(error), dim=1).values
-        score = torch.reciprocal(
-            1.0 + mean_squared_error / float(group_stds[group_name]) ** 2
-        )
-        weighted_score += (float(group_weights[group_name]) / weight_sum) * score
-    return weighted_score, group_rms, group_max
 
 
-def _grouped_actual_joint_speed_score(
+def _grouped_expert_joint_pose_score(
     command: MotionCommand,
     joint_groups: Mapping[str, Sequence[str]],
     group_stds: Mapping[str, float],
     group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Return a robust grouped score for the robot's measured joint speeds."""
+    """Return a grouped expert-pose score with its legacy RMS/max diagnostics."""
+
+    details = _grouped_expert_joint_pose_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
+    )
+    return details.aggregate, details.rms, details.maximum
+
+
+def _grouped_actual_joint_speed_score_details(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> _GroupedJointScoreDetails:
+    """Return complete grouped score diagnostics for measured joint speeds."""
 
     group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
     robot_joint_vel = command.robot_joint_vel
@@ -1598,22 +1881,47 @@ def _grouped_actual_joint_speed_score(
             f"got {command.robot_joint_pos.shape} and {robot_joint_vel.shape}."
         )
 
-    weighted_score = torch.zeros(
-        robot_joint_vel.shape[0], dtype=robot_joint_vel.dtype, device=robot_joint_vel.device
+    return _grouped_joint_score_details(
+        robot_joint_vel,
+        torch.zeros_like(robot_joint_vel),
+        joint_groups,
+        group_ids,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
     )
-    weight_sum = sum(float(group_weights[name]) for name in joint_groups)
-    group_rms: dict[str, torch.Tensor] = {}
-    group_max: dict[str, torch.Tensor] = {}
-    for group_name, joint_ids in group_ids.items():
-        group_velocity = robot_joint_vel[:, joint_ids]
-        mean_squared_speed = torch.mean(torch.square(group_velocity), dim=1)
-        group_rms[group_name] = torch.sqrt(mean_squared_speed)
-        group_max[group_name] = torch.max(torch.abs(group_velocity), dim=1).values
-        score = torch.reciprocal(
-            1.0 + mean_squared_speed / float(group_stds[group_name]) ** 2
-        )
-        weighted_score += (float(group_weights[group_name]) / weight_sum) * score
-    return weighted_score, group_rms, group_max
+
+
+def _grouped_actual_joint_speed_score(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Return a grouped measured-speed score with legacy RMS/max diagnostics."""
+
+    details = _grouped_actual_joint_speed_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
+    )
+    return details.aggregate, details.rms, details.maximum
 
 
 def _terminal_platform_alignment_gate(command: MotionCommand) -> torch.Tensor:
@@ -1897,7 +2205,14 @@ def _terminal_expert_support_gate(
         min_total_load_fraction=min_total_load_fraction,
     ).clamp(min=0.0, max=1.0)
     strict_support = two_foot_support * foot_load_score
-    soft_support = support_floor + (1.0 - support_floor) * strict_support
+    # With a full floor the expert correction is intentionally independent of
+    # support.  Return an exact constant instead of evaluating ``0 * score``:
+    # IEEE arithmetic would otherwise propagate a diagnostic NaN into a reward
+    # that is configured not to depend on that diagnostic at all.
+    if support_floor == 1.0:
+        soft_support = torch.ones_like(strict_support)
+    else:
+        soft_support = support_floor + (1.0 - support_floor) * strict_support
     return soft_support, strict_support
 
 
@@ -1907,18 +2222,33 @@ def _record_final_tail_group_metrics(
     *,
     strict_support: torch.Tensor | None = None,
     torso_orientation_error: torch.Tensor | None = None,
+    torso_linear_velocity_error: torch.Tensor | None = None,
+    torso_angular_velocity_error: torch.Tensor | None = None,
     torso_angular_speed: torch.Tensor | None = None,
+    root_orientation_score: torch.Tensor | None = None,
+    root_linear_velocity_score: torch.Tensor | None = None,
+    root_angular_velocity_score: torch.Tensor | None = None,
+    pose_quality: torch.Tensor | None = None,
+    speed_quality: torch.Tensor | None = None,
+    speed_pose_quality: torch.Tensor | None = None,
+    speed_pose_modulation: torch.Tensor | None = None,
     pose_rms: Mapping[str, torch.Tensor] | None = None,
     pose_max: Mapping[str, torch.Tensor] | None = None,
+    pose_mean_score: Mapping[str, torch.Tensor] | None = None,
+    pose_worst_score: Mapping[str, torch.Tensor] | None = None,
+    pose_group_score: Mapping[str, torch.Tensor] | None = None,
     speed_rms: Mapping[str, torch.Tensor] | None = None,
     speed_max: Mapping[str, torch.Tensor] | None = None,
+    speed_mean_score: Mapping[str, torch.Tensor] | None = None,
+    speed_worst_score: Mapping[str, torch.Tensor] | None = None,
+    speed_group_score: Mapping[str, torch.Tensor] | None = None,
 ) -> None:
     """Publish read-only final-tail diagnostics when a command owns metrics."""
 
     metrics = getattr(command, "metrics", None)
     if metrics is None:
         return
-    active = (static_tail > 0.0).to(dtype=command.robot_joint_pos.dtype)
+    active = (static_tail > 0.0).to(dtype=static_tail.dtype)
 
     def record(name: str, value: torch.Tensor) -> None:
         metric = metrics.setdefault(name, torch.zeros_like(value))
@@ -1932,20 +2262,56 @@ def _record_final_tail_group_metrics(
         record("final_tail_strict_support", strict_support)
     if torso_orientation_error is not None:
         record("final_tail_torso_orientation_error", torso_orientation_error)
+    if torso_linear_velocity_error is not None:
+        record("final_tail_torso_linear_velocity_error", torso_linear_velocity_error)
+    if torso_angular_velocity_error is not None:
+        record("final_tail_torso_angular_velocity_error", torso_angular_velocity_error)
     if torso_angular_speed is not None:
         record("final_tail_torso_angular_speed", torso_angular_speed)
+    if root_orientation_score is not None:
+        record("final_tail_root_orientation_score", root_orientation_score)
+    if root_linear_velocity_score is not None:
+        record("final_tail_root_linear_velocity_score", root_linear_velocity_score)
+    if root_angular_velocity_score is not None:
+        record("final_tail_root_angular_velocity_score", root_angular_velocity_score)
+    if pose_quality is not None:
+        record("final_tail_pose_quality", pose_quality)
+    if speed_quality is not None:
+        record("final_tail_speed_quality", speed_quality)
+    if speed_pose_quality is not None:
+        record("final_tail_speed_pose_quality", speed_pose_quality)
+    if speed_pose_modulation is not None:
+        record("final_tail_speed_pose_modulation", speed_pose_modulation)
     if pose_rms is not None:
         for group_name, value in pose_rms.items():
             record(f"final_tail_{group_name}_pose_rms", value)
     if pose_max is not None:
         for group_name, value in pose_max.items():
             record(f"final_tail_{group_name}_max_pose_error", value)
+    if pose_mean_score is not None:
+        for group_name, value in pose_mean_score.items():
+            record(f"final_tail_{group_name}_pose_mean_score", value)
+    if pose_worst_score is not None:
+        for group_name, value in pose_worst_score.items():
+            record(f"final_tail_{group_name}_pose_worst_score", value)
+    if pose_group_score is not None:
+        for group_name, value in pose_group_score.items():
+            record(f"final_tail_{group_name}_pose_group_score", value)
     if speed_rms is not None:
         for group_name, value in speed_rms.items():
             record(f"final_tail_{group_name}_joint_speed_rms", value)
     if speed_max is not None:
         for group_name, value in speed_max.items():
             record(f"final_tail_{group_name}_max_joint_speed", value)
+    if speed_mean_score is not None:
+        for group_name, value in speed_mean_score.items():
+            record(f"final_tail_{group_name}_speed_mean_score", value)
+    if speed_worst_score is not None:
+        for group_name, value in speed_worst_score.items():
+            record(f"final_tail_{group_name}_speed_worst_score", value)
+    if speed_group_score is not None:
+        for group_name, value in speed_group_score.items():
+            record(f"final_tail_{group_name}_speed_group_score", value)
 
 
 def final_grouped_expert_joint_position_error_exp(
@@ -1968,6 +2334,11 @@ def final_grouped_expert_joint_position_error_exp(
     support_floor: float,
     platform_support_params: Mapping[str, object] | None = None,
     min_total_load_fraction: float = 0.0,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
 ) -> torch.Tensor:
     """Track expert terminal posture by group during the authored static tail.
 
@@ -1978,9 +2349,18 @@ def final_grouped_expert_joint_position_error_exp(
     """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    pose_score, pose_rms, pose_max = _grouped_expert_joint_pose_score(
-        command, joint_groups, group_stds, group_weights
+    pose_details = _grouped_expert_joint_pose_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
     )
+    pose_score = pose_details.aggregate
     soft_support, strict_support = _terminal_expert_support_gate(
         env,
         command,
@@ -2013,8 +2393,12 @@ def final_grouped_expert_joint_position_error_exp(
         strict_support=strict_support,
         torso_orientation_error=torso_orientation_error,
         torso_angular_speed=torso_angular_speed,
-        pose_rms=pose_rms,
-        pose_max=pose_max,
+        pose_quality=pose_score,
+        pose_rms=pose_details.rms,
+        pose_max=pose_details.maximum,
+        pose_mean_score=pose_details.mean_score,
+        pose_worst_score=pose_details.worst_score,
+        pose_group_score=pose_details.group_score,
     )
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=pose_score.dtype)
     return alignment_complete * static_tail * soft_support * pose_score
@@ -2040,13 +2424,65 @@ def final_grouped_actual_joint_velocity_exp(
     support_floor: float,
     platform_support_params: Mapping[str, object] | None = None,
     min_total_load_fraction: float = 0.0,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+    pose_quality_floor: float | None = None,
+    pose_quality_group_stds: Mapping[str, float] | None = None,
+    pose_quality_group_weights: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
-    """Settle measured grouped joint velocities in the expert static tail."""
+    """Settle measured joint velocities, optionally conditioned on expert-pose quality.
+
+    ``pose_quality_floor=None`` is the backward-compatible unmodulated mode.
+    An explicit floor in ``[0, 1]`` multiplies the speed score by
+    ``floor + (1 - floor) * pose_quality``.  Pose tracking itself remains
+    unconditional, so a policy cannot avoid it by continuing to move.
+    """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    velocity_score, speed_rms, speed_max = _grouped_actual_joint_speed_score(
-        command, joint_groups, group_stds, group_weights
+    velocity_details = _grouped_actual_joint_speed_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
     )
+    velocity_score = velocity_details.aggregate
+    pose_quality: torch.Tensor | None = None
+    if pose_quality_floor is None:
+        pose_modulation = torch.ones_like(velocity_score)
+    else:
+        try:
+            floor = float(pose_quality_floor)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("pose_quality_floor must be a finite scalar in [0, 1] or None.") from exc
+        if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+            raise ValueError(
+                f"pose_quality_floor must be finite and in [0, 1], got {pose_quality_floor}."
+            )
+        if pose_quality_group_stds is None:
+            raise ValueError(
+                "pose_quality_group_stds is required when pose_quality_floor is enabled."
+            )
+        pose_details = _grouped_expert_joint_pose_score_details(
+            command,
+            joint_groups,
+            pose_quality_group_stds,
+            pose_quality_group_weights if pose_quality_group_weights is not None else group_weights,
+            score_exponent=score_exponent,
+            worst_joint_count=worst_joint_count,
+            worst_joint_weight=worst_joint_weight,
+            group_aggregation=group_aggregation,
+            worst_group_weight=worst_group_weight,
+        )
+        pose_quality = pose_details.aggregate
+        pose_modulation = floor + (1.0 - floor) * pose_quality
     soft_support, strict_support = _terminal_expert_support_gate(
         env,
         command,
@@ -2073,11 +2509,189 @@ def final_grouped_actual_joint_velocity_exp(
         command,
         static_tail,
         strict_support=strict_support,
-        speed_rms=speed_rms,
-        speed_max=speed_max,
+        speed_quality=velocity_score,
+        speed_pose_quality=pose_quality,
+        speed_pose_modulation=pose_modulation,
+        speed_rms=velocity_details.rms,
+        speed_max=velocity_details.maximum,
+        speed_mean_score=velocity_details.mean_score,
+        speed_worst_score=velocity_details.worst_score,
+        speed_group_score=velocity_details.group_score,
     )
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=velocity_score.dtype)
-    return alignment_complete * static_tail * soft_support * velocity_score
+    return alignment_complete * static_tail * soft_support * pose_modulation * velocity_score
+
+
+def _validate_terminal_root_tensor_pair(
+    command: MotionCommand,
+    reference_name: str,
+    robot_name: str,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a shape-checked expert/robot root tensor pair."""
+
+    reference = getattr(command, reference_name, None)
+    robot = getattr(command, robot_name, None)
+    if not isinstance(reference, torch.Tensor) or not isinstance(robot, torch.Tensor):
+        raise RuntimeError(
+            f"Terminal expert root reward requires tensor attributes {reference_name!r} "
+            f"and {robot_name!r}."
+        )
+    expected_shape = (command.time_steps.shape[0], width)
+    if reference.shape != expected_shape or robot.shape != expected_shape:
+        raise RuntimeError(
+            f"Terminal expert root tensors {reference_name!r} and {robot_name!r} must both "
+            f"have shape {expected_shape}, got {reference.shape} and {robot.shape}."
+        )
+    if reference.device != robot.device:
+        raise RuntimeError(
+            f"Terminal expert root tensors {reference_name!r} and {robot_name!r} must share "
+            f"a device, got {reference.device} and {robot.device}."
+        )
+    if not reference.is_floating_point() or not robot.is_floating_point():
+        raise TypeError(
+            f"Terminal expert root tensors {reference_name!r} and {robot_name!r} must be floating point."
+        )
+    if reference.dtype != robot.dtype:
+        raise RuntimeError(
+            f"Terminal expert root tensors {reference_name!r} and {robot_name!r} must share "
+            f"a dtype, got {reference.dtype} and {robot.dtype}."
+        )
+    return reference, robot
+
+
+def _validate_terminal_root_score_parameters(std: float, score_exponent: float) -> tuple[float, float]:
+    """Validate scale and inverse-power exponent shared by terminal root terms."""
+
+    if isinstance(std, bool):
+        raise TypeError("std must be a positive finite scalar.")
+    try:
+        scale = float(std)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("std must be a positive finite scalar.") from exc
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"std must be positive and finite, got {std}.")
+    exponent = _validate_score_exponent(score_exponent)
+    if exponent is None:
+        raise ValueError("score_exponent cannot be None for terminal root rewards.")
+    return scale, exponent
+
+
+def final_expert_root_orientation_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    std: float,
+    ramp_time_s: float | None = None,
+    score_exponent: float = 0.5,
+) -> torch.Tensor:
+    """Track expert root orientation only during the authored stationary tail.
+
+    The historical ``_exp`` suffix follows the module's reward naming
+    convention; the implemented score is the configurable heavy-tailed
+    ``(1 + (error / std)^2)^(-score_exponent)``.  The gate depends solely on
+    reference phase and reference joint speed—never on robot pose, velocity,
+    contact, or support—so the policy cannot turn this correction off by
+    remaining in a bad state.
+    """
+
+    scale, exponent = _validate_terminal_root_score_parameters(std, score_exponent)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reference, robot = _validate_terminal_root_tensor_pair(
+        command, "anchor_quat_w", "robot_anchor_quat_w", 4
+    )
+    error = quat_error_magnitude(reference, robot)
+    if error.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "quat_error_magnitude must return one value per environment, "
+            f"got {error.shape} and expected {command.time_steps.shape}."
+        )
+    score = _inverse_power_score(error, scale, exponent)
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    _record_final_tail_group_metrics(
+        command,
+        static_tail,
+        torso_orientation_error=error,
+        root_orientation_score=score,
+    )
+    return static_tail * score
+
+
+def final_expert_root_linear_velocity_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    std: float,
+    ramp_time_s: float | None = None,
+    score_exponent: float = 0.5,
+) -> torch.Tensor:
+    """Track expert root linear velocity during the reference-static tail."""
+
+    scale, exponent = _validate_terminal_root_score_parameters(std, score_exponent)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reference, robot = _validate_terminal_root_tensor_pair(
+        command, "anchor_lin_vel_w", "robot_anchor_lin_vel_w", 3
+    )
+    error = torch.linalg.vector_norm(reference - robot, dim=1)
+    score = _inverse_power_score(error, scale, exponent)
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    _record_final_tail_group_metrics(
+        command,
+        static_tail,
+        torso_linear_velocity_error=error,
+        root_linear_velocity_score=score,
+    )
+    return static_tail * score
+
+
+def final_expert_root_angular_velocity_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    std: float,
+    ramp_time_s: float | None = None,
+    score_exponent: float = 0.5,
+) -> torch.Tensor:
+    """Track expert root angular velocity during the reference-static tail."""
+
+    scale, exponent = _validate_terminal_root_score_parameters(std, score_exponent)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reference, robot = _validate_terminal_root_tensor_pair(
+        command, "anchor_ang_vel_w", "robot_anchor_ang_vel_w", 3
+    )
+    error = torch.linalg.vector_norm(reference - robot, dim=1)
+    robot_speed = torch.linalg.vector_norm(robot, dim=1)
+    score = _inverse_power_score(error, scale, exponent)
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    _record_final_tail_group_metrics(
+        command,
+        static_tail,
+        torso_angular_velocity_error=error,
+        torso_angular_speed=robot_speed,
+        root_angular_velocity_score=score,
+    )
+    return static_tail * score
 
 
 def final_expert_joint_position_error_exp(

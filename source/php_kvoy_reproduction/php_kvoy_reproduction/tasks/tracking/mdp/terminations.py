@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import isaaclab.utils.math as math_utils
+from isaaclab.utils.math import quat_error_magnitude
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -349,14 +350,114 @@ def _terminal_platform_alignment_complete(command: MotionCommand) -> torch.Tenso
     return completed.to(dtype=torch.bool)
 
 
-class motion_end_success(ManagerTermBase):
-    """Classify a clip as successful only after a continuous stable final stand.
+def _episode_started_at_motion_beginning(command: MotionCommand) -> torch.Tensor:
+    """Return which episodes contain the complete authored motion.
 
-    Success requires real bilateral platform load, quiet motion and a broad
-    all-joint RMS bound around the immutable final expert pose.  The bound does
-    not require exact imitation; it rejects only terminal configurations such
-    as crossed legs or strongly folded/raised arms that otherwise satisfy the
-    pose-independent stability checks.
+    Random-phase episodes remain useful for local policy learning, but a clip
+    that starts inside the terminal window may not have enough elapsed time to
+    satisfy the contact and contiguous-stability durations.  Such a partial
+    trial must therefore be neither a terminal-quality success nor a
+    terminal-quality failure; the generic clip-boundary timeout still ends it.
+    """
+
+    started = getattr(command, "episode_started_at_motion_beginning", None)
+    if not isinstance(started, torch.Tensor):
+        raise RuntimeError(
+            "Terminal quality classification requires "
+            "MotionCommand.episode_started_at_motion_beginning to be a tensor."
+        )
+    if started.shape != command.time_steps.shape:
+        raise RuntimeError(
+            "episode_started_at_motion_beginning must match command time_steps, "
+            f"got {started.shape} and {command.time_steps.shape}."
+        )
+    if started.device != command.time_steps.device:
+        raise RuntimeError(
+            "episode_started_at_motion_beginning and command time_steps must share a device, "
+            f"got {started.device} and {command.time_steps.device}."
+        )
+    return started.to(dtype=torch.bool)
+
+
+def _resolve_terminal_quality_joint_groups(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_pose_rms_thresholds: Mapping[str, float],
+    group_pose_max_thresholds: Mapping[str, float],
+    group_velocity_rms_thresholds: Mapping[str, float],
+) -> dict[str, torch.Tensor]:
+    """Validate and resolve a complete, disjoint terminal joint partition."""
+
+    if not isinstance(joint_groups, Mapping) or not joint_groups:
+        raise ValueError("joint_groups must be a non-empty mapping of group names to joint names.")
+    group_names = tuple(joint_groups)
+    threshold_mappings = (
+        ("group_pose_rms_thresholds", group_pose_rms_thresholds),
+        ("group_pose_max_thresholds", group_pose_max_thresholds),
+        ("group_velocity_rms_thresholds", group_velocity_rms_thresholds),
+    )
+    for mapping_name, thresholds in threshold_mappings:
+        if not isinstance(thresholds, Mapping) or set(thresholds) != set(group_names):
+            raise ValueError(f"{mapping_name} keys must exactly match joint_groups keys.")
+        invalid = {
+            name: thresholds[name]
+            for name in group_names
+            if not math.isfinite(float(thresholds[name])) or float(thresholds[name]) <= 0.0
+        }
+        if invalid:
+            raise ValueError(f"Every {mapping_name} value must be positive; got {invalid}.")
+
+    robot_joint_names = tuple(command.robot.joint_names)
+    name_to_id = {name: joint_id for joint_id, name in enumerate(robot_joint_names)}
+    if len(name_to_id) != len(robot_joint_names):
+        raise RuntimeError("Robot joint names must be unique for terminal quality checks.")
+
+    resolved: dict[str, torch.Tensor] = {}
+    assigned_names: set[str] = set()
+    for group_name, names_value in joint_groups.items():
+        if isinstance(names_value, (str, bytes)):
+            raise ValueError(
+                f"Terminal joint group {group_name!r} must be a sequence of joint names, not a string."
+            )
+        names = tuple(names_value)
+        if not names:
+            raise ValueError(f"Terminal joint group {group_name!r} must not be empty.")
+        local_duplicates = sorted({name for name in names if names.count(name) > 1})
+        if local_duplicates:
+            raise ValueError(
+                f"Terminal joint group {group_name!r} contains repeated joints: {local_duplicates}."
+            )
+        repeated = sorted(assigned_names.intersection(names))
+        if repeated:
+            raise ValueError(f"Terminal joint groups must be disjoint; repeated joints: {repeated}.")
+        unknown = [name for name in names if name not in name_to_id]
+        if unknown:
+            raise RuntimeError(
+                f"Terminal joint group {group_name!r} contains unknown robot joints: {unknown}."
+            )
+        assigned_names.update(names)
+        resolved[group_name] = torch.tensor(
+            [name_to_id[name] for name in names],
+            dtype=torch.long,
+            device=command.robot_joint_vel.device,
+        )
+
+    missing = sorted(set(robot_joint_names).difference(assigned_names))
+    if missing:
+        raise ValueError(
+            "joint_groups must cover every robot joint exactly once; "
+            f"unassigned joints: {missing}."
+        )
+    return resolved
+
+
+class motion_end_success(ManagerTermBase):
+    """Classify a clip only after a contiguous, high-quality expert tail.
+
+    No post-clip hold is required.  Quality samples accumulate inside the
+    authored static tail, while the episode still ends immediately at the
+    source boundary.  A bad sample clears the counter, so a robot that was
+    briefly stable and then departs from the expert pose cannot be accepted.
     """
 
     _METRIC_PREFIX = "final_standing_"
@@ -369,19 +470,77 @@ class motion_end_success(ManagerTermBase):
 
     def __init__(self, cfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
+        required_params = (
+            "command_name",
+            "contact_sensor_cfg",
+            "min_stable_time",
+            "static_window_time_s",
+            "reference_max_joint_speed",
+            "joint_groups",
+            "group_pose_rms_thresholds",
+            "group_pose_max_thresholds",
+            "group_velocity_rms_thresholds",
+            "max_torso_orientation_error",
+        )
+        missing_params = [name for name in required_params if name not in cfg.params]
+        if missing_params:
+            raise ValueError(
+                "motion_end_success is missing required quality parameters: "
+                f"{missing_params}."
+            )
+        if env.step_dt <= 0.0:
+            raise ValueError(f"env.step_dt must be positive, got {env.step_dt}.")
+        min_stable_time = float(cfg.params["min_stable_time"])
+        static_window_time_s = float(cfg.params["static_window_time_s"])
+        reference_max_joint_speed = float(cfg.params["reference_max_joint_speed"])
+        max_torso_orientation_error = float(cfg.params["max_torso_orientation_error"])
+        if not math.isfinite(min_stable_time) or min_stable_time <= 0.0:
+            raise ValueError(f"min_stable_time must be positive, got {min_stable_time}.")
+        if not math.isfinite(static_window_time_s) or static_window_time_s <= 0.0:
+            raise ValueError(f"static_window_time_s must be positive, got {static_window_time_s}.")
+        if not math.isfinite(reference_max_joint_speed) or reference_max_joint_speed < 0.0:
+            raise ValueError(
+                "reference_max_joint_speed must be non-negative, "
+                f"got {reference_max_joint_speed}."
+            )
+        if not math.isfinite(max_torso_orientation_error) or not 0.0 <= max_torso_orientation_error <= math.pi:
+            raise ValueError(
+                "max_torso_orientation_error must lie in [0, pi], "
+                f"got {max_torso_orientation_error}."
+            )
+
         self._stable_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self._longest_stable_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-        self._required_stable_steps = max(1, math.ceil(float(cfg.params["min_stable_time"]) / env.step_dt - 1.0e-9))
+        self._required_stable_steps = max(1, math.ceil(min_stable_time / env.step_dt - 1.0e-9))
+        self._static_window_steps = max(1, math.ceil(static_window_time_s / env.step_dt - 1.0e-9))
+        if self._required_stable_steps > self._static_window_steps:
+            raise ValueError(
+                "min_stable_time cannot exceed the available static_window_time_s when "
+                "motion_end_hold_time_s is zero; "
+                f"got {min_stable_time} s and {static_window_time_s} s."
+            )
 
         command: MotionCommand = env.command_manager.get_term(cfg.params["command_name"])
-        self._expert_joint_pos_gate_enabled = cfg.params.get("max_expert_joint_pos_rms") is not None
-        if self._expert_joint_pos_gate_enabled and getattr(command.cfg, "terminal_default_pose_enabled", False):
+        motion_end_hold_time_s = getattr(command.cfg, "motion_end_hold_time_s", None)
+        if motion_end_hold_time_s is not None and float(motion_end_hold_time_s) != 0.0:
             raise ValueError(
-                "motion_end_success cannot combine max_expert_joint_pos_rms with "
-                "terminal_default_pose_enabled: terminal default-q handoff replaces the source expert q, "
-                "so a final source-q RMS success gate would be contradictory. Disable one of these options."
+                "Tail-window motion_end_success requires motion_end_hold_time_s=0; "
+                f"got {motion_end_hold_time_s}."
             )
-        self._joint_group_ids = {
+        if getattr(command.cfg, "terminal_default_pose_enabled", False):
+            raise ValueError(
+                "Tail-window motion_end_success tracks the immutable source expert pose and cannot "
+                "be combined with terminal_default_pose_enabled."
+            )
+        self._expert_joint_pos_gate_enabled = cfg.params.get("max_expert_joint_pos_rms") is not None
+        self._quality_joint_group_ids = _resolve_terminal_quality_joint_groups(
+            command,
+            cfg.params["joint_groups"],
+            cfg.params["group_pose_rms_thresholds"],
+            cfg.params["group_pose_max_thresholds"],
+            cfg.params["group_velocity_rms_thresholds"],
+        )
+        self._diagnostic_joint_group_ids = {
             group_name: torch.tensor(
                 [
                     joint_id
@@ -393,7 +552,7 @@ class motion_end_success(ManagerTermBase):
             )
             for group_name, name_tokens in self._JOINT_GROUP_TOKENS.items()
         }
-        empty_groups = [name for name, ids in self._joint_group_ids.items() if ids.numel() == 0]
+        empty_groups = [name for name, ids in self._diagnostic_joint_group_ids.items() if ids.numel() == 0]
         if empty_groups:
             raise RuntimeError(f"No robot joints found for diagnostic groups: {empty_groups}.")
 
@@ -421,6 +580,8 @@ class motion_end_success(ManagerTermBase):
             "default_joint_pos_valid",
             "terminal_alignment_complete",
             "terminal_default_pose_complete",
+            "static_tail",
+            "reference_static",
             "final_frame_fraction",
             "max_joint_speed",
             "joint_speed_rms",
@@ -428,7 +589,10 @@ class motion_end_success(ManagerTermBase):
             "joints_over_0_75",
             "joints_over_1_0",
             "joints_over_2_0",
+            "root_linear_speed",
             "root_angular_speed",
+            "torso_orientation_valid",
+            "torso_orientation_error",
             "arm_max_joint_speed",
             "waist_max_joint_speed",
             "leg_max_joint_speed",
@@ -443,6 +607,15 @@ class motion_end_success(ManagerTermBase):
         )
         if self._expert_joint_pos_gate_enabled:
             metric_names += ("expert_joint_pos_valid", "expert_joint_pos_rms")
+        for group_name in self._quality_joint_group_ids:
+            metric_names += (
+                f"{group_name}_pose_rms_valid",
+                f"{group_name}_pose_max_valid",
+                f"{group_name}_velocity_rms_valid",
+                f"{group_name}_pose_rms",
+                f"{group_name}_max_pose_error",
+                f"{group_name}_joint_speed_rms",
+            )
         for name in metric_names:
             command.metrics.setdefault(self._METRIC_PREFIX + name, torch.zeros(env.num_envs, device=env.device))
 
@@ -470,14 +643,44 @@ class motion_end_success(ManagerTermBase):
         max_joint_speed: float,
         max_torso_tilt: float,
         min_stable_time: float,
+        static_window_time_s: float,
+        reference_max_joint_speed: float,
+        joint_groups: Mapping[str, Sequence[str]],
+        group_pose_rms_thresholds: Mapping[str, float],
+        group_pose_max_thresholds: Mapping[str, float],
+        group_velocity_rms_thresholds: Mapping[str, float],
+        max_torso_orientation_error: float,
         platform_support_params: Mapping[str, object] | None = None,
         sole_height_tolerance: float | None = None,
         min_total_load_fraction: float = 0.0,
         max_default_joint_pos_rms: float | None = None,
         max_expert_joint_pos_rms: float | None = None,
     ) -> torch.Tensor:
-        if min_stable_time <= 0.0:
+        if not math.isfinite(min_stable_time) or min_stable_time <= 0.0:
             raise ValueError(f"min_stable_time must be positive, got {min_stable_time}.")
+        if not math.isfinite(static_window_time_s) or static_window_time_s <= 0.0:
+            raise ValueError(f"static_window_time_s must be positive, got {static_window_time_s}.")
+        if not math.isfinite(reference_max_joint_speed) or reference_max_joint_speed < 0.0:
+            raise ValueError(
+                "reference_max_joint_speed must be non-negative, "
+                f"got {reference_max_joint_speed}."
+            )
+        if not math.isfinite(max_torso_orientation_error) or not 0.0 <= max_torso_orientation_error <= math.pi:
+            raise ValueError(
+                "max_torso_orientation_error must lie in [0, pi], "
+                f"got {max_torso_orientation_error}."
+            )
+        runtime_required_steps = max(1, math.ceil(min_stable_time / env.step_dt - 1.0e-9))
+        runtime_window_steps = max(1, math.ceil(static_window_time_s / env.step_dt - 1.0e-9))
+        if runtime_required_steps != self._required_stable_steps or runtime_window_steps != self._static_window_steps:
+            raise ValueError(
+                "motion_end_success duration parameters changed after construction; "
+                "recreate the environment after changing min_stable_time or static_window_time_s."
+            )
+        if tuple(joint_groups) != tuple(self._quality_joint_group_ids):
+            raise ValueError(
+                "motion_end_success joint_groups changed after construction; recreate the environment."
+            )
 
         command: MotionCommand = env.command_manager.get_term(command_name)
         if not command.cfg.terminate_on_motion_end:
@@ -508,24 +711,91 @@ class motion_end_success(ManagerTermBase):
         expert_joint_pos_rms = (
             _expert_joint_position_rms(command) if self._expert_joint_pos_gate_enabled else None
         )
+
+        robot_joint_pos = command.robot_joint_pos
+        robot_joint_vel = command.robot_joint_vel
+        source_joint_pos = getattr(command, "source_joint_pos", None)
+        if source_joint_pos is None:
+            raise RuntimeError("motion_end_success requires the immutable source_joint_pos tensor.")
+        if source_joint_pos.shape != robot_joint_pos.shape or robot_joint_vel.shape != robot_joint_pos.shape:
+            raise RuntimeError(
+                "Source position, robot position, and robot velocity tensors must have the same shape, "
+                f"got {source_joint_pos.shape}, {robot_joint_pos.shape}, and {robot_joint_vel.shape}."
+            )
+        if hasattr(command.motion, "joint_vel"):
+            source_joint_vel = command.motion.joint_vel[command.time_steps]
+        else:
+            source_joint_vel = command.joint_vel
+        if source_joint_vel.shape != robot_joint_vel.shape:
+            raise RuntimeError(
+                "Source and robot joint-velocity tensors must have the same shape, "
+                f"got {source_joint_vel.shape} and {robot_joint_vel.shape}."
+            )
+
         final_frames = command.motion.motion_end_idx[command.motion_ids] - 1
+        static_window_start = final_frames - (self._static_window_steps - 1)
+        in_static_tail = (command.time_steps >= static_window_start) & (command.time_steps <= final_frames)
         at_final_frame = command.time_steps >= final_frames
         alignment_complete = _terminal_platform_alignment_complete(command)
         terminal_default_pose_complete = _terminal_default_pose_complete(command)
-        # The q target intentionally moves during the default-pose transition;
-        # its samples cannot count toward the required quiet final stand.
-        eligible_final_frame = at_final_frame & alignment_complete & terminal_default_pose_complete
+        tail_observation = in_static_tail & alignment_complete & terminal_default_pose_complete
+        reference_speed = torch.max(torch.abs(source_joint_vel), dim=1).values
+        reference_static = reference_speed <= reference_max_joint_speed
+
+        joint_position_error = robot_joint_pos - source_joint_pos
+        group_pose_rms: dict[str, torch.Tensor] = {}
+        group_pose_max: dict[str, torch.Tensor] = {}
+        group_velocity_rms: dict[str, torch.Tensor] = {}
+        group_pose_rms_valid: dict[str, torch.Tensor] = {}
+        group_pose_max_valid: dict[str, torch.Tensor] = {}
+        group_velocity_rms_valid: dict[str, torch.Tensor] = {}
+        grouped_quality_valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        for group_name, joint_ids in self._quality_joint_group_ids.items():
+            group_error = joint_position_error[:, joint_ids]
+            group_velocity = robot_joint_vel[:, joint_ids]
+            pose_rms = torch.sqrt(torch.mean(torch.square(group_error), dim=1))
+            pose_max = torch.max(torch.abs(group_error), dim=1).values
+            velocity_rms = torch.sqrt(torch.mean(torch.square(group_velocity), dim=1))
+            pose_rms_valid = pose_rms <= float(group_pose_rms_thresholds[group_name])
+            pose_max_valid = pose_max <= float(group_pose_max_thresholds[group_name])
+            velocity_rms_valid = velocity_rms <= float(group_velocity_rms_thresholds[group_name])
+            group_pose_rms[group_name] = pose_rms
+            group_pose_max[group_name] = pose_max
+            group_velocity_rms[group_name] = velocity_rms
+            group_pose_rms_valid[group_name] = pose_rms_valid
+            group_pose_max_valid[group_name] = pose_max_valid
+            group_velocity_rms_valid[group_name] = velocity_rms_valid
+            grouped_quality_valid &= pose_rms_valid & pose_max_valid & velocity_rms_valid
+
+        absolute_joint_speed = torch.abs(robot_joint_vel)
+        max_joint_speed_value = torch.max(absolute_joint_speed, dim=1).values
+        joint_speed_rms = torch.sqrt(torch.mean(torch.square(robot_joint_vel), dim=1))
+        global_joint_speed_valid = max_joint_speed_value <= max_joint_speed
+        root_linear_speed = torch.linalg.vector_norm(command.robot_anchor_lin_vel_w, dim=1)
+        root_angular_speed = torch.linalg.vector_norm(command.robot_anchor_ang_vel_w, dim=1)
+        root_motion_valid = (root_linear_speed <= max_root_linear_speed) & (
+            root_angular_speed <= max_root_angular_speed
+        )
+        torso_orientation_error = quat_error_magnitude(
+            command.anchor_quat_w,
+            command.robot_anchor_quat_w,
+        )
+        torso_orientation_valid = torso_orientation_error <= max_torso_orientation_error
+
         standing_valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
         for value in conditions.values():
             standing_valid &= value
-        valid_final_stand = eligible_final_frame & standing_valid
-        self._stable_steps = torch.where(valid_final_stand, self._stable_steps + 1, 0)
+        valid_tail_sample = (
+            tail_observation
+            & reference_static
+            & standing_valid
+            & grouped_quality_valid
+            & global_joint_speed_valid
+            & root_motion_valid
+            & torso_orientation_valid
+        )
+        self._stable_steps = torch.where(valid_tail_sample, self._stable_steps + 1, 0)
         self._longest_stable_steps = torch.maximum(self._longest_stable_steps, self._stable_steps)
-
-        absolute_joint_speed = torch.abs(command.robot_joint_vel)
-        max_joint_speed_value = torch.max(absolute_joint_speed, dim=1).values
-        joint_speed_rms = torch.sqrt(torch.mean(torch.square(command.robot_joint_vel), dim=1))
-        root_angular_speed = torch.linalg.vector_norm(command.robot_anchor_ang_vel_w, dim=1)
 
         contact_sensor: ContactSensor = env.scene.sensors[contact_sensor_cfg.name]
         if contact_sensor.data.net_forces_w is None or contact_sensor.data.current_contact_time is None:
@@ -536,25 +806,31 @@ class motion_end_success(ManagerTermBase):
         wrist_contact_times = contact_sensor.data.current_contact_time[:, self._wrist_contact_body_ids]
 
         for name, value in conditions.items():
-            command.metrics[self._METRIC_PREFIX + name].copy_((eligible_final_frame & value).float())
+            command.metrics[self._METRIC_PREFIX + name].copy_((tail_observation & value).float())
         command.metrics[self._METRIC_PREFIX + "terminal_alignment_complete"].copy_(
-            (at_final_frame & alignment_complete).float()
+            (in_static_tail & alignment_complete).float()
         )
         command.metrics[self._METRIC_PREFIX + "terminal_default_pose_complete"].copy_(
-            (at_final_frame & terminal_default_pose_complete).float()
+            (in_static_tail & terminal_default_pose_complete).float()
+        )
+        command.metrics[self._METRIC_PREFIX + "static_tail"].copy_(in_static_tail.float())
+        command.metrics[self._METRIC_PREFIX + "reference_static"].copy_(
+            (in_static_tail & reference_static).float()
         )
         command.metrics[self._METRIC_PREFIX + "default_joint_pos_rms"].copy_(
-            torch.where(eligible_final_frame, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
+            torch.where(tail_observation, default_joint_pos_rms, torch.zeros_like(default_joint_pos_rms))
         )
         if expert_joint_pos_rms is not None:
             command.metrics[self._METRIC_PREFIX + "expert_joint_pos_rms"].copy_(
-                torch.where(eligible_final_frame, expert_joint_pos_rms, torch.zeros_like(expert_joint_pos_rms))
+                torch.where(tail_observation, expert_joint_pos_rms, torch.zeros_like(expert_joint_pos_rms))
             )
         command.metrics[self._METRIC_PREFIX + "stable_time"].copy_(self._stable_steps.float() * env.step_dt)
-        final_float = eligible_final_frame.to(dtype=max_joint_speed_value.dtype)
+        final_eligible = at_final_frame & alignment_complete & terminal_default_pose_complete
+        final_float = final_eligible.to(dtype=max_joint_speed_value.dtype)
+        tail_float = tail_observation.to(dtype=max_joint_speed_value.dtype)
         command.metrics[self._METRIC_PREFIX + "final_frame_fraction"].copy_(final_float)
-        command.metrics[self._METRIC_PREFIX + "max_joint_speed"].copy_(final_float * max_joint_speed_value)
-        command.metrics[self._METRIC_PREFIX + "joint_speed_rms"].copy_(final_float * joint_speed_rms)
+        command.metrics[self._METRIC_PREFIX + "max_joint_speed"].copy_(tail_float * max_joint_speed_value)
+        command.metrics[self._METRIC_PREFIX + "joint_speed_rms"].copy_(tail_float * joint_speed_rms)
         for threshold_name, threshold in (
             ("0_5", 0.5),
             ("0_75", 0.75),
@@ -563,22 +839,50 @@ class motion_end_success(ManagerTermBase):
         ):
             joints_over_threshold = torch.count_nonzero(absolute_joint_speed > threshold, dim=1)
             command.metrics[self._METRIC_PREFIX + f"joints_over_{threshold_name}"].copy_(
-                final_float * joints_over_threshold.to(dtype=final_float.dtype)
+                tail_float * joints_over_threshold.to(dtype=tail_float.dtype)
             )
-        command.metrics[self._METRIC_PREFIX + "root_angular_speed"].copy_(
-            final_float * root_angular_speed
+        command.metrics[self._METRIC_PREFIX + "root_linear_speed"].copy_(
+            tail_float * root_linear_speed
         )
-        for group_name, joint_ids in self._joint_group_ids.items():
+        command.metrics[self._METRIC_PREFIX + "root_angular_speed"].copy_(
+            tail_float * root_angular_speed
+        )
+        command.metrics[self._METRIC_PREFIX + "torso_orientation_valid"].copy_(
+            (tail_observation & torso_orientation_valid).float()
+        )
+        command.metrics[self._METRIC_PREFIX + "torso_orientation_error"].copy_(
+            tail_float * torso_orientation_error
+        )
+        for group_name, joint_ids in self._diagnostic_joint_group_ids.items():
             group_max_speed = torch.max(absolute_joint_speed[:, joint_ids], dim=1).values
             command.metrics[self._METRIC_PREFIX + f"{group_name}_max_joint_speed"].copy_(
-                final_float * group_max_speed
+                tail_float * group_max_speed
+            )
+        for group_name in self._quality_joint_group_ids:
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_pose_rms_valid"].copy_(
+                (tail_observation & group_pose_rms_valid[group_name]).float()
+            )
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_pose_max_valid"].copy_(
+                (tail_observation & group_pose_max_valid[group_name]).float()
+            )
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_velocity_rms_valid"].copy_(
+                (tail_observation & group_velocity_rms_valid[group_name]).float()
+            )
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_pose_rms"].copy_(
+                tail_float * group_pose_rms[group_name]
+            )
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_max_pose_error"].copy_(
+                tail_float * group_pose_max[group_name]
+            )
+            command.metrics[self._METRIC_PREFIX + f"{group_name}_joint_speed_rms"].copy_(
+                tail_float * group_velocity_rms[group_name]
             )
         for wrist_index, side in enumerate(("left", "right")):
             command.metrics[self._METRIC_PREFIX + f"{side}_wrist_contact_force"].copy_(
-                final_float * wrist_contact_forces[:, wrist_index]
+                tail_float * wrist_contact_forces[:, wrist_index]
             )
             command.metrics[self._METRIC_PREFIX + f"{side}_wrist_contact_time"].copy_(
-                final_float * wrist_contact_times[:, wrist_index]
+                tail_float * wrist_contact_times[:, wrist_index]
             )
         command.metrics[self._METRIC_PREFIX + "longest_stable_time"].copy_(
             self._longest_stable_steps.float() * env.step_dt
@@ -597,8 +901,9 @@ class motion_end_success(ManagerTermBase):
         )
 
         continuously_stable = self._stable_steps >= self._required_stable_steps
+        complete_trial = _episode_started_at_motion_beginning(command)
         clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
-        return clip_timeout & continuously_stable
+        return clip_timeout & complete_trial & at_final_frame & continuously_stable
 
 
 def motion_end_failure(
@@ -612,7 +917,13 @@ def motion_end_failure(
     if not command.cfg.terminate_on_motion_end:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
+    # Only episodes that started at the authored first frame are eligible for
+    # end-quality classification.  A random-phase episode can begin too close
+    # to the boundary to accumulate the required contact/stability time; if it
+    # were recorded as an adaptive failure, sampling would be biased toward
+    # unlearnable one- or two-step terminal starts.
+    complete_trial = _episode_started_at_motion_beginning(command)
     # The success term is configured immediately before this term.  Reusing
-    # its result guarantees that completed clips are partitioned exactly once.
+    # its result partitions every eligible completed clip exactly once.
     successful = env.termination_manager.get_term(success_term_name)
-    return clip_timeout & ~successful
+    return clip_timeout & complete_trial & ~successful
