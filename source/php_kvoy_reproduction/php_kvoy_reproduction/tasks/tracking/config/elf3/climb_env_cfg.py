@@ -292,7 +292,10 @@ ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
 # The final source pose is already a natural stable posture.  Score waist,
 # arms and legs separately so a local abnormal pose cannot disappear inside a
 # 29-joint average.  Legs use the broadest tolerance and the smallest total
-# share because they still need freedom for physical balance corrections.
+# share because they still need freedom for physical balance corrections.  The
+# grouped pose and measured-speed terms use an inverse-quadratic score, so a
+# group's score is 0.5 when its RMS equals the configured scale; unlike a
+# narrow Gaussian, gross resumed-policy errors retain a corrective signal.
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT = 6.0
 ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT = 1.5
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S = 0.50

@@ -1542,8 +1542,15 @@ def _grouped_expert_joint_pose_score(
     joint_groups: Mapping[str, Sequence[str]],
     group_stds: Mapping[str, float],
     group_weights: Mapping[str, float],
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Return a weighted expert-pose score without all-joint error dilution."""
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Return a robust weighted expert-pose score and group diagnostics.
+
+    The inverse-quadratic score has the same local quadratic behavior as the
+    former Gaussian around the expert pose, but its polynomial tail preserves
+    a useful improvement signal when a resumed policy starts with a grossly
+    displaced arm.  This avoids freezing a far-away pose merely because its
+    exponential score has already underflowed to an effectively flat value.
+    """
 
     group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
     robot_joint_pos = command.robot_joint_pos
@@ -1562,13 +1569,17 @@ def _grouped_expert_joint_pose_score(
     )
     weight_sum = sum(float(group_weights[name]) for name in joint_groups)
     group_rms: dict[str, torch.Tensor] = {}
+    group_max: dict[str, torch.Tensor] = {}
     for group_name, joint_ids in group_ids.items():
         error = robot_joint_pos[:, joint_ids] - target_joint_pos[:, joint_ids]
         mean_squared_error = torch.mean(torch.square(error), dim=1)
         group_rms[group_name] = torch.sqrt(mean_squared_error)
-        score = torch.exp(-mean_squared_error / float(group_stds[group_name]) ** 2)
+        group_max[group_name] = torch.max(torch.abs(error), dim=1).values
+        score = torch.reciprocal(
+            1.0 + mean_squared_error / float(group_stds[group_name]) ** 2
+        )
         weighted_score += (float(group_weights[group_name]) / weight_sum) * score
-    return weighted_score, group_rms
+    return weighted_score, group_rms, group_max
 
 
 def _grouped_actual_joint_speed_score(
@@ -1577,7 +1588,7 @@ def _grouped_actual_joint_speed_score(
     group_stds: Mapping[str, float],
     group_weights: Mapping[str, float],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Return a smooth grouped score for the robot's measured joint speeds."""
+    """Return a robust grouped score for the robot's measured joint speeds."""
 
     group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
     robot_joint_vel = command.robot_joint_vel
@@ -1598,7 +1609,9 @@ def _grouped_actual_joint_speed_score(
         mean_squared_speed = torch.mean(torch.square(group_velocity), dim=1)
         group_rms[group_name] = torch.sqrt(mean_squared_speed)
         group_max[group_name] = torch.max(torch.abs(group_velocity), dim=1).values
-        score = torch.exp(-mean_squared_speed / float(group_stds[group_name]) ** 2)
+        score = torch.reciprocal(
+            1.0 + mean_squared_speed / float(group_stds[group_name]) ** 2
+        )
         weighted_score += (float(group_weights[group_name]) / weight_sum) * score
     return weighted_score, group_rms, group_max
 
@@ -1896,6 +1909,7 @@ def _record_final_tail_group_metrics(
     torso_orientation_error: torch.Tensor | None = None,
     torso_angular_speed: torch.Tensor | None = None,
     pose_rms: Mapping[str, torch.Tensor] | None = None,
+    pose_max: Mapping[str, torch.Tensor] | None = None,
     speed_rms: Mapping[str, torch.Tensor] | None = None,
     speed_max: Mapping[str, torch.Tensor] | None = None,
 ) -> None:
@@ -1923,6 +1937,9 @@ def _record_final_tail_group_metrics(
     if pose_rms is not None:
         for group_name, value in pose_rms.items():
             record(f"final_tail_{group_name}_pose_rms", value)
+    if pose_max is not None:
+        for group_name, value in pose_max.items():
+            record(f"final_tail_{group_name}_max_pose_error", value)
     if speed_rms is not None:
         for group_name, value in speed_rms.items():
             record(f"final_tail_{group_name}_joint_speed_rms", value)
@@ -1961,7 +1978,7 @@ def final_grouped_expert_joint_position_error_exp(
     """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    pose_score, pose_rms = _grouped_expert_joint_pose_score(
+    pose_score, pose_rms, pose_max = _grouped_expert_joint_pose_score(
         command, joint_groups, group_stds, group_weights
     )
     soft_support, strict_support = _terminal_expert_support_gate(
@@ -1997,6 +2014,7 @@ def final_grouped_expert_joint_position_error_exp(
         torso_orientation_error=torso_orientation_error,
         torso_angular_speed=torso_angular_speed,
         pose_rms=pose_rms,
+        pose_max=pose_max,
     )
     alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=pose_score.dtype)
     return alignment_complete * static_tail * soft_support * pose_score

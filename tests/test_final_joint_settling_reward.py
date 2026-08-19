@@ -493,12 +493,13 @@ class GroupedTerminalExpertRewardTest(unittest.TestCase):
         return {"waist": 2.0, "left_arm": 2.0, "left_leg": 0.5}
 
     def test_grouped_pose_does_not_dilute_arm_error_into_all_joints(self):
-        score, rms = rewards._grouped_expert_joint_pose_score(
+        score, rms, maximum = rewards._grouped_expert_joint_pose_score(
             self._command(), self._groups(), self._stds(), self._weights()
         )
         self.assertLess(score[1].item(), score[0].item())
         torch.testing.assert_close(rms["left_arm"], torch.tensor([0.0, 1.0]))
         torch.testing.assert_close(rms["left_leg"], torch.tensor([1.0, 0.0]))
+        torch.testing.assert_close(maximum["left_arm"], torch.tensor([0.0, 1.0]))
 
     def test_grouped_velocity_uses_measured_robot_velocity(self):
         score, rms, maximum = rewards._grouped_actual_joint_speed_score(
@@ -524,6 +525,45 @@ class GroupedTerminalExpertRewardTest(unittest.TestCase):
                 {"a": 1.0},
                 {"a": 1.0},
             )
+
+    def test_inverse_quadratic_pose_retains_signal_for_large_arm_error(self):
+        command = SimpleNamespace(
+            robot=SimpleNamespace(joint_names=("left_arm",)),
+            robot_joint_pos=torch.tensor([[1.7], [1.6], [0.0]]),
+            source_joint_pos=torch.zeros(3, 1),
+        )
+        score, rms, maximum = rewards._grouped_expert_joint_pose_score(
+            command,
+            {"left_arm": ["left_arm"]},
+            {"left_arm": 0.45},
+            {"left_arm": 1.0},
+        )
+        expected = torch.reciprocal(1.0 + torch.square(torch.tensor([1.7, 1.6, 0.0]) / 0.45))
+        torch.testing.assert_close(score, expected)
+        torch.testing.assert_close(rms, {"left_arm": torch.tensor([1.7, 1.6, 0.0])})
+        torch.testing.assert_close(maximum, {"left_arm": torch.tensor([1.7, 1.6, 0.0])})
+        self.assertGreater(score[1].item() - score[0].item(), 0.005)
+        self.assertGreater(score[0].item(), 0.05)
+
+    def test_inverse_quadratic_velocity_is_monotonic_and_normalized(self):
+        command = SimpleNamespace(
+            robot=SimpleNamespace(joint_names=("left_arm",)),
+            robot_joint_pos=torch.zeros(3, 1),
+            robot_joint_vel=torch.tensor([[1.24], [0.62], [0.0]]),
+        )
+        score, rms, maximum = rewards._grouped_actual_joint_speed_score(
+            command,
+            {"left_arm": ["left_arm"]},
+            {"left_arm": 0.55},
+            {"left_arm": 1.0},
+        )
+        expected = torch.reciprocal(1.0 + torch.square(torch.tensor([1.24, 0.62, 0.0]) / 0.55))
+        torch.testing.assert_close(score, expected)
+        torch.testing.assert_close(rms["left_arm"], torch.tensor([1.24, 0.62, 0.0]))
+        torch.testing.assert_close(maximum["left_arm"], torch.tensor([1.24, 0.62, 0.0]))
+        self.assertLess(score[0].item(), score[1].item())
+        self.assertLess(score[1].item(), score[2].item())
+        self.assertEqual(score[2].item(), 1.0)
 
     def test_static_tail_reaches_full_strength_after_short_ramp(self):
         command = SimpleNamespace(
@@ -615,7 +655,7 @@ class GroupedTerminalExpertRewardTest(unittest.TestCase):
             ),
             patch.object(rewards, "_expert_static_tail_gate", return_value=static_tail),
         ):
-            pose_score, _ = rewards._grouped_expert_joint_pose_score(
+            pose_score, _, _ = rewards._grouped_expert_joint_pose_score(
                 command, self._groups(), self._stds(), self._weights()
             )
             velocity_score, _, _ = rewards._grouped_actual_joint_speed_score(
@@ -628,6 +668,7 @@ class GroupedTerminalExpertRewardTest(unittest.TestCase):
         torch.testing.assert_close(velocity_reward, soft_support * velocity_score)
         torch.testing.assert_close(command.metrics["final_tail_strict_support"], strict_support)
         self.assertIn("final_tail_left_arm_pose_rms", command.metrics)
+        self.assertIn("final_tail_left_arm_max_pose_error", command.metrics)
         self.assertIn("final_tail_left_leg_joint_speed_rms", command.metrics)
         self.assertIn("final_tail_left_leg_max_joint_speed", command.metrics)
         self.assertIn("final_tail_torso_orientation_error", command.metrics)
