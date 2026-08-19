@@ -46,7 +46,7 @@ def _load_rewards_module():
     stubs["isaaclab.assets"].Articulation = object
     stubs["isaaclab.managers"].SceneEntityCfg = _SceneEntityCfg
     stubs["isaaclab.sensors"].ContactSensor = object
-    stubs["isaaclab.utils.math"].quat_error_magnitude = lambda *_: torch.zeros(1)
+    stubs["isaaclab.utils.math"].quat_error_magnitude = lambda first, *_: torch.zeros(first.shape[0])
     stubs["php_kvoy_reproduction.tasks.tracking.mdp.commands"].MotionCommand = object
     stubs["php_kvoy_reproduction.tasks.tracking.mdp.joint_settling"].joint_settling_score = (
         lambda velocity, **_: 1.0 / (1.0 + torch.max(torch.abs(velocity), dim=1).values)
@@ -456,6 +456,182 @@ class FinalExpertUpperBodyPoseRewardTest(unittest.TestCase):
         self.assertEqual(moving_tail.item(), 0.0)
         self.assertEqual(single_foot.item(), 0.0)
         self.assertEqual(alignment_in_progress.item(), 0.0)
+
+
+class GroupedTerminalExpertRewardTest(unittest.TestCase):
+    def _command(self):
+        joint_names = ("waist", "left_arm_a", "left_arm_b", "left_leg_a", "left_leg_b")
+        robot_joint_pos = torch.zeros(2, len(joint_names), dtype=torch.float32)
+        source_joint_pos = torch.zeros_like(robot_joint_pos)
+        # Compare equal-sized errors in a low-weight leg group and a
+        # high-weight arm group.  The latter must reduce the aggregate more.
+        robot_joint_pos[0, 3:] = 1.0
+        robot_joint_pos[1, 1:3] = 1.0
+        robot_joint_vel = robot_joint_pos.clone()
+        return SimpleNamespace(
+            robot=SimpleNamespace(joint_names=joint_names),
+            robot_joint_pos=robot_joint_pos,
+            source_joint_pos=source_joint_pos,
+            joint_pos=source_joint_pos,
+            robot_joint_vel=robot_joint_vel,
+        )
+
+    @staticmethod
+    def _groups():
+        return {
+            "waist": ["waist"],
+            "left_arm": ["left_arm_a", "left_arm_b"],
+            "left_leg": ["left_leg_a", "left_leg_b"],
+        }
+
+    @staticmethod
+    def _stds():
+        return {"waist": 1.0, "left_arm": 1.0, "left_leg": 1.0}
+
+    @staticmethod
+    def _weights():
+        return {"waist": 2.0, "left_arm": 2.0, "left_leg": 0.5}
+
+    def test_grouped_pose_does_not_dilute_arm_error_into_all_joints(self):
+        score, rms = rewards._grouped_expert_joint_pose_score(
+            self._command(), self._groups(), self._stds(), self._weights()
+        )
+        self.assertLess(score[1].item(), score[0].item())
+        torch.testing.assert_close(rms["left_arm"], torch.tensor([0.0, 1.0]))
+        torch.testing.assert_close(rms["left_leg"], torch.tensor([1.0, 0.0]))
+
+    def test_grouped_velocity_uses_measured_robot_velocity(self):
+        score, rms, maximum = rewards._grouped_actual_joint_speed_score(
+            self._command(), self._groups(), self._stds(), self._weights()
+        )
+        self.assertLess(score[1].item(), score[0].item())
+        torch.testing.assert_close(rms["left_arm"], torch.tensor([0.0, 1.0]))
+        torch.testing.assert_close(maximum["left_leg"], torch.tensor([1.0, 0.0]))
+
+    def test_joint_groups_must_be_disjoint_and_known(self):
+        command = self._command()
+        with self.assertRaisesRegex(ValueError, "disjoint"):
+            rewards._grouped_expert_joint_pose_score(
+                command,
+                {"a": ["waist"], "b": ["waist"]},
+                {"a": 1.0, "b": 1.0},
+                {"a": 1.0, "b": 1.0},
+            )
+        with self.assertRaisesRegex(RuntimeError, "unknown robot joints"):
+            rewards._grouped_expert_joint_pose_score(
+                command,
+                {"a": ["missing"]},
+                {"a": 1.0},
+                {"a": 1.0},
+            )
+
+    def test_static_tail_reaches_full_strength_after_short_ramp(self):
+        command = SimpleNamespace(
+            motion=SimpleNamespace(motion_end_idx=torch.tensor([101], dtype=torch.long)),
+            motion_ids=torch.zeros(6, dtype=torch.long),
+            time_steps=torch.tensor([75, 76, 77, 80, 90, 100], dtype=torch.long),
+            final_hold_progress=torch.zeros(6),
+            joint_vel=torch.zeros(6, 2),
+            joint_pos=torch.zeros(6, 2),
+        )
+        gate = rewards._expert_static_tail_gate(
+            command,
+            reference_max_joint_speed=0.1,
+            static_window_time_s=0.5,
+            step_dt=0.02,
+            ramp_time_s=0.1,
+        )
+        torch.testing.assert_close(gate, torch.tensor([0.0, 0.0, 0.25, 1.0, 1.0, 1.0]))
+
+    def test_soft_support_retains_guidance_without_replacing_strict_support(self):
+        command = SimpleNamespace()
+        env = SimpleNamespace()
+        with (
+            patch.object(
+                rewards,
+                "_platform_foot_contact_scores",
+                return_value=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+            ),
+            patch.object(
+                rewards,
+                "_platform_foot_load_score",
+                return_value=torch.tensor([0.0, 1.0]),
+            ),
+        ):
+            soft, strict = rewards._terminal_expert_support_gate(
+                env,
+                command,
+                _SceneEntityCfg("platform"),
+                _SceneEntityCfg("contact_forces"),
+                (0.51, 0.8, 0.66),
+                ["left", "right"],
+                0.02,
+                0.04,
+                10.0,
+                0.25,
+                None,
+                0.5,
+                0.25,
+            )
+        torch.testing.assert_close(strict, torch.tensor([0.0, 1.0]))
+        torch.testing.assert_close(soft, torch.tensor([0.25, 1.0]))
+
+    def test_top_level_grouped_rewards_apply_tail_support_and_publish_metrics(self):
+        command = self._command()
+        command.time_steps = torch.tensor([99, 100], dtype=torch.long)
+        command.metrics = {}
+        command.anchor_quat_w = torch.zeros(2, 4)
+        command.robot_anchor_quat_w = torch.zeros(2, 4)
+        command.robot_anchor_ang_vel_w = torch.zeros(2, 3)
+        env = SimpleNamespace(command_manager=_CommandManager(command), step_dt=0.02)
+        static_tail = torch.ones(2)
+        soft_support = torch.tensor([0.25, 1.0])
+        strict_support = torch.tensor([0.0, 1.0])
+        common = dict(
+            env=env,
+            command_name="motion",
+            platform_cfg=_SceneEntityCfg("platform"),
+            contact_sensor_cfg=_SceneEntityCfg("contact_forces"),
+            base_size=(0.51, 0.8, 0.66),
+            foot_body_names=["left", "right"],
+            footprint_inset=0.02,
+            foot_height_std=0.04,
+            min_contact_force=10.0,
+            contact_time_scale=0.25,
+            reference_max_joint_speed=0.1,
+            static_window_time_s=0.5,
+            ramp_time_s=0.1,
+            joint_groups=self._groups(),
+            group_stds=self._stds(),
+            group_weights=self._weights(),
+            support_floor=0.25,
+            min_total_load_fraction=0.5,
+        )
+        with (
+            patch.object(
+                rewards,
+                "_terminal_expert_support_gate",
+                return_value=(soft_support, strict_support),
+            ),
+            patch.object(rewards, "_expert_static_tail_gate", return_value=static_tail),
+        ):
+            pose_score, _ = rewards._grouped_expert_joint_pose_score(
+                command, self._groups(), self._stds(), self._weights()
+            )
+            velocity_score, _, _ = rewards._grouped_actual_joint_speed_score(
+                command, self._groups(), self._stds(), self._weights()
+            )
+            pose_reward = rewards.final_grouped_expert_joint_position_error_exp(**common)
+            velocity_reward = rewards.final_grouped_actual_joint_velocity_exp(**common)
+
+        torch.testing.assert_close(pose_reward, soft_support * pose_score)
+        torch.testing.assert_close(velocity_reward, soft_support * velocity_score)
+        torch.testing.assert_close(command.metrics["final_tail_strict_support"], strict_support)
+        self.assertIn("final_tail_left_arm_pose_rms", command.metrics)
+        self.assertIn("final_tail_left_leg_joint_speed_rms", command.metrics)
+        self.assertIn("final_tail_left_leg_max_joint_speed", command.metrics)
+        self.assertIn("final_tail_torso_orientation_error", command.metrics)
+        self.assertIn("final_tail_torso_angular_speed", command.metrics)
 
 
 class FinalExpertFullJointPoseRewardTest(unittest.TestCase):

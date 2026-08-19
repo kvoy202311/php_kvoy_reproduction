@@ -86,6 +86,26 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertNotIn("final_standing_stability", reward_names)
         self.assertNotIn("final_joint_settling", reward_names)
         self.assertIn("final_expert_joint_pose", reward_names)
+        self.assertIn("final_actual_joint_velocity", reward_names)
+
+        reward_functions = {
+            target.id: ast.unparse(
+                next(keyword.value for keyword in node.value.keywords if keyword.arg == "func")
+            )
+            for node in rewards_class.body
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+            and any(keyword.arg == "func" for keyword in node.value.keywords)
+        }
+        self.assertEqual(
+            reward_functions["final_expert_joint_pose"],
+            "mdp.final_grouped_expert_joint_position_error_exp",
+        )
+        self.assertEqual(
+            reward_functions["final_actual_joint_velocity"],
+            "mdp.final_grouped_actual_joint_velocity_exp",
+        )
 
         terminations_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbTerminationsCfg"
@@ -159,6 +179,35 @@ class ClimbTerminalConfigTest(unittest.TestCase):
                 }
                 self.assertNotIn("terminal_platform_xy_offset", term_names)
                 self.assertNotIn("first_foothold_height_offsets", term_names)
+
+    def test_terminal_joint_groups_cover_robot_once_and_keep_legs_looser(self):
+        tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))
+        assignments = _top_level_assignments(tree)
+        robot_joint_names = ast.literal_eval(assignments["ELF3_CLIMB_JOINT_NAMES"])
+        groups = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS"])
+        grouped_joint_names = [name for names in groups.values() for name in names]
+
+        self.assertCountEqual(grouped_joint_names, robot_joint_names)
+        self.assertEqual(len(grouped_joint_names), len(set(grouped_joint_names)))
+
+        pose_stds = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS"])
+        pose_weights = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS"])
+        velocity_stds = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS"])
+        velocity_weights = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS"])
+        for side in ("left", "right"):
+            self.assertGreater(pose_stds[f"{side}_leg"], pose_stds[f"{side}_arm"])
+            self.assertLess(pose_weights[f"{side}_leg"], pose_weights[f"{side}_arm"])
+            self.assertGreater(velocity_stds[f"{side}_leg"], velocity_stds[f"{side}_arm"])
+            self.assertLess(velocity_weights[f"{side}_leg"], velocity_weights[f"{side}_arm"])
+
+        self.assertEqual(
+            ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S"]),
+            0.1,
+        )
+        self.assertEqual(
+            ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR"]),
+            0.25,
+        )
 
     def test_length_range_is_fixed_to_the_source_aligned_platform(self):
         tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))

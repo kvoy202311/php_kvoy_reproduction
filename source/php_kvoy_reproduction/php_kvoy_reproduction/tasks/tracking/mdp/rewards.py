@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import math
 import torch
 from typing import TYPE_CHECKING, NamedTuple
@@ -1428,6 +1428,7 @@ def _expert_static_tail_gate(
     reference_max_joint_speed: float,
     static_window_time_s: float,
     step_dt: float,
+    ramp_time_s: float | None = None,
 ) -> torch.Tensor:
     """Return a smooth gate for the stationary tail of the reference clip.
 
@@ -1443,11 +1444,163 @@ def _expert_static_tail_gate(
             "reference_max_joint_speed must be non-negative, "
             f"got {reference_max_joint_speed}."
         )
+    if static_window_time_s <= 0.0:
+        raise ValueError(f"static_window_time_s must be positive, got {static_window_time_s}.")
+    if step_dt <= 0.0:
+        raise ValueError(f"step_dt must be positive, got {step_dt}.")
+    if ramp_time_s is None:
+        ramp_time_s = static_window_time_s
+    if ramp_time_s <= 0.0:
+        raise ValueError(f"ramp_time_s must be positive, got {ramp_time_s}.")
+    if ramp_time_s > static_window_time_s:
+        raise ValueError(
+            "ramp_time_s cannot exceed static_window_time_s, "
+            f"got {ramp_time_s} and {static_window_time_s}."
+        )
+
+    final_frames = command.motion.motion_end_idx[command.motion_ids] - 1
+    window_steps = max(1, math.ceil(static_window_time_s / step_dt))
+    ramp_steps = max(1, math.ceil(ramp_time_s / step_dt))
+    start_frames = final_frames - (window_steps - 1)
+    ramp_progress = (command.time_steps - start_frames).to(dtype=torch.float32)
+    ramp_progress = ramp_progress / float(max(1, ramp_steps - 1))
+    final_window_ramp = ramp_progress.clamp(min=0.0, max=1.0)
+    final_window_ramp = torch.maximum(
+        final_window_ramp,
+        command.final_hold_progress.to(dtype=final_window_ramp.dtype),
+    )
+
     reference_speed = torch.max(torch.abs(command.joint_vel), dim=1).values
     reference_is_static = reference_speed <= reference_max_joint_speed
-    return _final_phase_gate(command, static_window_time_s, step_dt) * reference_is_static.to(
+    return final_window_ramp * reference_is_static.to(
         dtype=command.joint_pos.dtype
     )
+
+
+def _validate_terminal_joint_groups(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+) -> dict[str, torch.Tensor]:
+    """Resolve and validate disjoint terminal joint groups in robot order."""
+
+    if not joint_groups:
+        raise ValueError("joint_groups must contain at least one group.")
+    group_names = tuple(joint_groups)
+    if set(group_stds) != set(group_names):
+        raise ValueError("group_stds keys must exactly match joint_groups keys.")
+    if set(group_weights) != set(group_names):
+        raise ValueError("group_weights keys must exactly match joint_groups keys.")
+    if any(float(group_stds[name]) <= 0.0 for name in group_names):
+        raise ValueError("Every terminal joint-group std must be positive.")
+    if any(float(group_weights[name]) < 0.0 for name in group_names):
+        raise ValueError("Terminal joint-group weights must be non-negative.")
+    if sum(float(group_weights[name]) for name in group_names) <= 0.0:
+        raise ValueError("At least one terminal joint-group weight must be positive.")
+
+    joint_names = tuple(command.robot.joint_names)
+    name_to_id = {name: joint_id for joint_id, name in enumerate(joint_names)}
+    if len(name_to_id) != len(joint_names):
+        raise RuntimeError("Robot joint names must be unique for grouped terminal rewards.")
+
+    group_signature = tuple((name, tuple(names)) for name, names in joint_groups.items())
+    cached_groups = getattr(command, "_terminal_reward_joint_group_ids", None)
+    if cached_groups is not None and cached_groups[0] == group_signature:
+        return cached_groups[1]
+
+    resolved: dict[str, torch.Tensor] = {}
+    assigned_names: set[str] = set()
+    device = command.robot_joint_pos.device
+    for group_name, names in joint_groups.items():
+        names = tuple(names)
+        if not names:
+            raise ValueError(f"Terminal joint group {group_name!r} must not be empty.")
+        duplicates = assigned_names.intersection(names)
+        if duplicates:
+            raise ValueError(
+                f"Terminal joint groups must be disjoint; repeated joints: {sorted(duplicates)}."
+            )
+        missing = [name for name in names if name not in name_to_id]
+        if missing:
+            raise RuntimeError(
+                f"Terminal joint group {group_name!r} contains unknown robot joints: {missing}."
+            )
+        assigned_names.update(names)
+        resolved[group_name] = torch.tensor(
+            [name_to_id[name] for name in names], dtype=torch.long, device=device
+        )
+    # MotionCommand and its robot device/order are fixed for the lifetime of
+    # an environment.  Cache CUDA index tensors instead of reallocating all
+    # five groups on every reward evaluation.
+    command._terminal_reward_joint_group_ids = (group_signature, resolved)
+    return resolved
+
+
+def _grouped_expert_joint_pose_score(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Return a weighted expert-pose score without all-joint error dilution."""
+
+    group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
+    robot_joint_pos = command.robot_joint_pos
+    target_joint_pos = getattr(command, "source_joint_pos", None)
+    if target_joint_pos is None:
+        target_joint_pos = getattr(command, "joint_pos", None)
+    if target_joint_pos is None or target_joint_pos.shape != robot_joint_pos.shape:
+        target_shape = None if target_joint_pos is None else target_joint_pos.shape
+        raise RuntimeError(
+            "Grouped terminal pose reward requires matching expert and robot joint tensors, "
+            f"got {target_shape} and {robot_joint_pos.shape}."
+        )
+
+    weighted_score = torch.zeros(
+        robot_joint_pos.shape[0], dtype=robot_joint_pos.dtype, device=robot_joint_pos.device
+    )
+    weight_sum = sum(float(group_weights[name]) for name in joint_groups)
+    group_rms: dict[str, torch.Tensor] = {}
+    for group_name, joint_ids in group_ids.items():
+        error = robot_joint_pos[:, joint_ids] - target_joint_pos[:, joint_ids]
+        mean_squared_error = torch.mean(torch.square(error), dim=1)
+        group_rms[group_name] = torch.sqrt(mean_squared_error)
+        score = torch.exp(-mean_squared_error / float(group_stds[group_name]) ** 2)
+        weighted_score += (float(group_weights[group_name]) / weight_sum) * score
+    return weighted_score, group_rms
+
+
+def _grouped_actual_joint_speed_score(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Return a smooth grouped score for the robot's measured joint speeds."""
+
+    group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
+    robot_joint_vel = command.robot_joint_vel
+    if robot_joint_vel.shape != command.robot_joint_pos.shape:
+        raise RuntimeError(
+            "Robot joint position and velocity tensors must have the same shape, "
+            f"got {command.robot_joint_pos.shape} and {robot_joint_vel.shape}."
+        )
+
+    weighted_score = torch.zeros(
+        robot_joint_vel.shape[0], dtype=robot_joint_vel.dtype, device=robot_joint_vel.device
+    )
+    weight_sum = sum(float(group_weights[name]) for name in joint_groups)
+    group_rms: dict[str, torch.Tensor] = {}
+    group_max: dict[str, torch.Tensor] = {}
+    for group_name, joint_ids in group_ids.items():
+        group_velocity = robot_joint_vel[:, joint_ids]
+        mean_squared_speed = torch.mean(torch.square(group_velocity), dim=1)
+        group_rms[group_name] = torch.sqrt(mean_squared_speed)
+        group_max[group_name] = torch.max(torch.abs(group_velocity), dim=1).values
+        score = torch.exp(-mean_squared_speed / float(group_stds[group_name]) ** 2)
+        weighted_score += (float(group_weights[group_name]) / weight_sum) * score
+    return weighted_score, group_rms, group_max
 
 
 def _terminal_platform_alignment_gate(command: MotionCommand) -> torch.Tensor:
@@ -1685,6 +1838,228 @@ def _expert_joint_pose_score(command: MotionCommand, std: float) -> torch.Tensor
         )
     mean_squared_error = torch.mean(torch.square(robot_joint_pos - target_joint_pos), dim=1)
     return torch.exp(-mean_squared_error / std**2)
+
+
+def _terminal_expert_support_gate(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    platform_support_params: Mapping[str, object] | None,
+    min_total_load_fraction: float,
+    support_floor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a soft terminal support gate and its strict physical score."""
+
+    if not 0.0 <= support_floor <= 1.0:
+        raise ValueError(f"support_floor must be in [0, 1], got {support_floor}.")
+    per_foot_scores = _platform_foot_contact_scores(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        platform_support_params,
+    )
+    two_foot_support = per_foot_scores.amin(dim=1).clamp(min=0.0, max=1.0)
+    foot_load_score = _platform_foot_load_score(
+        env,
+        command,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_contact_force=min_contact_force,
+        foot_height_std=foot_height_std,
+        min_total_load_fraction=min_total_load_fraction,
+    ).clamp(min=0.0, max=1.0)
+    strict_support = two_foot_support * foot_load_score
+    soft_support = support_floor + (1.0 - support_floor) * strict_support
+    return soft_support, strict_support
+
+
+def _record_final_tail_group_metrics(
+    command: MotionCommand,
+    static_tail: torch.Tensor,
+    *,
+    strict_support: torch.Tensor | None = None,
+    torso_orientation_error: torch.Tensor | None = None,
+    torso_angular_speed: torch.Tensor | None = None,
+    pose_rms: Mapping[str, torch.Tensor] | None = None,
+    speed_rms: Mapping[str, torch.Tensor] | None = None,
+    speed_max: Mapping[str, torch.Tensor] | None = None,
+) -> None:
+    """Publish read-only final-tail diagnostics when a command owns metrics."""
+
+    metrics = getattr(command, "metrics", None)
+    if metrics is None:
+        return
+    active = (static_tail > 0.0).to(dtype=command.robot_joint_pos.dtype)
+
+    def record(name: str, value: torch.Tensor) -> None:
+        metric = metrics.setdefault(name, torch.zeros_like(value))
+        if metric.shape != value.shape:
+            raise RuntimeError(
+                f"Terminal diagnostic {name!r} has shape {metric.shape}, expected {value.shape}."
+            )
+        metric.copy_(active * value)
+
+    if strict_support is not None:
+        record("final_tail_strict_support", strict_support)
+    if torso_orientation_error is not None:
+        record("final_tail_torso_orientation_error", torso_orientation_error)
+    if torso_angular_speed is not None:
+        record("final_tail_torso_angular_speed", torso_angular_speed)
+    if pose_rms is not None:
+        for group_name, value in pose_rms.items():
+            record(f"final_tail_{group_name}_pose_rms", value)
+    if speed_rms is not None:
+        for group_name, value in speed_rms.items():
+            record(f"final_tail_{group_name}_joint_speed_rms", value)
+    if speed_max is not None:
+        for group_name, value in speed_max.items():
+            record(f"final_tail_{group_name}_max_joint_speed", value)
+
+
+def final_grouped_expert_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    ramp_time_s: float,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    support_floor: float,
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
+) -> torch.Tensor:
+    """Track expert terminal posture by group during the authored static tail.
+
+    Waist and each arm are scored independently so a local abnormal pose can
+    no longer hide inside a 29-joint mean.  Legs are also scored explicitly,
+    but their configured weight and tolerance can remain looser so physical
+    ankle, knee and hip balance corrections are not suppressed.
+    """
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    pose_score, pose_rms = _grouped_expert_joint_pose_score(
+        command, joint_groups, group_stds, group_weights
+    )
+    soft_support, strict_support = _terminal_expert_support_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        platform_support_params,
+        min_total_load_fraction,
+        support_floor,
+    )
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    torso_orientation_error = quat_error_magnitude(
+        command.anchor_quat_w, command.robot_anchor_quat_w
+    )
+    torso_angular_speed = torch.linalg.vector_norm(command.robot_anchor_ang_vel_w, dim=1)
+    _record_final_tail_group_metrics(
+        command,
+        static_tail,
+        strict_support=strict_support,
+        torso_orientation_error=torso_orientation_error,
+        torso_angular_speed=torso_angular_speed,
+        pose_rms=pose_rms,
+    )
+    alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=pose_score.dtype)
+    return alignment_complete * static_tail * soft_support * pose_score
+
+
+def final_grouped_actual_joint_velocity_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    foot_body_names: list[str],
+    footprint_inset: float,
+    foot_height_std: float,
+    min_contact_force: float,
+    contact_time_scale: float,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    ramp_time_s: float,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    support_floor: float,
+    platform_support_params: Mapping[str, object] | None = None,
+    min_total_load_fraction: float = 0.0,
+) -> torch.Tensor:
+    """Settle measured grouped joint velocities in the expert static tail."""
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    velocity_score, speed_rms, speed_max = _grouped_actual_joint_speed_score(
+        command, joint_groups, group_stds, group_weights
+    )
+    soft_support, strict_support = _terminal_expert_support_gate(
+        env,
+        command,
+        platform_cfg,
+        contact_sensor_cfg,
+        base_size,
+        foot_body_names,
+        footprint_inset,
+        foot_height_std,
+        min_contact_force,
+        contact_time_scale,
+        platform_support_params,
+        min_total_load_fraction,
+        support_floor,
+    )
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    _record_final_tail_group_metrics(
+        command,
+        static_tail,
+        strict_support=strict_support,
+        speed_rms=speed_rms,
+        speed_max=speed_max,
+    )
+    alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=velocity_score.dtype)
+    return alignment_complete * static_tail * soft_support * velocity_score
 
 
 def final_expert_joint_position_error_exp(

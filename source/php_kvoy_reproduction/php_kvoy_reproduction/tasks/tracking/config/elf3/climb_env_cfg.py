@@ -289,12 +289,81 @@ ELF3_CLIMB_PROGRESS_LIFT_PHASE_END = 0.75
 ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT = 0.65
 ELF3_CLIMB_PROGRESS_LIFT_WEIGHT = 0.35
 ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
-# The final source pose is already a natural stable posture.  A broad all-joint
-# target reinforces that source tail without extending the episode beyond it.
+# The final source pose is already a natural stable posture.  Score waist,
+# arms and legs separately so a local abnormal pose cannot disappear inside a
+# 29-joint average.  Legs use the broadest tolerance and the smallest total
+# share because they still need freedom for physical balance corrections.
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT = 6.0
-ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_STD = 0.50
+ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT = 1.5
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S = 0.50
+ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S = 0.10
 ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
+ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR = 0.25
+ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS = {
+    "waist": ["waist_y_joint", "waist_x_joint", "waist_z_joint"],
+    "left_arm": [
+        "l_shoulder_y_joint",
+        "l_shoulder_x_joint",
+        "l_shoulder_z_joint",
+        "l_elbow_y_joint",
+        "l_wrist_x_joint",
+        "l_wrist_y_joint",
+        "l_wrist_z_joint",
+    ],
+    "right_arm": [
+        "r_shoulder_y_joint",
+        "r_shoulder_x_joint",
+        "r_shoulder_z_joint",
+        "r_elbow_y_joint",
+        "r_wrist_x_joint",
+        "r_wrist_y_joint",
+        "r_wrist_z_joint",
+    ],
+    "left_leg": [
+        "l_hip_y_joint",
+        "l_hip_x_joint",
+        "l_hip_z_joint",
+        "l_knee_y_joint",
+        "l_ankle_y_joint",
+        "l_ankle_x_joint",
+    ],
+    "right_leg": [
+        "r_hip_y_joint",
+        "r_hip_x_joint",
+        "r_hip_z_joint",
+        "r_knee_y_joint",
+        "r_ankle_y_joint",
+        "r_ankle_x_joint",
+    ],
+}
+ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS = {
+    "waist": 0.35,
+    "left_arm": 0.45,
+    "right_arm": 0.45,
+    "left_leg": 0.70,
+    "right_leg": 0.70,
+}
+ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS = {
+    "waist": 2.0,
+    "left_arm": 2.0,
+    "right_arm": 2.0,
+    "left_leg": 0.75,
+    "right_leg": 0.75,
+}
+ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS = {
+    "waist": 0.35,
+    "left_arm": 0.55,
+    "right_arm": 0.55,
+    "left_leg": 0.85,
+    "right_leg": 0.85,
+}
+ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS = {
+    "waist": 2.0,
+    "left_arm": 2.0,
+    "right_arm": 2.0,
+    "left_leg": 0.50,
+    "right_leg": 0.50,
+}
 
 
 # Three performance-gated reset-pose stages: fixed, half range, full range.
@@ -750,7 +819,7 @@ class ELF3ClimbRewardsCfg:
         },
     )
     final_expert_joint_pose = RewTerm(
-        func=mdp.final_expert_joint_position_error_exp,
+        func=mdp.final_grouped_expert_joint_position_error_exp,
         weight=ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT,
         params={
             "command_name": "motion",
@@ -767,7 +836,38 @@ class ELF3ClimbRewardsCfg:
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
             "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
             "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "std": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_STD,
+            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
+            "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
+            "group_stds": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS,
+            "group_weights": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS,
+            "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
+            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
+            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
+        },
+    )
+    final_actual_joint_velocity = RewTerm(
+        func=mdp.final_grouped_actual_joint_velocity_exp,
+        weight=ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "platform_cfg": SceneEntityCfg("platform"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["l_ankle_x_link", "r_ankle_x_link"],
+            ),
+            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
+            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
+            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
+            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
+            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
+            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
+            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
+            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
+            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
+            "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
+            "group_stds": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS,
+            "group_weights": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS,
+            "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
             "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
             "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
         },
