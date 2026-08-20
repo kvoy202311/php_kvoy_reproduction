@@ -283,6 +283,57 @@ class ClimbBoxGeometryTest(unittest.TestCase):
         self.assertGreater(scores[0, 0].item(), 0.0)
         self.assertEqual(scores[0, 1].item(), 0.0)
 
+    def test_complete_sole_alignment_rejects_a_persistent_toe_stand(self):
+        centers, orientations, sizes = self._platform()
+        flat = self._sole_corners(-0.20, 0.04)
+        toe_stand = flat.clone()
+        toe_stand[..., 0, 2] += 0.05
+        toe_stand[..., 1, 2] += 0.05
+        corners = torch.cat((flat, toe_stand), dim=1)
+
+        score, valid, maximum_error = obstacle.sole_surface_alignment_score(
+            corners,
+            centers,
+            sizes,
+            height_std=0.025,
+            height_tolerance=0.03,
+        )
+
+        self.assertEqual(valid.tolist(), [[True, False]])
+        torch.testing.assert_close(maximum_error, torch.tensor([[0.0, 0.05]]))
+        self.assertGreater(score[0, 0].item(), score[0, 1].item())
+        self.assertEqual(score[0, 0].item(), 1.0)
+
+    def test_large_toe_tilt_keeps_dense_surface_gradient_but_fails_strict_support(self):
+        centers, _, sizes = self._platform()
+        toe_stand = self._sole_corners(-0.20, 0.04)
+        toe_stand[..., 0, 2] += 0.25
+        toe_stand[..., 1, 2] += 0.25
+        toe_stand.requires_grad_()
+
+        dense_score, height_spread, closest_error = obstacle.sole_surface_shaping_score(
+            toe_stand,
+            centers,
+            sizes,
+            tilt_scale=0.05,
+            height_scale=0.06,
+        )
+        _, strict_valid, maximum_error = obstacle.sole_surface_alignment_score(
+            toe_stand,
+            centers,
+            sizes,
+            height_std=0.025,
+            height_tolerance=0.03,
+        )
+        dense_score.sum().backward()
+
+        self.assertAlmostEqual(dense_score.item(), 1.0 / math.sqrt(26.0), places=6)
+        self.assertAlmostEqual(height_spread.item(), 0.25, places=6)
+        self.assertEqual(closest_error.item(), 0.0)
+        self.assertAlmostEqual(maximum_error.item(), 0.25, places=6)
+        self.assertFalse(strict_valid.item())
+        self.assertGreater(torch.linalg.vector_norm(toe_stand.grad).item(), 0.0)
+
     def test_filtered_platform_contact_time_needs_continuous_filtered_support(self):
         previous = torch.zeros((1, 2), dtype=torch.float32)
         left_only = torch.tensor([[True, False]])

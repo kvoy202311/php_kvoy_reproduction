@@ -90,9 +90,12 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertNotIn("final_joint_settling", reward_names)
         self.assertIn("final_expert_joint_pose", reward_names)
         self.assertIn("final_actual_joint_velocity", reward_names)
+        self.assertIn("final_ankle_surface_settling", reward_names)
         self.assertIn("final_expert_root_orientation", reward_names)
         self.assertIn("final_expert_root_linear_velocity", reward_names)
         self.assertIn("final_expert_root_angular_velocity", reward_names)
+        self.assertIn("first_foothold_surface_alignment", reward_names)
+        self.assertIn("platform_foot_surface_alignment", reward_names)
 
         reward_functions = {
             target.id: ast.unparse(
@@ -111,6 +114,10 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertEqual(
             reward_functions["final_actual_joint_velocity"],
             "mdp.final_grouped_actual_joint_velocity_exp",
+        )
+        self.assertEqual(
+            reward_functions["final_ankle_surface_settling"],
+            "mdp.final_ankle_surface_settling",
         )
         self.assertEqual(
             reward_functions["final_expert_root_orientation"],
@@ -296,6 +303,38 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             self.assertLess(pose_weights[f"{side}_leg"], pose_weights[f"{side}_arm"])
             self.assertGreater(velocity_stds[f"{side}_leg"], velocity_stds[f"{side}_arm"])
             self.assertLess(velocity_weights[f"{side}_leg"], velocity_weights[f"{side}_arm"])
+            self.assertEqual(pose_weights[f"{side}_ankle"], 0.0)
+            self.assertEqual(velocity_weights[f"{side}_ankle"], 0.0)
+
+        exempt_groups = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_QUALITY_EXPERT_POSE_EXEMPT_GROUPS"]
+        )
+        self.assertEqual(set(exempt_groups), {"left_ankle", "right_ankle"})
+        self.assertEqual(
+            ast.literal_eval(
+                assignments["ELF3_CLIMB_TERMINAL_FOOT_VERTICAL_POSITION_TRACKING_WEIGHT"]
+            ),
+            0.0,
+        )
+        vertical_position_weights = ast.literal_eval(
+            assignments["ELF3_CLIMB_FIRST_FOOTHOLD_VERTICAL_POSITION_TRACKING_WEIGHTS"]
+        )
+        self.assertEqual(vertical_position_weights, {"l_ankle_x_link": 0.0, "r_ankle_x_link": 0.0})
+        vertical_precontact_weights = ast.literal_eval(
+            assignments["ELF3_CLIMB_FIRST_FOOTHOLD_VERTICAL_PRECONTACT_TRACKING_WEIGHTS"]
+        )
+        orientation_precontact_weights = ast.literal_eval(
+            assignments["ELF3_CLIMB_FIRST_FOOTHOLD_ORIENTATION_PRECONTACT_TRACKING_WEIGHTS"]
+        )
+        self.assertEqual(vertical_precontact_weights, {"l_ankle_x_link": 0.25, "r_ankle_x_link": 0.25})
+        self.assertEqual(orientation_precontact_weights, {"l_ankle_x_link": 0.15, "r_ankle_x_link": 0.15})
+        generic_velocity_weight = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT"]
+        )
+        ankle_velocity_weight = ast.literal_eval(
+            assignments["ELF3_CLIMB_FINAL_ANKLE_SURFACE_SETTLING_REWARD_WEIGHT"]
+        )
+        self.assertEqual(generic_velocity_weight + ankle_velocity_weight, 3.0)
 
         self.assertEqual(
             ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S"]),

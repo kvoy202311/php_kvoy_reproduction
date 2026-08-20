@@ -414,6 +414,87 @@ def sole_top_height_score(
     return torch.exp(-0.5 * torch.square(closest_height_error / height_std))
 
 
+def sole_surface_alignment_score(
+    sole_corners_w: torch.Tensor,
+    centers_w: torch.Tensor,
+    sizes: torch.Tensor,
+    *,
+    height_std: float,
+    height_tolerance: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score whether the complete sampled sole is aligned with the box top.
+
+    ``sole_top_height_score`` intentionally accepts a forefoot-first landing by
+    looking only at the closest sole sample.  That is useful for detecting the
+    initial impact, but it must not classify a persistent toe stand as settled
+    support.  This stricter helper uses the largest absolute height error over
+    every configured sole sample.  It therefore remains independent of the
+    expert ankle pitch/roll and adapts directly to the physical platform top.
+
+    Returns the smooth alignment score, a hard readiness mask, and the maximum
+    absolute sole-to-surface error for diagnostics.
+    """
+
+    if sole_corners_w.ndim != 4 or sole_corners_w.shape[-1] != 3 or sole_corners_w.shape[2] == 0:
+        raise ValueError(f"sole_corners_w must have shape [N, F, C, 3], got {sole_corners_w.shape}.")
+    if centers_w.shape != (sole_corners_w.shape[0], 3):
+        raise ValueError(f"centers_w must have shape {(sole_corners_w.shape[0], 3)}, got {centers_w.shape}.")
+    if sizes.shape != (sole_corners_w.shape[0], 3):
+        raise ValueError(f"sizes must have shape {(sole_corners_w.shape[0], 3)}, got {sizes.shape}.")
+    if not math.isfinite(height_std) or height_std <= 0.0:
+        raise ValueError(f"height_std must be positive and finite, got {height_std}.")
+    if not math.isfinite(height_tolerance) or height_tolerance <= 0.0:
+        raise ValueError(f"height_tolerance must be positive and finite, got {height_tolerance}.")
+
+    platform_top = centers_w[:, 2].view(-1, 1, 1) + 0.5 * sizes[:, 2].view(-1, 1, 1)
+    maximum_height_error = torch.abs(sole_corners_w[..., 2] - platform_top).amax(dim=-1)
+    score = torch.exp(-0.5 * torch.square(maximum_height_error / height_std))
+    valid = maximum_height_error <= height_tolerance
+    return score, valid, maximum_height_error
+
+
+def sole_surface_shaping_score(
+    sole_corners_w: torch.Tensor,
+    centers_w: torch.Tensor,
+    sizes: torch.Tensor,
+    *,
+    tilt_scale: float,
+    height_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return non-saturating sole-to-top shaping and its two physical errors.
+
+    Strict support intentionally checks the *largest* absolute sample error in
+    :func:`sole_surface_alignment_score`.  That binary fact must not also be
+    used as the only learning signal: a badly pitched incoming sole can be
+    tens of centimetres from strict support, where a narrow Gaussian is
+    numerically indistinguishable from zero.  This helper instead combines
+    inverse-square-root scores for sole tilt and closest top approach.  It
+    remains informative far from the target but never changes the strict
+    support classification.
+
+    Returns the dense score, sole height spread, and closest absolute height
+    error, each with shape ``[N, F]``.
+    """
+
+    if sole_corners_w.ndim != 4 or sole_corners_w.shape[-1] != 3 or sole_corners_w.shape[2] == 0:
+        raise ValueError(f"sole_corners_w must have shape [N, F, C, 3], got {sole_corners_w.shape}.")
+    if centers_w.shape != (sole_corners_w.shape[0], 3):
+        raise ValueError(f"centers_w must have shape {(sole_corners_w.shape[0], 3)}, got {centers_w.shape}.")
+    if sizes.shape != (sole_corners_w.shape[0], 3):
+        raise ValueError(f"sizes must have shape {(sole_corners_w.shape[0], 3)}, got {sizes.shape}.")
+    for name, value in (("tilt_scale", tilt_scale), ("height_scale", height_scale)):
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be positive and finite, got {value}.")
+
+    sole_heights = sole_corners_w[..., 2]
+    platform_top = centers_w[:, 2].view(-1, 1, 1) + 0.5 * sizes[:, 2].view(-1, 1, 1)
+    height_spread = sole_heights.amax(dim=-1) - sole_heights.amin(dim=-1)
+    closest_height_error = torch.abs(sole_heights - platform_top).amin(dim=-1)
+    tilt_score = torch.rsqrt(1.0 + torch.square(height_spread / tilt_scale))
+    height_score = torch.rsqrt(1.0 + torch.square(closest_height_error / height_scale))
+    return tilt_score * height_score, height_spread, closest_height_error
+
+
 def foothold_precontact_score(
     sole_corners_w: torch.Tensor,
     centers_w: torch.Tensor,

@@ -240,7 +240,7 @@ def _climb_standing_conditions(
         # the user-approved maximum 5 cm heel overhang.  In particular, this is
         # not an ankle-origin-in-box approximation.
         inside = support.sole_geometry_valid
-        height_valid = support.sole_plane_height_error.abs() <= sole_height_tolerance
+        height_valid = support.sole_surface_valid
         contact_valid = support.active_support & (filtered_contact_time >= min_foot_contact_time)
         load_valid = platform_foot_load_valid(
             support,
@@ -540,6 +540,16 @@ class motion_end_success(ManagerTermBase):
             cfg.params["group_pose_max_thresholds"],
             cfg.params["group_velocity_rms_thresholds"],
         )
+        exempt_groups = tuple(cfg.params.get("expert_pose_exempt_groups", ()))
+        unknown_exempt_groups = sorted(set(exempt_groups).difference(self._quality_joint_group_ids))
+        if unknown_exempt_groups:
+            raise ValueError(
+                "expert_pose_exempt_groups contains names absent from joint_groups: "
+                f"{unknown_exempt_groups}."
+            )
+        if len(set(exempt_groups)) != len(exempt_groups):
+            raise ValueError("expert_pose_exempt_groups must not contain duplicate names.")
+        self._expert_pose_exempt_groups = frozenset(exempt_groups)
         self._diagnostic_joint_group_ids = {
             group_name: torch.tensor(
                 [
@@ -756,8 +766,17 @@ class motion_end_success(ManagerTermBase):
             pose_rms = torch.sqrt(torch.mean(torch.square(group_error), dim=1))
             pose_max = torch.max(torch.abs(group_error), dim=1).values
             velocity_rms = torch.sqrt(torch.mean(torch.square(group_velocity), dim=1))
-            pose_rms_valid = pose_rms <= float(group_pose_rms_thresholds[group_name])
-            pose_max_valid = pose_max <= float(group_pose_max_thresholds[group_name])
+            expert_pose_required = group_name not in self._expert_pose_exempt_groups
+            pose_rms_valid = (
+                pose_rms <= float(group_pose_rms_thresholds[group_name])
+                if expert_pose_required
+                else torch.ones_like(pose_rms, dtype=torch.bool)
+            )
+            pose_max_valid = (
+                pose_max <= float(group_pose_max_thresholds[group_name])
+                if expert_pose_required
+                else torch.ones_like(pose_max, dtype=torch.bool)
+            )
             velocity_rms_valid = velocity_rms <= float(group_velocity_rms_thresholds[group_name])
             group_pose_rms[group_name] = pose_rms
             group_pose_max[group_name] = pose_max

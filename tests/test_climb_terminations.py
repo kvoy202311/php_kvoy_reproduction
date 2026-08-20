@@ -435,6 +435,25 @@ class MotionEndSuccessTest(unittest.TestCase):
         self.assertEqual(command.metrics["final_standing_left_arm_pose_rms_valid"][1], 1.0)
         self.assertEqual(command.metrics["final_standing_left_arm_pose_max_valid"][1], 0.0)
 
+    def test_adaptive_ankle_group_ignores_expert_pose_but_still_requires_low_velocity(self):
+        term, env, command = _make_success_term(
+            params_override={"expert_pose_exempt_groups": ("right_leg",)}
+        )
+        right_leg_ids = [
+            _QUALITY_JOINT_NAMES.index(name) for name in _QUALITY_JOINT_GROUPS["right_leg"]
+        ]
+        command.robot_joint_pos[:, right_leg_ids] = 2.0
+
+        self._call_frame(term, env, command, 15)
+        torch.testing.assert_close(term._stable_steps, torch.ones(3, dtype=torch.long))
+        torch.testing.assert_close(
+            command.metrics["final_standing_right_leg_pose_max_valid"], torch.ones(3)
+        )
+
+        command.robot_joint_vel[1, right_leg_ids] = 0.61
+        self._call_frame(term, env, command, 16)
+        torch.testing.assert_close(term._stable_steps, torch.tensor([2, 0, 2]))
+
     def test_each_explicit_quality_gate_rejects_only_its_bad_environment(self):
         cases = (
             "group_pose_rms",

@@ -22,6 +22,8 @@ from php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry import (
     foothold_precontact_score,
     foothold_safety_score,
     foothold_safety_violation,
+    sole_surface_alignment_score,
+    sole_surface_shaping_score,
     sole_top_height_score,
 )
 from php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support import (
@@ -160,6 +162,10 @@ class _FirstFootholdSettings(NamedTuple):
     far_edge_margin: float
     lateral_margin: float
     foot_height_std: float
+    surface_height_std: float
+    surface_height_tolerance: float
+    surface_tilt_scale: float
+    surface_height_scale: float
     precontact_approach_distance: float
     precontact_height_std: float
     reference_activation_distance: float
@@ -186,6 +192,13 @@ class _FirstFootholdState(NamedTuple):
     precontact_scores: torch.Tensor
 
 
+class _FirstFootholdTrackingGates(NamedTuple):
+    """Separate source fades before and after verified physical top contact."""
+
+    precontact: torch.Tensor
+    physical_contact: torch.Tensor
+
+
 def _first_foothold_settings(params: Mapping[str, object]) -> _FirstFootholdSettings:
     """Parse the compact first-foot configuration passed by ``RewTerm``."""
 
@@ -199,6 +212,10 @@ def _first_foothold_settings(params: Mapping[str, object]) -> _FirstFootholdSett
         "far_edge_margin",
         "lateral_margin",
         "foot_height_std",
+        "surface_height_std",
+        "surface_height_tolerance",
+        "surface_tilt_scale",
+        "surface_height_scale",
         "precontact_approach_distance",
         "precontact_height_std",
         "reference_activation_distance",
@@ -251,6 +268,10 @@ def _first_foothold_settings(params: Mapping[str, object]) -> _FirstFootholdSett
         far_edge_margin=float(params["far_edge_margin"]),
         lateral_margin=float(params["lateral_margin"]),
         foot_height_std=float(params["foot_height_std"]),
+        surface_height_std=float(params["surface_height_std"]),
+        surface_height_tolerance=float(params["surface_height_tolerance"]),
+        surface_tilt_scale=float(params["surface_tilt_scale"]),
+        surface_height_scale=float(params["surface_height_scale"]),
         precontact_approach_distance=float(params["precontact_approach_distance"]),
         precontact_height_std=float(params["precontact_height_std"]),
         reference_activation_distance=float(params["reference_activation_distance"]),
@@ -339,11 +360,12 @@ def _apply_first_foothold_body_tracking_weights(
     weights: torch.Tensor,
     command: MotionCommand,
     body_indexes: list[int],
-    first_foothold_gates: torch.Tensor | None,
+    first_foothold_gates: _FirstFootholdTrackingGates | None,
     first_foothold_foot_body_names: tuple[str, ...] | None,
     first_foothold_body_weights: Mapping[str, float] | None,
+    first_foothold_precontact_body_weights: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
-    """Apply a per-foot pre-contact fade to explicitly selected tracked links."""
+    """Apply safe pre-contact and physical-contact source-weight floors."""
 
     if first_foothold_gates is None:
         if first_foothold_foot_body_names is not None or first_foothold_body_weights is not None:
@@ -351,16 +373,29 @@ def _apply_first_foothold_body_tracking_weights(
         return weights
     if first_foothold_foot_body_names is None or first_foothold_body_weights is None:
         raise ValueError("first_foothold_gates requires both foot names and body weights.")
-    if first_foothold_gates.shape != (weights.shape[0], len(first_foothold_foot_body_names)):
+    expected_shape = (weights.shape[0], len(first_foothold_foot_body_names))
+    if first_foothold_gates.precontact.shape != expected_shape:
         raise ValueError(
-            "first_foothold_gates must have shape "
-            f"{(weights.shape[0], len(first_foothold_foot_body_names))}, got {first_foothold_gates.shape}."
+            "first_foothold_gates.precontact must have shape "
+            f"{expected_shape}, got {first_foothold_gates.precontact.shape}."
+        )
+    if first_foothold_gates.physical_contact.shape != expected_shape:
+        raise ValueError(
+            "first_foothold_gates.physical_contact must have shape "
+            f"{expected_shape}, got {first_foothold_gates.physical_contact.shape}."
         )
 
     tracked_names = command.cfg.body_names
     unknown_names = set(first_foothold_body_weights).difference(tracked_names)
     if unknown_names:
         raise ValueError(f"First-foothold body weights contain untracked body names: {sorted(unknown_names)}.")
+    if first_foothold_precontact_body_weights is not None:
+        unknown_precontact_names = set(first_foothold_precontact_body_weights).difference(tracked_names)
+        if unknown_precontact_names:
+            raise ValueError(
+                "First-foothold pre-contact body weights contain untracked body names: "
+                f"{sorted(unknown_precontact_names)}."
+            )
     side_to_foot_index: dict[str, int] = {}
     for foot_index, foot_name in enumerate(first_foothold_foot_body_names):
         side, separator, _ = foot_name.partition("_")
@@ -372,12 +407,23 @@ def _apply_first_foothold_body_tracking_weights(
 
     for local_index, body_index in enumerate(body_indexes):
         body_name = tracked_names[body_index]
-        target_weight = first_foothold_body_weights.get(body_name)
-        if target_weight is None:
+        contact_target_weight = first_foothold_body_weights.get(body_name)
+        if contact_target_weight is None:
             continue
-        if not 0.0 <= target_weight <= 1.0:
+        precontact_target_weight = (
+            contact_target_weight
+            if first_foothold_precontact_body_weights is None
+            else first_foothold_precontact_body_weights.get(body_name, contact_target_weight)
+        )
+        if not 0.0 <= contact_target_weight <= 1.0:
             raise ValueError(
-                f"First-foothold tracking weight for '{body_name}' must be in [0, 1], got {target_weight}."
+                "First-foothold physical-contact tracking weight for "
+                f"'{body_name}' must be in [0, 1], got {contact_target_weight}."
+            )
+        if not 0.0 <= precontact_target_weight <= 1.0:
+            raise ValueError(
+                "First-foothold pre-contact tracking weight for "
+                f"'{body_name}' must be in [0, 1], got {precontact_target_weight}."
             )
         side, separator, _ = body_name.partition("_")
         if not separator or side not in side_to_foot_index:
@@ -385,10 +431,16 @@ def _apply_first_foothold_body_tracking_weights(
                 f"First-foothold tracked body '{body_name}' does not match a configured first-foot side."
             )
         foot_index = side_to_foot_index[side]
-        first_weight = 1.0 - (1.0 - target_weight) * first_foothold_gates[:, foot_index]
+        precontact_weight = 1.0 - (1.0 - precontact_target_weight) * first_foothold_gates.precontact[
+            :, foot_index
+        ]
+        contact_weight = 1.0 - (1.0 - contact_target_weight) * first_foothold_gates.physical_contact[
+            :, foot_index
+        ]
+        first_weight = torch.minimum(precontact_weight, contact_weight)
         # Multiple fades must combine as the weaker active objective, never as
-        # a product.  In particular this preserves the existing 15% terminal
-        # ankle floor instead of accidentally reducing it further.
+        # a product.  This preserves whichever terminal or arrival objective
+        # is intentionally weaker instead of multiplying two gates together.
         weights[:, local_index] = torch.minimum(weights[:, local_index], first_weight)
     return weights
 
@@ -401,16 +453,54 @@ def _terminal_weighted_body_error_exp(
     terminal_body_weight: float,
     terminal_gate: torch.Tensor,
     std: float,
-    first_foothold_gates: torch.Tensor | None = None,
+    first_foothold_gates: _FirstFootholdTrackingGates | None = None,
     first_foothold_foot_body_names: tuple[str, ...] | None = None,
     first_foothold_body_weights: Mapping[str, float] | None = None,
+    first_foothold_precontact_body_weights: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
     """Fade selected tracking objectives during first support and final contact."""
 
+    if not math.isfinite(std) or std <= 0.0:
+        raise ValueError(f"std must be positive and finite, got {std}.")
+    weights = _terminal_body_tracking_weights(
+        error,
+        command,
+        body_indexes,
+        terminal_body_indexes,
+        terminal_body_weight,
+        terminal_gate,
+        first_foothold_gates,
+        first_foothold_foot_body_names,
+        first_foothold_body_weights,
+        first_foothold_precontact_body_weights,
+    )
+    # Keep the original body-count normalization. This genuinely weakens the
+    # ankle objective instead of renormalizing the remaining body terms.
+    return torch.exp(-(error * weights).mean(dim=-1) / std**2)
+
+
+def _terminal_body_tracking_weights(
+    error: torch.Tensor,
+    command: MotionCommand,
+    body_indexes: list[int],
+    terminal_body_indexes: list[int],
+    terminal_body_weight: float,
+    terminal_gate: torch.Tensor,
+    first_foothold_gates: _FirstFootholdTrackingGates | None = None,
+    first_foothold_foot_body_names: tuple[str, ...] | None = None,
+    first_foothold_body_weights: Mapping[str, float] | None = None,
+    first_foothold_precontact_body_weights: Mapping[str, float] | None = None,
+) -> torch.Tensor:
+    """Build per-body source-tracking weights without reducing error axes."""
+
     if not 0.0 <= terminal_body_weight <= 1.0:
         raise ValueError(f"terminal_body_weight must be in [0, 1], got {terminal_body_weight}.")
-    if std <= 0.0:
-        raise ValueError(f"std must be positive, got {std}.")
+    if error.ndim != 2 or error.shape[1] != len(body_indexes):
+        raise ValueError(
+            f"error must have shape [N, {len(body_indexes)}], got {tuple(error.shape)}."
+        )
+    if terminal_gate.shape != (error.shape[0],):
+        raise ValueError(f"terminal_gate must have shape {(error.shape[0],)}, got {terminal_gate.shape}.")
     terminal_set = set(terminal_body_indexes)
     terminal_mask = torch.tensor(
         [index in terminal_set for index in body_indexes], dtype=error.dtype, device=error.device
@@ -423,10 +513,9 @@ def _terminal_weighted_body_error_exp(
         first_foothold_gates,
         first_foothold_foot_body_names,
         first_foothold_body_weights,
+        first_foothold_precontact_body_weights,
     )
-    # Keep the original body-count normalization. This genuinely weakens the
-    # ankle objective instead of renormalizing the remaining body terms.
-    return torch.exp(-(error * weights).mean(dim=-1) / std**2)
+    return weights
 
 
 def _climb_terminal_gate(
@@ -479,16 +568,22 @@ def climb_motion_relative_body_position_error_exp(
     first_foothold_params: Mapping[str, object] | None = None,
     first_foothold_body_weights: Mapping[str, float] | None = None,
     platform_support_params: Mapping[str, object] | None = None,
+    terminal_vertical_body_weight: float | None = None,
+    first_foothold_vertical_body_weights: Mapping[str, float] | None = None,
+    first_foothold_vertical_precontact_body_weights: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
-    """Track climb body positions while freeing an arriving physical foot."""
+    """Track body XY while allowing physical terrain to own an arriving foot's Z."""
 
+    if not math.isfinite(std) or std <= 0.0:
+        raise ValueError(f"std must be positive and finite, got {std}.")
     command: MotionCommand = env.command_manager.get_term(command_name)
     body_indexes = _get_body_indexes(command, body_names)
     terminal_body_indexes = _get_body_indexes(command, terminal_body_names)
-    error = torch.sum(
-        torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]),
-        dim=-1,
+    position_error = torch.square(
+        command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]
     )
+    horizontal_error = position_error[..., :2].sum(dim=-1)
+    vertical_error = position_error[..., 2]
     terminal_gate = _climb_terminal_gate(
         env,
         command,
@@ -503,11 +598,19 @@ def climb_motion_relative_body_position_error_exp(
         terminal_window_time_s,
         platform_support_params,
     )
-    first_foothold_gates: torch.Tensor | None = None
+    first_foothold_gates: _FirstFootholdTrackingGates | None = None
     first_foothold_foot_body_names: tuple[str, ...] | None = None
-    if first_foothold_params is not None or first_foothold_body_weights is not None:
+    if (
+        first_foothold_params is not None
+        or first_foothold_body_weights is not None
+        or first_foothold_vertical_body_weights is not None
+        or first_foothold_vertical_precontact_body_weights is not None
+    ):
         if first_foothold_params is None or first_foothold_body_weights is None:
-            raise ValueError("Position tracking requires both first_foothold_params and first_foothold_body_weights.")
+            raise ValueError(
+                "Position tracking requires first_foothold_params and horizontal body weights "
+                "whenever either first-foothold axis is configured."
+            )
         first_foothold_gates, settings = _first_foothold_tracking_gates(
             env,
             command,
@@ -516,18 +619,42 @@ def climb_motion_relative_body_position_error_exp(
             first_foothold_params,
         )
         first_foothold_foot_body_names = settings.foot_body_names
-    score = _terminal_weighted_body_error_exp(
-        error,
+    horizontal_weights = _terminal_body_tracking_weights(
+        horizontal_error,
         command,
         body_indexes,
         terminal_body_indexes,
         terminal_body_weight,
         terminal_gate,
-        std,
         first_foothold_gates,
         first_foothold_foot_body_names,
         first_foothold_body_weights,
     )
+    vertical_terminal_weight = (
+        terminal_body_weight if terminal_vertical_body_weight is None else terminal_vertical_body_weight
+    )
+    vertical_first_weights = (
+        first_foothold_body_weights
+        if first_foothold_vertical_body_weights is None
+        else first_foothold_vertical_body_weights
+    )
+    vertical_weights = _terminal_body_tracking_weights(
+        vertical_error,
+        command,
+        body_indexes,
+        terminal_body_indexes,
+        vertical_terminal_weight,
+        terminal_gate,
+        first_foothold_gates,
+        first_foothold_foot_body_names,
+        vertical_first_weights,
+        first_foothold_vertical_precontact_body_weights,
+    )
+    # Preserve the historical normalization over tracked bodies.  Only the
+    # selected feet differ by axis: expert XY remains active while source Z is
+    # handed to the physical sole-to-platform objective.
+    weighted_error = horizontal_error * horizontal_weights + vertical_error * vertical_weights
+    score = torch.exp(-weighted_error.mean(dim=-1) / std**2)
     return _terminal_expert_tracking_factor(command) * score
 
 
@@ -561,6 +688,7 @@ def climb_motion_relative_body_orientation_error_exp(
     terminal_window_time_s: float,
     first_foothold_params: Mapping[str, object] | None = None,
     first_foothold_body_weights: Mapping[str, float] | None = None,
+    first_foothold_precontact_body_weights: Mapping[str, float] | None = None,
     platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
     """Track body orientations while freeing an arriving ankle from the reference."""
@@ -585,9 +713,13 @@ def climb_motion_relative_body_orientation_error_exp(
         terminal_window_time_s,
         platform_support_params,
     )
-    first_foothold_gates: torch.Tensor | None = None
+    first_foothold_gates: _FirstFootholdTrackingGates | None = None
     first_foothold_foot_body_names: tuple[str, ...] | None = None
-    if first_foothold_params is not None or first_foothold_body_weights is not None:
+    if (
+        first_foothold_params is not None
+        or first_foothold_body_weights is not None
+        or first_foothold_precontact_body_weights is not None
+    ):
         if first_foothold_params is None or first_foothold_body_weights is None:
             raise ValueError(
                 "Orientation tracking requires both first_foothold_params and first_foothold_body_weights."
@@ -611,6 +743,7 @@ def climb_motion_relative_body_orientation_error_exp(
         first_foothold_gates,
         first_foothold_foot_body_names,
         first_foothold_body_weights,
+        first_foothold_precontact_body_weights,
     )
     return _terminal_expert_tracking_factor(command) * score
 
@@ -642,7 +775,7 @@ def _first_foothold_weighted_body_error_exp(
     command: MotionCommand,
     body_indexes: list[int],
     std: float,
-    first_foothold_gates: torch.Tensor,
+    first_foothold_gates: _FirstFootholdTrackingGates,
     first_foothold_foot_body_names: tuple[str, ...],
     first_foothold_body_weights: Mapping[str, float],
 ) -> torch.Tensor:
@@ -921,16 +1054,14 @@ def _first_foothold_tracking_gates(
     platform_cfg: SceneEntityCfg,
     base_size: tuple[float, float, float],
     first_foothold_params: Mapping[str, object],
-) -> tuple[torch.Tensor, _FirstFootholdSettings]:
-    """Return a post-contact fade gate, restricted to the reference-leading foot.
+) -> tuple[_FirstFootholdTrackingGates, _FirstFootholdSettings]:
+    """Fade only configured source-foot objectives near the physical surface.
 
-    The old gate faded ankle tracking while a foot was merely approaching the
-    box.  That made an air-borne foot almost unconstrained and opened the
-    hand-supported shortcut.  A fade is now allowed only after the same real
-    sole geometry and filtered ``ClimbPlatform`` +z support used by terminal
-    terms are present.  This helper is deliberately stateless: the four body
-    tracking rewards may call it in one policy step without accelerating a
-    contact timer.
+    The terrain-adaptive surface reward replaces the expert ankle pitch/roll
+    during this gate.  Hip, knee and torso terms remain fully constrained by
+    configuration, so the arriving foot is never an unconstrained airborne
+    end effector.  A permissive forefoot contact keeps the gate active while
+    the heel is being lowered toward complete-sole support.
     """
 
     state = _first_foothold_state(env, command, platform_cfg, base_size, first_foothold_params)
@@ -946,17 +1077,34 @@ def _first_foothold_tracking_gates(
     )
     if support.settings.foot_body_names != state.settings.foot_body_names:
         raise RuntimeError("First-foothold physical support feet do not match the reference-foot ordering.")
-    return (
-        state.reference_gate[:, None]
-        * state.reference_lead_mask
-        * support.active_support.to(dtype=state.reference_gate.dtype)
-    ), state.settings
+    phase = _motion_phase(command)
+    phase_in = _smoothstep_window(
+        phase,
+        state.settings.phase_start,
+        state.settings.phase_start + state.settings.phase_ramp,
+    )
+    phase_out = 1.0 - _smoothstep_window(
+        phase,
+        state.settings.phase_end,
+        state.settings.phase_end + state.settings.phase_fade,
+    )
+    # Every foot that physically approaches the top receives the same terrain
+    # handoff.  Reference-leading-foot selection remains exclusive to the
+    # first-support bonus; using it here would leave the second arriving foot
+    # stuck with the same bad expert pitch/roll.
+    precontact_gate = phase_in[:, None] * phase_out[:, None] * state.precontact_scores
+    # Once either foot physically reaches the platform, retain the adaptive
+    # handoff even after the reference's first-foot window closes.  Otherwise
+    # the bad source pitch/roll would be restored exactly while the second foot
+    # is arriving and could pull a settled heel back off the surface.
+    physical_contact_gate = support.contact_support.to(dtype=state.reference_gate.dtype)
+    return _FirstFootholdTrackingGates(precontact_gate, physical_contact_gate), state.settings
 
 
 def _first_foothold_sole_safety(
     state: _FirstFootholdState,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return smooth sole quality, hard footprint validity, and top-height quality."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return footprint, transient-contact, and complete-sole surface facts."""
 
     geometry_score, valid_footprint = foothold_safety_score(
         state.sole_corners_w,
@@ -975,7 +1123,70 @@ def _first_foothold_sole_safety(
         state.sizes,
         height_std=state.settings.foot_height_std,
     )
-    return geometry_score, valid_footprint, height_score
+    surface_score, surface_valid, _ = sole_surface_alignment_score(
+        state.sole_corners_w,
+        state.platform.data.root_pos_w,
+        state.sizes,
+        height_std=state.settings.surface_height_std,
+        height_tolerance=state.settings.surface_height_tolerance,
+    )
+    return geometry_score, valid_footprint, height_score, surface_score, surface_valid
+
+
+def first_foothold_surface_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    first_foothold_params: Mapping[str, object],
+    yaw_std: float,
+) -> torch.Tensor:
+    """Align the arriving sole to the sampled box top without copying bad expert tilt.
+
+    Expert phase and each foot's yaw remain authoritative.  Sole Z, pitch and
+    roll are instead scored against the physical platform surface for whichever
+    foot is actually approaching it.  The pre-contact gate gives the policy a
+    dense correction before impact and covers both the first and second foot.
+    """
+
+    if not math.isfinite(yaw_std) or yaw_std <= 0.0:
+        raise ValueError(f"yaw_std must be positive and finite, got {yaw_std}.")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    state = _first_foothold_state(env, command, platform_cfg, base_size, first_foothold_params)
+    surface_score, _, _ = sole_surface_shaping_score(
+        state.sole_corners_w,
+        state.platform.data.root_pos_w,
+        state.sizes,
+        tilt_scale=state.settings.surface_tilt_scale,
+        height_scale=state.settings.surface_height_scale,
+    )
+    foot_ids = _named_body_ids(
+        command.cfg.body_names,
+        state.settings.foot_body_names,
+        command.device,
+        context="First-foothold adaptive surface heading",
+    )
+    reference_yaw = math_utils.yaw_quat(command.body_quat_relative_w[:, foot_ids])
+    actual_yaw = math_utils.yaw_quat(command.robot_body_quat_w[:, foot_ids])
+    yaw_error = quat_error_magnitude(reference_yaw, actual_yaw)
+    yaw_score = torch.rsqrt(1.0 + torch.square(yaw_error / yaw_std))
+    phase = _motion_phase(command)
+    phase_in = _smoothstep_window(
+        phase,
+        state.settings.phase_start,
+        state.settings.phase_start + state.settings.phase_ramp,
+    )
+    phase_out = 1.0 - _smoothstep_window(
+        phase,
+        state.settings.phase_end,
+        state.settings.phase_end + state.settings.phase_fade,
+    )
+    gates = phase_in[:, None] * phase_out[:, None] * state.precontact_scores
+    per_foot_score = gates * surface_score * yaw_score
+    # Preserve a unit maximum whether one or both feet are simultaneously in
+    # the arrival band, without amplifying a barely active gate.
+    normalization = gates.sum(dim=1).clamp_min(1.0)
+    return per_foot_score.sum(dim=1) / normalization
 
 
 def first_foothold_support_quality(
@@ -995,7 +1206,7 @@ def first_foothold_support_quality(
 
     command: MotionCommand = env.command_manager.get_term(command_name)
     state = _first_foothold_state(env, command, platform_cfg, base_size, first_foothold_params)
-    geometry_score, valid_footprint, height_score = _first_foothold_sole_safety(state)
+    geometry_score, valid_footprint, _, surface_score, surface_valid = _first_foothold_sole_safety(state)
     platform_top = state.platform.data.root_pos_w[:, None, 2] + 0.5 * state.sizes[:, None, 2]
     near_platform_top = torch.abs(state.sole_corners_w[..., 2] - platform_top[:, :, None]).amin(dim=-1)
     # The same physical height scale that scores contact defines when filtered
@@ -1005,6 +1216,7 @@ def first_foothold_support_quality(
         (state.reference_gate[:, None] > 0.0)
         & state.reference_lead_mask.to(dtype=torch.bool)
         & valid_footprint
+        & surface_valid
         & (near_platform_top <= state.settings.foot_height_std)
     )
     platform_contact_score, platform_force_score = _filtered_platform_foot_contact_scores(
@@ -1029,7 +1241,11 @@ def first_foothold_support_quality(
     # there, so the requested 5 cm heel limit is both a hard reward gate and a
     # directional behavior constraint rather than merely a missing bonus.
     per_foot_quality = state.precontact_scores * (
-        geometry_score * height_score * platform_contact_score - safety_violation * platform_force_score
+        geometry_score
+        * surface_score
+        * surface_valid.to(dtype=surface_score.dtype)
+        * platform_contact_score
+        - safety_violation * platform_force_score
     )
     return state.reference_gate * torch.sum(state.reference_lead_mask * per_foot_quality, dim=1)
 
@@ -1237,8 +1453,12 @@ def climb_platform_progress(
             base_size,
             first_foothold_params,
         )
-        foot_geometry_score, _, foot_height_score = _first_foothold_sole_safety(first_foothold_state)
-        foot_support_score = foot_geometry_score * foot_height_score
+        foot_geometry_score, _, _, foot_surface_score, foot_surface_valid = _first_foothold_sole_safety(
+            first_foothold_state
+        )
+        foot_support_score = (
+            foot_geometry_score * foot_surface_score * foot_surface_valid.to(dtype=foot_surface_score.dtype)
+        )
         for foot_index, foot_name in enumerate(first_foothold_state.settings.foot_body_names):
             if foot_name in support_body_names:
                 support_index = support_body_names.index(foot_name)
@@ -1538,7 +1758,7 @@ def _validate_terminal_joint_groups(
         )
     # MotionCommand and its robot device/order are fixed for the lifetime of
     # an environment.  Cache CUDA index tensors instead of reallocating all
-    # five groups on every reward evaluation.
+    # seven groups on every reward evaluation.
     command._terminal_reward_joint_group_ids = (group_signature, resolved)
     return resolved
 
@@ -2790,6 +3010,173 @@ def platform_foot_contact(
     # A mean would let one planted foot hide an unsupported second foot.  The
     # minimum makes this a genuine bilateral-platform reward.
     return gate * per_foot_scores.amin(dim=1)
+
+
+def platform_foot_surface_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    platform_support_params: Mapping[str, object],
+    min_upward_force: float,
+    sole_height_tolerance: float,
+    terminal_window_time_s: float,
+    yaw_std: float,
+) -> torch.Tensor:
+    """Reward two terrain-aligned feet while preserving the expert headings.
+
+    This is deliberately independent of expert ankle pitch/roll and contact
+    force.  It supplies a geometric correction before impact; the separate
+    platform-contact and load terms decide whether the aligned feet are
+    physically supporting the robot.
+    """
+
+    if not math.isfinite(yaw_std) or yaw_std <= 0.0:
+        raise ValueError(f"yaw_std must be positive and finite, got {yaw_std}.")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    support = platform_foot_support_state(
+        env,
+        command.robot,
+        command.device,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_upward_force=min_upward_force,
+        sole_height_tolerance=sole_height_tolerance,
+    )
+    foot_ids = _named_body_ids(
+        command.cfg.body_names,
+        support.settings.foot_body_names,
+        command.device,
+        context="Terminal adaptive surface heading",
+    )
+    reference_yaw = math_utils.yaw_quat(command.body_quat_relative_w[:, foot_ids])
+    actual_yaw = math_utils.yaw_quat(command.robot_body_quat_w[:, foot_ids])
+    yaw_error = quat_error_magnitude(reference_yaw, actual_yaw)
+    yaw_score = torch.rsqrt(1.0 + torch.square(yaw_error / yaw_std))
+    per_foot_score = support.dense_surface_score * yaw_score
+    gate = _final_phase_gate(command, terminal_window_time_s, env.step_dt)
+
+    metrics = getattr(command, "metrics", None)
+    if metrics is not None:
+        side_names = ("left", "right")
+
+        def record(name: str, value: torch.Tensor) -> None:
+            metric = metrics.setdefault(name, torch.zeros_like(value))
+            if metric.shape != value.shape:
+                raise RuntimeError(
+                    f"Terminal foot-surface diagnostic {name!r} has shape {metric.shape}, "
+                    f"expected {value.shape}."
+                )
+            metric.copy_(gate * value)
+
+        for foot_index, side_name in enumerate(side_names):
+            record(
+                f"final_standing_{side_name}_sole_max_height_error",
+                support.sole_surface_height_error[:, foot_index],
+            )
+            record(
+                f"final_standing_{side_name}_sole_height_spread",
+                support.sole_height_spread[:, foot_index],
+            )
+            record(
+                f"final_standing_{side_name}_dense_surface_score",
+                support.dense_surface_score[:, foot_index],
+            )
+            record(
+                f"final_standing_{side_name}_platform_upward_force",
+                support.upward_forces[:, foot_index],
+            )
+            record(
+                f"final_standing_{side_name}_strict_active_support",
+                support.active_support[:, foot_index].to(dtype=gate.dtype),
+            )
+    tiny = torch.finfo(per_foot_score.dtype).tiny
+    bilateral_score = per_foot_score.shape[1] / torch.sum(
+        torch.reciprocal(per_foot_score.clamp_min(tiny)), dim=1
+    )
+    return gate * bilateral_score
+
+
+def final_ankle_surface_settling(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    platform_cfg: SceneEntityCfg,
+    base_size: tuple[float, float, float],
+    platform_support_params: Mapping[str, object],
+    min_upward_force: float,
+    sole_height_tolerance: float,
+    reference_max_joint_speed: float,
+    static_window_time_s: float,
+    ramp_time_s: float,
+    ankle_joint_names: Sequence[Sequence[str]],
+    speed_scale: float,
+) -> torch.Tensor:
+    """Settle each ankle only in proportion to its terrain-aligned sole quality.
+
+    A motionless toe stand receives only its low dense surface score, so this
+    term cannot teach the policy to freeze a bad ankle pose.  Conversely, the
+    inverse-square-root velocity score keeps a useful gradient while an ankle
+    is still moving.  Strict contact and success remain separate terms.
+    """
+
+    if not math.isfinite(speed_scale) or speed_scale <= 0.0:
+        raise ValueError(f"speed_scale must be positive and finite, got {speed_scale}.")
+    if len(ankle_joint_names) != 2 or any(len(names) == 0 for names in ankle_joint_names):
+        raise ValueError("ankle_joint_names must contain two non-empty per-foot joint groups.")
+    flattened_names = [str(name) for names in ankle_joint_names for name in names]
+    if len(set(flattened_names)) != len(flattened_names):
+        raise ValueError("ankle_joint_names must not contain duplicate joints.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    missing = [name for name in flattened_names if name not in command.robot.joint_names]
+    if missing:
+        raise RuntimeError(f"Terminal ankle settling references unknown robot joints: {missing}.")
+    joint_signature = tuple(tuple(str(name) for name in names) for names in ankle_joint_names)
+    cached_joint_ids = getattr(command, "_terminal_ankle_surface_joint_ids", None)
+    if cached_joint_ids is None or cached_joint_ids[0] != joint_signature:
+        resolved_joint_ids = tuple(
+            torch.tensor(
+                [command.robot.joint_names.index(name) for name in names],
+                dtype=torch.long,
+                device=command.device,
+            )
+            for names in joint_signature
+        )
+        command._terminal_ankle_surface_joint_ids = (joint_signature, resolved_joint_ids)
+    else:
+        resolved_joint_ids = cached_joint_ids[1]
+    support = platform_foot_support_state(
+        env,
+        command.robot,
+        command.device,
+        platform_cfg,
+        base_size,
+        platform_support_params,
+        min_upward_force=min_upward_force,
+        sole_height_tolerance=sole_height_tolerance,
+    )
+    per_foot_velocity_scores: list[torch.Tensor] = []
+    for joint_ids in resolved_joint_ids:
+        joint_scores = torch.rsqrt(
+            1.0 + torch.square(torch.abs(command.robot_joint_vel[:, joint_ids]) / speed_scale)
+        )
+        per_foot_velocity_scores.append(joint_scores.amin(dim=1))
+    ankle_velocity_score = torch.stack(per_foot_velocity_scores, dim=1)
+    per_foot_score = support.dense_surface_score * ankle_velocity_score
+    static_tail = _expert_static_tail_gate(
+        command,
+        reference_max_joint_speed,
+        static_window_time_s,
+        env.step_dt,
+        ramp_time_s,
+    )
+    alignment_complete = _terminal_platform_alignment_gate(command).to(dtype=per_foot_score.dtype)
+    tiny = torch.finfo(per_foot_score.dtype).tiny
+    bilateral_score = per_foot_score.shape[1] / torch.sum(
+        torch.reciprocal(per_foot_score.clamp_min(tiny)), dim=1
+    )
+    return alignment_complete * static_tail * bilateral_score
 
 
 def final_standing_stability(

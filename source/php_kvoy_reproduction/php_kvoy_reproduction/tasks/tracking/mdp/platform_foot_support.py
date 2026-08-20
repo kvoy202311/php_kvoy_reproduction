@@ -11,6 +11,7 @@ the same physical definition.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -25,6 +26,8 @@ from php_kvoy_reproduction.tasks.tracking.mdp.obstacle_geometry import (
     filtered_platform_force_score,
     foot_sole_corners_world,
     foothold_safety_score,
+    sole_surface_alignment_score,
+    sole_surface_shaping_score,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +45,8 @@ class PlatformFootSupportSettings(NamedTuple):
     min_forefoot_inside: float
     far_edge_margin: float
     lateral_margin: float
+    surface_tilt_scale: float
+    surface_height_scale: float
 
 
 class PlatformFootSupportState(NamedTuple):
@@ -54,8 +59,15 @@ class PlatformFootSupportState(NamedTuple):
     sole_geometry_score: torch.Tensor
     sole_geometry_valid: torch.Tensor
     sole_plane_height_error: torch.Tensor
+    sole_surface_score: torch.Tensor
+    sole_surface_valid: torch.Tensor
+    sole_surface_height_error: torch.Tensor
+    dense_surface_score: torch.Tensor
+    sole_height_spread: torch.Tensor
+    sole_closest_height_error: torch.Tensor
     platform_forces_w: torch.Tensor
     upward_forces: torch.Tensor
+    contact_support: torch.Tensor
     active_support: torch.Tensor
 
 
@@ -77,6 +89,8 @@ def platform_foot_support_settings(params: Mapping[str, object]) -> PlatformFoot
         "min_forefoot_inside",
         "far_edge_margin",
         "lateral_margin",
+        "surface_tilt_scale",
+        "surface_height_scale",
     )
     missing = [key for key in required_keys if key not in params]
     if missing:
@@ -113,6 +127,10 @@ def platform_foot_support_settings(params: Mapping[str, object]) -> PlatformFoot
     for name in ("max_heel_overhang", "min_forefoot_inside", "far_edge_margin", "lateral_margin"):
         if float(params[name]) < 0.0:
             raise ValueError(f"platform-foot support setting {name} must be non-negative, got {params[name]}.")
+    for name in ("surface_tilt_scale", "surface_height_scale"):
+        value = float(params[name])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"platform-foot support setting {name} must be positive and finite, got {value}.")
 
     return PlatformFootSupportSettings(
         foot_body_names=foot_body_names,
@@ -123,6 +141,8 @@ def platform_foot_support_settings(params: Mapping[str, object]) -> PlatformFoot
         min_forefoot_inside=float(params["min_forefoot_inside"]),
         far_edge_margin=float(params["far_edge_margin"]),
         lateral_margin=float(params["lateral_margin"]),
+        surface_tilt_scale=float(params["surface_tilt_scale"]),
+        surface_height_scale=float(params["surface_height_scale"]),
     )
 
 
@@ -143,7 +163,7 @@ def platform_foot_support_state(
 
     * its real sole is inside the safe platform footprint (including the
       requested 5 cm maximum heel overhang);
-    * its lowest sole point is close to the physical platform top;
+    * every configured sole sample is close to the physical platform top;
     * the force from *ClimbPlatform* has a sufficient positive world-z
       component.
 
@@ -192,12 +212,25 @@ def platform_foot_support_state(
         lateral_margin=settings.lateral_margin,
     )
 
-    # ``foothold_safety_score`` permits the user-approved 5 cm rear overhang.
-    # The terminal task additionally needs a genuine top-surface proximity;
-    # using the lowest sole point is robust to a still-pitched landing foot and
-    # never mistakes the ankle origin for contact geometry.
+    # Keep a permissive forefoot-contact fact for the transient landing phase,
+    # but require the complete sampled sole to approach the surface before the
+    # foot becomes load-bearing support for progress or terminal quality.
     platform_top = platform.data.root_pos_w[:, 2] + 0.5 * sizes[:, 2]
     sole_plane_height_error = sole_corners_w[..., 2].amin(dim=-1) - platform_top[:, None]
+    sole_surface_score, sole_surface_valid, sole_surface_height_error = sole_surface_alignment_score(
+        sole_corners_w,
+        platform.data.root_pos_w,
+        sizes,
+        height_std=sole_height_tolerance,
+        height_tolerance=sole_height_tolerance,
+    )
+    dense_surface_score, sole_height_spread, sole_closest_height_error = sole_surface_shaping_score(
+        sole_corners_w,
+        platform.data.root_pos_w,
+        sizes,
+        tilt_scale=settings.surface_tilt_scale,
+        height_scale=settings.surface_height_scale,
+    )
 
     platform_forces: list[torch.Tensor] = []
     for sensor_name in settings.platform_contact_sensor_names:
@@ -217,11 +250,15 @@ def platform_foot_support_state(
         platform_forces.append(force_matrix[:, 0].sum(dim=1))
     platform_forces_w = torch.stack(platform_forces, dim=1)
     upward_forces = platform_forces_w[..., 2].clamp_min(0.0)
-    active_support = (
-        sole_geometry_valid
-        & (sole_plane_height_error.abs() <= sole_height_tolerance)
-        & (upward_forces >= min_upward_force)
+    # This permissive physical-contact fact is used only to complete the
+    # source-to-terrain handoff.  It deliberately ignores footprint safety so
+    # an already contacting foot is not pulled back toward bad source tilt.
+    # Unsafe placement still cannot satisfy ``active_support`` below and thus
+    # cannot earn progress, contact time, or terminal success.
+    contact_support = (sole_plane_height_error.abs() <= sole_height_tolerance) & (
+        upward_forces >= min_upward_force
     )
+    active_support = sole_geometry_valid & sole_surface_valid & (upward_forces >= min_upward_force)
 
     return PlatformFootSupportState(
         settings=settings,
@@ -231,8 +268,15 @@ def platform_foot_support_state(
         sole_geometry_score=sole_geometry_score,
         sole_geometry_valid=sole_geometry_valid,
         sole_plane_height_error=sole_plane_height_error,
+        sole_surface_score=sole_surface_score,
+        sole_surface_valid=sole_surface_valid,
+        sole_surface_height_error=sole_surface_height_error,
+        dense_surface_score=dense_surface_score,
+        sole_height_spread=sole_height_spread,
+        sole_closest_height_error=sole_closest_height_error,
         platform_forces_w=platform_forces_w,
         upward_forces=upward_forces,
+        contact_support=contact_support,
         active_support=active_support,
     )
 
@@ -260,8 +304,8 @@ def platform_foot_support_score(
 
     force_score = filtered_platform_force_score(state.platform_forces_w, min_upward_force=min_upward_force)
     time_score = (filtered_contact_time / contact_time_scale).clamp(min=0.0, max=1.0)
-    height_score = torch.exp(-0.5 * torch.square(state.sole_plane_height_error / sole_height_tolerance))
-    return state.sole_geometry_score * height_score * force_score * time_score
+    strict_mask = state.active_support.to(dtype=force_score.dtype)
+    return state.sole_geometry_score * state.sole_surface_score * force_score * time_score * strict_mask
 
 
 def platform_foot_load_score(

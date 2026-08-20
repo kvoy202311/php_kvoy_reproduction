@@ -64,6 +64,8 @@ def _load_rewards_module():
     obstacle_geometry.foothold_precontact_score = lambda *_args, **_kwargs: None
     obstacle_geometry.foothold_safety_score = lambda *_args, **_kwargs: None
     obstacle_geometry.foothold_safety_violation = lambda *_args, **_kwargs: None
+    obstacle_geometry.sole_surface_alignment_score = lambda *_args, **_kwargs: None
+    obstacle_geometry.sole_surface_shaping_score = lambda *_args, **_kwargs: None
     obstacle_geometry.sole_top_height_score = lambda *_args, **_kwargs: None
     platform_foot_support = stubs["php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support"]
     platform_foot_support.platform_foot_load_score = lambda *_args, **_kwargs: None
@@ -115,7 +117,8 @@ class FirstFootholdTrackingFadeTest(unittest.TestCase):
             )
         )
         body_indexes = [0, 1, 2, 3, 4]
-        gates = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        gate_values = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        gates = rewards._FirstFootholdTrackingGates(gate_values, gate_values)
         body_weights = {
             "l_knee_y_link": 0.65,
             "l_ankle_x_link": 0.25,
@@ -140,11 +143,174 @@ class FirstFootholdTrackingFadeTest(unittest.TestCase):
             terminal_weights,
             command,
             body_indexes,
-            gates[:1],
+            rewards._FirstFootholdTrackingGates(gates.precontact[:1], gates.physical_contact[:1]),
             ("l_ankle_x_link", "r_ankle_x_link"),
             body_weights,
         )
         self.assertAlmostEqual(preserved_floor[0, 1].item(), 0.15, places=6)
+
+    def test_physical_platform_contact_keeps_adaptive_handoff_after_reference_window_closes(self):
+        command = SimpleNamespace(
+            robot=object(),
+            device="cpu",
+            motion=SimpleNamespace(
+                motion_start_idx=torch.tensor([0]),
+                motion_lengths=torch.tensor([101]),
+            ),
+            motion_ids=torch.tensor([0]),
+            time_steps=torch.tensor([50]),
+        )
+        state = SimpleNamespace(
+            settings=SimpleNamespace(
+                foot_body_names=("l_ankle_x_link", "r_ankle_x_link"),
+                min_upward_force=10.0,
+                foot_height_std=0.06,
+                phase_start=0.28,
+                phase_ramp=0.08,
+                phase_end=0.72,
+                phase_fade=0.10,
+            ),
+            reference_gate=torch.zeros(1),
+            reference_lead_mask=torch.tensor([[1.0, 0.0]]),
+            precontact_scores=torch.tensor([[0.0, 0.7]]),
+        )
+        support = SimpleNamespace(
+            settings=SimpleNamespace(foot_body_names=("l_ankle_x_link", "r_ankle_x_link")),
+            contact_support=torch.tensor([[True, False]]),
+        )
+        with (
+            patch.object(rewards, "_first_foothold_state", return_value=state),
+            patch.object(rewards, "platform_foot_support_state", return_value=support),
+        ):
+            gates, _ = rewards._first_foothold_tracking_gates(
+                SimpleNamespace(),
+                command,
+                _SceneEntityCfg("platform"),
+                (0.51, 0.8, 0.66),
+                {},
+            )
+
+        torch.testing.assert_close(gates.precontact, torch.tensor([[0.0, 0.7]]))
+        torch.testing.assert_close(gates.physical_contact, torch.tensor([[1.0, 0.0]]))
+
+    def test_position_handoff_can_preserve_expert_xy_while_releasing_source_z(self):
+        command = SimpleNamespace(
+            cfg=SimpleNamespace(body_names=["l_ankle_x_link", "torso_link"])
+        )
+        body_indexes = [0, 1]
+        gates = rewards._FirstFootholdTrackingGates(
+            torch.tensor([[1.0, 0.0]]),
+            torch.zeros(1, 2),
+        )
+        error = torch.ones(1, 2)
+
+        horizontal = rewards._terminal_body_tracking_weights(
+            error,
+            command,
+            body_indexes,
+            [],
+            1.0,
+            torch.zeros(1),
+            gates,
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            {"l_ankle_x_link": 0.75},
+        )
+        vertical = rewards._terminal_body_tracking_weights(
+            error,
+            command,
+            body_indexes,
+            [],
+            1.0,
+            torch.zeros(1),
+            gates,
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            {"l_ankle_x_link": 0.0},
+        )
+
+        torch.testing.assert_close(horizontal, torch.tensor([[0.75, 1.0]]))
+        torch.testing.assert_close(vertical, torch.tensor([[0.0, 1.0]]))
+
+    def test_precontact_floor_is_retained_until_real_platform_contact(self):
+        command = SimpleNamespace(cfg=SimpleNamespace(body_names=["l_ankle_x_link"]))
+        error = torch.ones(1, 1)
+        precontact_only = rewards._FirstFootholdTrackingGates(
+            torch.ones(1, 2),
+            torch.zeros(1, 2),
+        )
+        physical_contact = rewards._FirstFootholdTrackingGates(
+            torch.ones(1, 2),
+            torch.tensor([[1.0, 0.0]]),
+        )
+
+        precontact_weights = rewards._terminal_body_tracking_weights(
+            error,
+            command,
+            [0],
+            [],
+            1.0,
+            torch.zeros(1),
+            precontact_only,
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            {"l_ankle_x_link": 0.0},
+            {"l_ankle_x_link": 0.25},
+        )
+        contact_weights = rewards._terminal_body_tracking_weights(
+            error,
+            command,
+            [0],
+            [],
+            1.0,
+            torch.zeros(1),
+            physical_contact,
+            ("l_ankle_x_link", "r_ankle_x_link"),
+            {"l_ankle_x_link": 0.0},
+            {"l_ankle_x_link": 0.25},
+        )
+
+        torch.testing.assert_close(precontact_weights, torch.tensor([[0.25]]))
+        torch.testing.assert_close(contact_weights, torch.tensor([[0.0]]))
+
+
+class AnkleSurfaceSettlingTest(unittest.TestCase):
+    def test_static_toe_pose_cannot_maximize_ankle_settling(self):
+        command = SimpleNamespace(
+            robot=SimpleNamespace(
+                joint_names=[
+                    "l_ankle_y_joint",
+                    "l_ankle_x_joint",
+                    "r_ankle_y_joint",
+                    "r_ankle_x_joint",
+                ]
+            ),
+            robot_joint_vel=torch.zeros(2, 4),
+            device="cpu",
+            time_steps=torch.tensor([99, 99]),
+        )
+        env = SimpleNamespace(command_manager=_CommandManager(command), step_dt=0.02)
+        support = SimpleNamespace(dense_surface_score=torch.tensor([[1.0, 1.0], [0.2, 0.2]]))
+        with (
+            patch.object(rewards, "platform_foot_support_state", return_value=support),
+            patch.object(rewards, "_expert_static_tail_gate", return_value=torch.ones(2)),
+        ):
+            reward = rewards.final_ankle_surface_settling(
+                env=env,
+                command_name="motion",
+                platform_cfg=_SceneEntityCfg("platform"),
+                base_size=(0.51, 0.8, 0.66),
+                platform_support_params={},
+                min_upward_force=10.0,
+                sole_height_tolerance=0.03,
+                reference_max_joint_speed=0.1,
+                static_window_time_s=0.5,
+                ramp_time_s=0.1,
+                ankle_joint_names=(
+                    ("l_ankle_y_joint", "l_ankle_x_joint"),
+                    ("r_ankle_y_joint", "r_ankle_x_joint"),
+                ),
+                speed_scale=0.5,
+            )
+
+        torch.testing.assert_close(reward, torch.tensor([1.0, 0.2]))
 
 
 class TerminalDefaultPoseModeGateTest(unittest.TestCase):
