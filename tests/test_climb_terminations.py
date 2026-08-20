@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import math
 import sys
 import types
@@ -311,6 +312,7 @@ def _call_success_term(
         "group_pose_rms_thresholds": _POSE_RMS_THRESHOLDS,
         "group_pose_max_thresholds": _POSE_MAX_THRESHOLDS,
         "group_velocity_rms_thresholds": _VELOCITY_RMS_THRESHOLDS,
+        "expert_pose_exempt_groups": tuple(term._expert_pose_exempt_groups),
         "max_torso_orientation_error": 0.20,
         "max_expert_joint_pos_rms": max_expert_joint_pos_rms,
     }
@@ -319,6 +321,19 @@ def _call_success_term(
 
 
 class MotionEndSuccessTest(unittest.TestCase):
+    def test_manager_call_signature_accepts_expert_pose_exempt_groups(self):
+        parameter = inspect.signature(terminations.motion_end_success.__call__).parameters[
+            "expert_pose_exempt_groups"
+        ]
+
+        self.assertEqual(parameter.default, ())
+
+    def test_runtime_exempt_groups_cannot_change_after_construction(self):
+        term, env, _ = _make_success_term()
+
+        with self.assertRaisesRegex(ValueError, "changed after construction"):
+            _call_success_term(term, env, expert_pose_exempt_groups=("right_leg",))
+
     def _standing_result(self, valid, invalid_condition="feet_inside"):
         conditions = {
             "feet_inside": torch.ones_like(valid),

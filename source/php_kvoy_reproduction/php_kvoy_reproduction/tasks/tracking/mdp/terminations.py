@@ -660,6 +660,7 @@ class motion_end_success(ManagerTermBase):
         group_pose_max_thresholds: Mapping[str, float],
         group_velocity_rms_thresholds: Mapping[str, float],
         max_torso_orientation_error: float,
+        expert_pose_exempt_groups: Sequence[str] = (),
         platform_support_params: Mapping[str, object] | None = None,
         sole_height_tolerance: float | None = None,
         min_total_load_fraction: float = 0.0,
@@ -690,6 +691,14 @@ class motion_end_success(ManagerTermBase):
         if tuple(joint_groups) != tuple(self._quality_joint_group_ids):
             raise ValueError(
                 "motion_end_success joint_groups changed after construction; recreate the environment."
+            )
+        runtime_exempt_groups = tuple(expert_pose_exempt_groups)
+        if len(set(runtime_exempt_groups)) != len(runtime_exempt_groups):
+            raise ValueError("expert_pose_exempt_groups must not contain duplicate names.")
+        if frozenset(runtime_exempt_groups) != self._expert_pose_exempt_groups:
+            raise ValueError(
+                "motion_end_success expert_pose_exempt_groups changed after construction; "
+                "recreate the environment."
             )
 
         command: MotionCommand = env.command_manager.get_term(command_name)
