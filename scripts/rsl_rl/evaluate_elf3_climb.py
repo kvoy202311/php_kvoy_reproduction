@@ -124,6 +124,11 @@ def _read_motion_metadata(files: tuple[Path, ...]) -> tuple[float, list[int]]:
 
 def _configure_obstacles(env_cfg: ManagerBasedRLEnvCfg, randomized: bool) -> None:
     if randomized:
+        env_cfg.events.platform_pose.params["position_range"] = {
+            "x": ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE,
+            "y": ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE,
+        }
+        env_cfg.events.platform_pose.params["yaw_range"] = ELF3_CLIMB_PLATFORM_YAW_RANGE
         return
     length, width, height = ELF3_CLIMB_PLATFORM_SIZE
     env_cfg.events.platform_geometry.params["length_range"] = (length, length)

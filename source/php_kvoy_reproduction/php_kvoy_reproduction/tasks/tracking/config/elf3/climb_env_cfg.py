@@ -4,7 +4,6 @@ import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -255,11 +254,11 @@ ELF3_CLIMB_PLATFORM_CENTER = (-0.95, 0.0, 0.33)
 ELF3_CLIMB_PLATFORM_LENGTH_RANGE = (0.51, 0.51)
 ELF3_CLIMB_PLATFORM_WIDTH_RANGE = (0.80, 0.80)
 ELF3_CLIMB_PLATFORM_HEIGHT_RANGE = (0.66, 0.66)
-# Geometry is fixed in this source-aligned run.  The deterministic 10% mask
-# selects environments that may start at a random motion phase; the other 90%
-# are forced to start at the clip beginning.  It is an initialization partition,
-# not a nominal-versus-randomized geometry partition.
-ELF3_CLIMB_RANDOM_PHASE_ENV_FRACTION = 0.1
+# Geometry is fixed in this source-aligned run.  Every environment may start
+# from a uniformly sampled source phase so the short static tail receives the
+# same direct reset coverage as the dynamic climb.  This is an initialization
+# mask, not a nominal-versus-randomized geometry partition.
+ELF3_CLIMB_RANDOM_PHASE_ENV_FRACTION = 1.0
 # Backward-compatible import alias for external configurations written before
 # the phase mask was named explicitly.  New code must use the name above.
 ELF3_CLIMB_NOMINAL_GEOMETRY_ENV_FRACTION = ELF3_CLIMB_RANDOM_PHASE_ENV_FRACTION
@@ -307,45 +306,13 @@ ELF3_CLIMB_PROGRESS_LIFT_PHASE_END = 0.75
 ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT = 0.65
 ELF3_CLIMB_PROGRESS_LIFT_WEIGHT = 0.35
 ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
-# The final source pose is already a natural stable posture.  Each joint is
-# scored before the group mean, the worst joints receive an explicit share,
-# and the weighted harmonic result is blended strongly with the worst of the
-# seven anatomical groups.  A bad arm or isolated leg joint can therefore no
-# longer hide behind already-correct groups or a low normal leg weight.
-# The inverse-square-root tail retains useful gradients for resumed policies
-# whose shoulders or wrists are still several radians from the expert pose.
-ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT = 6.0
-ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT = 2.5
-ELF3_CLIMB_FINAL_ANKLE_SURFACE_SETTLING_REWARD_WEIGHT = 0.5
-ELF3_CLIMB_FINAL_ROOT_ORIENTATION_REWARD_WEIGHT = 2.0
-ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_REWARD_WEIGHT = 1.0
-ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_REWARD_WEIGHT = 1.5
+# Foot-surface shaping remains physical and terrain-conditioned throughout the
+# climb.  The authored whole-body pose and velocity rewards remain continuous
+# through the source tail; no extra phase-gated terminal objective is added.
 ELF3_CLIMB_FINAL_FOOT_SURFACE_REWARD_WEIGHT = 4.0
 ELF3_CLIMB_FINAL_FOOT_SURFACE_YAW_STD = 0.35
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S = 0.50
-ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S = 0.10
 ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED = 0.10
-# Expert-pose correction must not become weaker merely because the current
-# robot has poor support.  Physical support remains an independent reward and
-# a mandatory terminal-quality condition.
-ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR = 1.0
-ELF3_CLIMB_FINAL_SCORE_EXPONENT = 0.5
-ELF3_CLIMB_FINAL_WORST_JOINT_COUNT = {
-    "waist": 1,
-    "left_arm": 1,
-    "right_arm": 1,
-    "left_leg": 1,
-    "right_leg": 1,
-    "left_ankle": 1,
-    "right_ankle": 1,
-}
-ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT = 0.75
-ELF3_CLIMB_FINAL_GROUP_AGGREGATION = "harmonic"
-ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT = 0.75
-ELF3_CLIMB_FINAL_SPEED_POSE_QUALITY_FLOOR = 0.25
-ELF3_CLIMB_FINAL_ROOT_ORIENTATION_STD = 0.20
-ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_STD = 0.20
-ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_STD = 0.30
 ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS = {
     "waist": ["waist_y_joint", "waist_x_joint", "waist_z_joint"],
     "left_arm": [
@@ -387,52 +354,6 @@ ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS = {
         "r_ankle_x_joint",
     ],
 }
-ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS = {
-    "waist": 0.35,
-    "left_arm": 0.45,
-    "right_arm": 0.45,
-    "left_leg": 0.70,
-    "right_leg": 0.70,
-    "left_ankle": 0.70,
-    "right_ankle": 0.70,
-}
-ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS = {
-    "waist": 2.0,
-    "left_arm": 2.0,
-    "right_arm": 2.0,
-    "left_leg": 0.75,
-    "right_leg": 0.75,
-    # Expert ankle pitch/roll is deliberately not an objective.  Physical
-    # sole alignment below replaces it without weakening hip/knee tracking.
-    "left_ankle": 0.0,
-    "right_ankle": 0.0,
-}
-ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS = {
-    "waist": 0.30,
-    "left_arm": 0.45,
-    "right_arm": 0.45,
-    "left_leg": 0.70,
-    "right_leg": 0.70,
-    "left_ankle": 0.50,
-    "right_ankle": 0.50,
-}
-ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS = {
-    "waist": 2.0,
-    "left_arm": 2.0,
-    "right_arm": 2.0,
-    "left_leg": 0.50,
-    "right_leg": 0.50,
-    # Ankle settling is terrain-conditioned by a dedicated term below.  Zero
-    # here prevents a motionless toe stand from maximizing generic settling.
-    "left_ankle": 0.0,
-    "right_ankle": 0.0,
-}
-ELF3_CLIMB_FINAL_ANKLE_JOINT_NAMES = (
-    ("l_ankle_y_joint", "l_ankle_x_joint"),
-    ("r_ankle_y_joint", "r_ankle_x_joint"),
-)
-ELF3_CLIMB_FINAL_ANKLE_SPEED_SCALE = 0.50
-
 # A completed clip is classified from the authored static tail; no post-expert
 # hold is added.  These are deliberately broad first-stage quality limits: the
 # group RMS checks tolerate physical balance corrections, while the per-group
@@ -472,15 +393,6 @@ ELF3_CLIMB_FINAL_QUALITY_VELOCITY_RMS_THRESHOLDS = {
     "right_ankle": 0.80,
 }
 ELF3_CLIMB_FINAL_QUALITY_EXPERT_POSE_EXEMPT_GROUPS = ("left_ankle", "right_ankle")
-
-
-# Three performance-gated reset-pose stages: fixed, half range, full range.
-# Collider sizes remain distributed at prestartup because PhysX collider scale
-# cannot be changed safely by a reset-time curriculum.
-ELF3_CLIMB_TERRAIN_CURRICULUM_STAGE_SCALES = (0.0, 0.5, 1.0)
-ELF3_CLIMB_TERRAIN_CURRICULUM_ADVANCE_SUCCESS_RATE = 0.80
-ELF3_CLIMB_TERRAIN_CURRICULUM_REGRESS_SUCCESS_RATE = 0.50
-ELF3_CLIMB_TERRAIN_CURRICULUM_MIN_EPISODES = 8192
 
 
 ##
@@ -625,12 +537,10 @@ class ELF3ClimbCommandsCfg:
         joint_position_range=(0.0, 0.0),
         terminate_on_motion_end=True,
         motion_end_hold_time_s=ELF3_CLIMB_FINAL_HOLD_TIME_S,
-        # Physical failures remain automatic.  A complete-start clip whose
-        # authored static tail is not high-quality is additionally recorded at
-        # the final phase bin.  Random-phase clips are deliberately excluded
-        # from this classifier because they may begin with too little time to
-        # satisfy the contact/stability durations.
-        adaptive_failure_term_names=("motion_end_failure",),
+        # Uniform source-phase resets avoid concentrating training on a single
+        # adaptive failure bin.  End-of-clip quality remains diagnostic only.
+        use_adaptive_sampling=False,
+        adaptive_failure_term_names=(),
         random_phase_env_mask_attr="_climb_box_random_phase_env_mask",
         reference_transform_asset_name="platform",
         reference_transform_nominal_xy=ELF3_CLIMB_PLATFORM_CENTER[:2],
@@ -678,16 +588,6 @@ class ELF3ClimbObservationsCfg:
             params={"command_name": "motion"},
             noise=Unoise(n_min=0.0, n_max=0.0),
         )
-        terminal_default_pose_alpha = ObsTerm(
-            func=mdp.terminal_default_pose_alpha,
-            params={"command_name": "motion"},
-            noise=Unoise(n_min=0.0, n_max=0.0),
-        )
-        terminal_default_pose_active = ObsTerm(
-            func=mdp.terminal_default_pose_active,
-            params={"command_name": "motion"},
-            noise=Unoise(n_min=0.0, n_max=0.0),
-        )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=0.0, n_max=0.0))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=0.0, n_max=0.0))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=0.0, n_max=0.0))
@@ -716,8 +616,6 @@ class ELF3ClimbObservationsCfg:
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
-        terminal_default_pose_alpha = ObsTerm(func=mdp.terminal_default_pose_alpha, params={"command_name": "motion"})
-        terminal_default_pose_active = ObsTerm(func=mdp.terminal_default_pose_active, params={"command_name": "motion"})
         body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
         body_ori = ObsTerm(func=mdp.robot_body_ori_b, params={"command_name": "motion"})
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
@@ -768,11 +666,10 @@ class ELF3ClimbEventCfg:
             "asset_cfg": SceneEntityCfg("platform"),
             "base_center_xy": ELF3_CLIMB_PLATFORM_CENTER[:2],
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
-            "position_range": {
-                "x": ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE,
-                "y": ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE,
-            },
-            "yaw_range": ELF3_CLIMB_PLATFORM_YAW_RANGE,
+            # Keep source training aligned to the fixed 0.66 m demonstration
+            # platform.  Randomized evaluation may override these ranges.
+            "position_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
+            "yaw_range": (0.0, 0.0),
         },
     )
 
@@ -953,126 +850,6 @@ class ELF3ClimbRewardsCfg:
             "yaw_std": ELF3_CLIMB_FINAL_FOOT_SURFACE_YAW_STD,
         },
     )
-    final_expert_joint_pose = RewTerm(
-        func=mdp.final_grouped_expert_joint_position_error_exp,
-        weight=ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "platform_cfg": SceneEntityCfg("platform"),
-            "contact_sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=["l_ankle_x_link", "r_ankle_x_link"],
-            ),
-            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
-            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
-            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
-            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
-            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
-            "group_stds": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS,
-            "group_weights": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS,
-            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
-            "worst_joint_count": ELF3_CLIMB_FINAL_WORST_JOINT_COUNT,
-            "worst_joint_weight": ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT,
-            "group_aggregation": ELF3_CLIMB_FINAL_GROUP_AGGREGATION,
-            "worst_group_weight": ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT,
-            "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
-            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
-            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
-        },
-    )
-    final_actual_joint_velocity = RewTerm(
-        func=mdp.final_grouped_actual_joint_velocity_exp,
-        weight=ELF3_CLIMB_FINAL_ACTUAL_JOINT_VELOCITY_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "platform_cfg": SceneEntityCfg("platform"),
-            "contact_sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=["l_ankle_x_link", "r_ankle_x_link"],
-            ),
-            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
-            "foot_body_names": ["l_ankle_x_link", "r_ankle_x_link"],
-            "footprint_inset": ELF3_CLIMB_FOOTPRINT_INSET,
-            "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
-            "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
-            "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "joint_groups": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS,
-            "group_stds": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_STDS,
-            "group_weights": ELF3_CLIMB_FINAL_ACTUAL_VELOCITY_GROUP_WEIGHTS,
-            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
-            "worst_joint_count": ELF3_CLIMB_FINAL_WORST_JOINT_COUNT,
-            "worst_joint_weight": ELF3_CLIMB_FINAL_WORST_JOINT_WEIGHT,
-            "group_aggregation": ELF3_CLIMB_FINAL_GROUP_AGGREGATION,
-            "worst_group_weight": ELF3_CLIMB_FINAL_WORST_GROUP_WEIGHT,
-            "pose_quality_floor": ELF3_CLIMB_FINAL_SPEED_POSE_QUALITY_FLOOR,
-            "pose_quality_group_stds": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_STDS,
-            "pose_quality_group_weights": ELF3_CLIMB_FINAL_EXPERT_POSE_GROUP_WEIGHTS,
-            "support_floor": ELF3_CLIMB_FINAL_EXPERT_SUPPORT_FLOOR,
-            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
-            "min_total_load_fraction": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_MIN_TOTAL_LOAD_FRACTION,
-        },
-    )
-    final_ankle_surface_settling = RewTerm(
-        func=mdp.final_ankle_surface_settling,
-        weight=ELF3_CLIMB_FINAL_ANKLE_SURFACE_SETTLING_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "platform_cfg": SceneEntityCfg("platform"),
-            "base_size": ELF3_CLIMB_PLATFORM_SIZE,
-            "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
-            "min_upward_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
-            "sole_height_tolerance": ELF3_CLIMB_SOLE_SURFACE_HEIGHT_TOLERANCE,
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "ankle_joint_names": ELF3_CLIMB_FINAL_ANKLE_JOINT_NAMES,
-            "speed_scale": ELF3_CLIMB_FINAL_ANKLE_SPEED_SCALE,
-        },
-    )
-    final_expert_root_orientation = RewTerm(
-        func=mdp.final_expert_root_orientation_error_exp,
-        weight=ELF3_CLIMB_FINAL_ROOT_ORIENTATION_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "std": ELF3_CLIMB_FINAL_ROOT_ORIENTATION_STD,
-            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
-        },
-    )
-    final_expert_root_linear_velocity = RewTerm(
-        func=mdp.final_expert_root_linear_velocity_error_exp,
-        weight=ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "std": ELF3_CLIMB_FINAL_ROOT_LINEAR_VELOCITY_STD,
-            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
-        },
-    )
-    final_expert_root_angular_velocity = RewTerm(
-        func=mdp.final_expert_root_angular_velocity_error_exp,
-        weight=ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_REWARD_WEIGHT,
-        params={
-            "command_name": "motion",
-            "reference_max_joint_speed": ELF3_CLIMB_REFERENCE_STATIC_MAX_JOINT_SPEED,
-            "static_window_time_s": ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S,
-            "ramp_time_s": ELF3_CLIMB_FINAL_EXPERT_REWARD_RAMP_TIME_S,
-            "std": ELF3_CLIMB_FINAL_ROOT_ANGULAR_VELOCITY_STD,
-            "score_exponent": ELF3_CLIMB_FINAL_SCORE_EXPONENT,
-        },
-    )
     first_foothold_support_quality = RewTerm(
         func=mdp.first_foothold_support_quality,
         weight=ELF3_CLIMB_FIRST_FOOTHOLD_REWARD_WEIGHT,
@@ -1221,27 +998,9 @@ class ELF3ClimbTerminationsCfg:
 
 @configclass
 class ELF3ClimbCurriculumCfg:
-    """Performance-gated terrain randomization curriculum."""
+    """No terrain curriculum for the fixed source-aligned training run."""
 
-    platform_pose = CurrTerm(
-        func=mdp.climb_box_pose_curriculum,
-        params={
-            "event_term_name": "platform_pose",
-            # Geometry advances only after a contiguous high-quality source
-            # tail, not merely after reaching the clip boundary.
-            "success_term_name": "motion_end_success",
-            "command_name": "motion",
-            "full_position_range": {
-                "x": ELF3_CLIMB_PLATFORM_X_OFFSET_RANGE,
-                "y": ELF3_CLIMB_PLATFORM_Y_OFFSET_RANGE,
-            },
-            "full_yaw_range": ELF3_CLIMB_PLATFORM_YAW_RANGE,
-            "stage_scales": ELF3_CLIMB_TERRAIN_CURRICULUM_STAGE_SCALES,
-            "advance_success_rate": ELF3_CLIMB_TERRAIN_CURRICULUM_ADVANCE_SUCCESS_RATE,
-            "regress_success_rate": ELF3_CLIMB_TERRAIN_CURRICULUM_REGRESS_SUCCESS_RATE,
-            "min_evaluated_episodes": ELF3_CLIMB_TERRAIN_CURRICULUM_MIN_EPISODES,
-        },
-    )
+    platform_pose = None
 
 
 ##
