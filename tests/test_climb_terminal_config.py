@@ -108,11 +108,77 @@ class ClimbTerminalConfigTest(unittest.TestCase):
             "motion_body_ori",
             "motion_body_lin_vel",
             "motion_body_ang_vel",
+            "motion_joint_pos",
+            "motion_joint_vel",
         ):
             with self.subTest(continuous_expert_reward=reward_name):
                 self.assertIn(reward_name, reward_names)
         self.assertIn("first_foothold_surface_alignment", reward_names)
         self.assertIn("platform_foot_surface_alignment", reward_names)
+
+        continuous_joint_groups = assignments["ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS"]
+        self.assertIsInstance(continuous_joint_groups, ast.Dict)
+        continuous_group_names = {
+            ast.literal_eval(key) for key in continuous_joint_groups.keys
+        }
+        self.assertEqual(
+            continuous_group_names,
+            {"waist", "left_arm", "right_arm", "left_leg", "right_leg"},
+        )
+        self.assertNotIn("left_ankle", continuous_group_names)
+        self.assertNotIn("right_ankle", continuous_group_names)
+        all_joint_names = set(ast.literal_eval(assignments["ELF3_CLIMB_JOINT_NAMES"]))
+        terminal_groups = ast.literal_eval(assignments["ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS"])
+        continuously_tracked_joints = [
+            joint_name
+            for group_name in continuous_group_names
+            for joint_name in terminal_groups[group_name]
+        ]
+        self.assertEqual(len(continuously_tracked_joints), len(set(continuously_tracked_joints)))
+        self.assertEqual(
+            set(continuously_tracked_joints),
+            all_joint_names
+            - {
+                "l_ankle_y_joint",
+                "l_ankle_x_joint",
+                "r_ankle_y_joint",
+                "r_ankle_x_joint",
+            },
+        )
+
+        for reward_name, expected_function in (
+            ("motion_joint_pos", "mdp.motion_grouped_expert_joint_position_error_exp"),
+            ("motion_joint_vel", "mdp.motion_grouped_expert_joint_velocity_error_exp"),
+        ):
+            with self.subTest(continuous_joint_reward=reward_name):
+                assignment = next(
+                    node
+                    for node in rewards_class.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == reward_name for target in node.targets)
+                )
+                reward_keywords = {keyword.arg: keyword.value for keyword in assignment.value.keywords}
+                self.assertEqual(ast.unparse(reward_keywords["func"]), expected_function)
+                reward_params = {
+                    ast.literal_eval(key): value
+                    for key, value in zip(
+                        reward_keywords["params"].keys,
+                        reward_keywords["params"].values,
+                        strict=True,
+                    )
+                }
+                self.assertEqual(
+                    ast.unparse(reward_params["joint_groups"]),
+                    "ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS",
+                )
+                for forbidden_gate in (
+                    "platform_cfg",
+                    "contact_sensor_cfg",
+                    "reference_max_joint_speed",
+                    "static_window_time_s",
+                    "ramp_time_s",
+                ):
+                    self.assertNotIn(forbidden_gate, reward_params)
 
         terminations_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbTerminationsCfg"

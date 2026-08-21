@@ -676,6 +676,50 @@ class GroupedTerminalExpertRewardTest(unittest.TestCase):
         torch.testing.assert_close(rms["left_arm"], torch.tensor([0.0, 1.0]))
         torch.testing.assert_close(maximum["left_leg"], torch.tensor([1.0, 0.0]))
 
+    def test_continuous_rewards_track_expert_q_and_qd_without_a_terminal_gate(self):
+        command = self._command()
+        command.time_steps = torch.tensor([0, 1], dtype=torch.long)
+        command.motion = SimpleNamespace(
+            joint_vel=torch.tensor(
+                [
+                    [0.2, 0.4, -0.4, 0.6, -0.6],
+                    [0.2, 0.4, -0.4, 0.6, -0.6],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        command.robot_joint_vel = command.motion.joint_vel.clone()
+        command.robot_joint_vel[1, 1] = 1.4
+        env = SimpleNamespace(command_manager=_CommandManager(command))
+        scoring = {
+            "score_exponent": 0.5,
+            "worst_joint_count": 1,
+            "worst_joint_weight": 0.5,
+            "group_aggregation": "harmonic",
+            "worst_group_weight": 0.5,
+        }
+
+        pose_reward = rewards.motion_grouped_expert_joint_position_error_exp(
+            env,
+            "motion",
+            self._groups(),
+            self._stds(),
+            self._weights(),
+            **scoring,
+        )
+        velocity_reward = rewards.motion_grouped_expert_joint_velocity_error_exp(
+            env,
+            "motion",
+            self._groups(),
+            self._stds(),
+            self._weights(),
+            **scoring,
+        )
+
+        self.assertGreater(pose_reward[0].item(), pose_reward[1].item())
+        self.assertEqual(velocity_reward[0].item(), 1.0)
+        self.assertLess(velocity_reward[1].item(), 1.0)
+
     def test_joint_groups_must_be_disjoint_and_known(self):
         command = self._command()
         with self.assertRaisesRegex(ValueError, "disjoint"):

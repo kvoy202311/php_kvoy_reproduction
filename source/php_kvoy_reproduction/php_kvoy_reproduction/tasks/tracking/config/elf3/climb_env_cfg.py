@@ -354,6 +354,44 @@ ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS = {
         "r_ankle_x_joint",
     ],
 }
+# Continuous joint-space imitation closes the kinematic null space left by
+# sparse Cartesian body tracking.  Both ankle groups are intentionally absent:
+# their source pitch/roll is unreliable, and the physical sole-surface terms
+# remain the sole authority for adapting those joints to the platform.
+ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS = {
+    "waist": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS["waist"],
+    "left_arm": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS["left_arm"],
+    "right_arm": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS["right_arm"],
+    "left_leg": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS["left_leg"],
+    "right_leg": ELF3_CLIMB_FINAL_EXPERT_JOINT_GROUPS["right_leg"],
+}
+ELF3_CLIMB_EXPERT_JOINT_POSITION_REWARD_WEIGHT = 2.0
+ELF3_CLIMB_EXPERT_JOINT_VELOCITY_REWARD_WEIGHT = 0.5
+ELF3_CLIMB_EXPERT_JOINT_POSITION_GROUP_STDS = {
+    "waist": 0.35,
+    "left_arm": 0.45,
+    "right_arm": 0.45,
+    "left_leg": 0.70,
+    "right_leg": 0.70,
+}
+ELF3_CLIMB_EXPERT_JOINT_VELOCITY_GROUP_STDS = {
+    "waist": 1.0,
+    "left_arm": 2.0,
+    "right_arm": 2.0,
+    "left_leg": 2.0,
+    "right_leg": 2.0,
+}
+ELF3_CLIMB_EXPERT_JOINT_GROUP_WEIGHTS = {
+    "waist": 1.0,
+    "left_arm": 1.0,
+    "right_arm": 1.0,
+    "left_leg": 1.0,
+    "right_leg": 1.0,
+}
+ELF3_CLIMB_EXPERT_JOINT_SCORE_EXPONENT = 0.5
+ELF3_CLIMB_EXPERT_JOINT_WORST_COUNT = 1
+ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT = 0.5
+ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT = 0.5
 # A completed clip is classified from the authored static tail; no post-expert
 # hold is added.  These are deliberately broad first-stage quality limits: the
 # group RMS checks tolerate physical balance corrections, while the per-group
@@ -814,6 +852,36 @@ class ELF3ClimbRewardsCfg:
             "base_size": ELF3_CLIMB_PLATFORM_SIZE,
             "first_foothold_params": ELF3_CLIMB_FIRST_FOOTHOLD_PARAMS,
             "first_foothold_body_weights": ELF3_CLIMB_FIRST_FOOTHOLD_ANGULAR_VELOCITY_TRACKING_WEIGHTS,
+        },
+    )
+    motion_joint_pos = RewTerm(
+        func=mdp.motion_grouped_expert_joint_position_error_exp,
+        weight=ELF3_CLIMB_EXPERT_JOINT_POSITION_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "joint_groups": ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS,
+            "group_stds": ELF3_CLIMB_EXPERT_JOINT_POSITION_GROUP_STDS,
+            "group_weights": ELF3_CLIMB_EXPERT_JOINT_GROUP_WEIGHTS,
+            "score_exponent": ELF3_CLIMB_EXPERT_JOINT_SCORE_EXPONENT,
+            "worst_joint_count": ELF3_CLIMB_EXPERT_JOINT_WORST_COUNT,
+            "worst_joint_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT,
+            "group_aggregation": "harmonic",
+            "worst_group_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT,
+        },
+    )
+    motion_joint_vel = RewTerm(
+        func=mdp.motion_grouped_expert_joint_velocity_error_exp,
+        weight=ELF3_CLIMB_EXPERT_JOINT_VELOCITY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "joint_groups": ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS,
+            "group_stds": ELF3_CLIMB_EXPERT_JOINT_VELOCITY_GROUP_STDS,
+            "group_weights": ELF3_CLIMB_EXPERT_JOINT_GROUP_WEIGHTS,
+            "score_exponent": ELF3_CLIMB_EXPERT_JOINT_SCORE_EXPONENT,
+            "worst_joint_count": ELF3_CLIMB_EXPERT_JOINT_WORST_COUNT,
+            "worst_joint_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT,
+            "group_aggregation": "harmonic",
+            "worst_group_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT,
         },
     )
     platform_foot_contact = RewTerm(

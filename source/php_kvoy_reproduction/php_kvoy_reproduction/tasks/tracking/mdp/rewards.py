@@ -2079,6 +2079,113 @@ def _grouped_expert_joint_pose_score(
     return details.aggregate, details.rms, details.maximum
 
 
+def _grouped_expert_joint_velocity_score_details(
+    command: MotionCommand,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> _GroupedJointScoreDetails:
+    """Score measured joint velocity against the immutable expert velocity."""
+
+    group_ids = _validate_terminal_joint_groups(command, joint_groups, group_stds, group_weights)
+    robot_joint_vel = command.robot_joint_vel
+    target_joint_vel = command.motion.joint_vel[command.time_steps]
+    if target_joint_vel.shape != robot_joint_vel.shape:
+        raise RuntimeError(
+            "Grouped expert velocity reward requires matching expert and robot joint tensors, "
+            f"got {target_joint_vel.shape} and {robot_joint_vel.shape}."
+        )
+
+    return _grouped_joint_score_details(
+        robot_joint_vel,
+        target_joint_vel,
+        joint_groups,
+        group_ids,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
+    )
+
+
+def motion_grouped_expert_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> torch.Tensor:
+    """Continuously track expert joint posture without a terminal mode switch.
+
+    The configured groups deliberately control which joints are constrained.
+    ELF3 climb omits both ankles so physical sole alignment can replace the
+    unreliable source pitch/roll while waist, arms, hips, and knees retain an
+    unambiguous expert target throughout the complete clip.
+    """
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return _grouped_expert_joint_pose_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
+    ).aggregate
+
+
+def motion_grouped_expert_joint_velocity_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    joint_groups: Mapping[str, Sequence[str]],
+    group_stds: Mapping[str, float],
+    group_weights: Mapping[str, float],
+    *,
+    score_exponent: float | None = None,
+    worst_joint_count: int | Mapping[str, int] = 0,
+    worst_joint_weight: float | Mapping[str, float] = 0.0,
+    group_aggregation: str = "arithmetic",
+    worst_group_weight: float = 0.0,
+) -> torch.Tensor:
+    """Continuously track expert joint velocity, including its static tail.
+
+    This compares measured velocity directly with the authored ``qd`` on
+    every frame.  It is not a terminal-only zero-speed or speed-reduction
+    bonus, so the policy cannot create motion in order to earn a later drop.
+    """
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return _grouped_expert_joint_velocity_score_details(
+        command,
+        joint_groups,
+        group_stds,
+        group_weights,
+        score_exponent=score_exponent,
+        worst_joint_count=worst_joint_count,
+        worst_joint_weight=worst_joint_weight,
+        group_aggregation=group_aggregation,
+        worst_group_weight=worst_group_weight,
+    ).aggregate
+
+
 def _grouped_actual_joint_speed_score_details(
     command: MotionCommand,
     joint_groups: Mapping[str, Sequence[str]],
