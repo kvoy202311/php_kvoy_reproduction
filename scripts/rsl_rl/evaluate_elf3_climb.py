@@ -99,7 +99,11 @@ from php_kvoy_reproduction.utils.climb_evaluation_report import (
 )
 
 
-_TERMINAL_TERM_NAMES = ("motion_clip_end",)
+_TERMINAL_TERM_NAMES = (
+    "motion_end_success",
+    "motion_end_failure",
+    "motion_clip_end",
+)
 
 
 def _read_motion_metadata(files: tuple[Path, ...]) -> tuple[float, list[int]]:
@@ -374,7 +378,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
         trial_records = []
         for env_id in range(env.num_envs):
             physically_terminated = bool(recorder.physically_terminated[env_id].item())
-            completed_motion_end = bool(recorder.termination_terms["motion_clip_end"][env_id].item())
+            completed_motion_end = any(
+                bool(recorder.termination_terms[name][env_id].item())
+                for name in _TERMINAL_TERM_NAMES
+            )
             trial_records.append(
                 build_completion_only_trial_record(
                     env_id=env_id,

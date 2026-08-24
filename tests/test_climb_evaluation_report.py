@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import importlib.util
 import json
@@ -16,6 +17,7 @@ _MODULE_PATH = (
     _ROOT
     / "source/php_kvoy_reproduction/php_kvoy_reproduction/utils/climb_evaluation_report.py"
 )
+_EVALUATION_SCRIPT_PATH = _ROOT / "scripts/rsl_rl/evaluate_elf3_climb.py"
 _SPEC = importlib.util.spec_from_file_location("php_kvoy_reproduction_climb_evaluation_report", _MODULE_PATH)
 reporting = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
@@ -77,7 +79,10 @@ class TerminalSnapshotRecorderTest(unittest.TestCase):
     def test_captures_pre_reset_state_once_and_restores_original_method(self):
         class _TerminationManager:
             def __init__(self):
-                self.terminated = torch.tensor([False, True, False])
+                # A clip boundary is now a true task termination.  The
+                # recorder must subtract its named mask while retaining the
+                # unrelated physical termination in environment 1.
+                self.terminated = torch.tensor([True, True, False])
                 self.terms = {"success": torch.tensor([True, False, False])}
 
             def get_term(self, name):
@@ -131,6 +136,24 @@ class TerminalSnapshotRecorderTest(unittest.TestCase):
 
         recorder.uninstall()
         self.assertEqual(env._reset_idx, original_reset)
+
+
+class EvaluationScriptBoundaryContractTest(unittest.TestCase):
+    def test_completion_evaluation_records_every_mutually_exclusive_boundary(self):
+        tree = ast.parse(_EVALUATION_SCRIPT_PATH.read_text(encoding="utf-8"))
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_TERMINAL_TERM_NAMES"
+                for target in node.targets
+            )
+        )
+        self.assertEqual(
+            ast.literal_eval(assignment.value),
+            ("motion_end_success", "motion_end_failure", "motion_clip_end"),
+        )
 
 
 class ClimbEvaluationReportTest(unittest.TestCase):

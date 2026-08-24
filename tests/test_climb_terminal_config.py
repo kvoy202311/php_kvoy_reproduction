@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import ast
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
 
+
+_ROOT = Path(__file__).parents[1]
 _CONFIG_PATH = (
-    Path(__file__).parents[1]
+    _ROOT
     / "source/php_kvoy_reproduction/php_kvoy_reproduction/tasks/tracking/config/elf3/climb_env_cfg.py"
 )
 _COMMANDS_PATH = (
-    Path(__file__).parents[1]
+    _ROOT
     / "source/php_kvoy_reproduction/php_kvoy_reproduction/tasks/tracking/mdp/commands.py"
 )
+_ELF3_URDF_PATH = (
+    _ROOT
+    / "source/php_kvoy_reproduction/php_kvoy_reproduction/assets/elf3/urdf/elf3.urdf"
+)
+_CLIMB_MOTION_DIR = _ROOT / "data/processed_motions/elf3/climb_50hz_default_start_v1"
 
 
 def _top_level_assignments(tree: ast.Module) -> dict[str, ast.expr]:
@@ -208,6 +217,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         for term_name, function_name in (
             ("motion_end_success", "mdp.motion_end_success"),
             ("motion_end_failure", "mdp.motion_end_failure"),
+            ("motion_clip_end", "mdp.motion_clip_end"),
         ):
             with self.subTest(termination=term_name):
                 assignment = next(
@@ -218,7 +228,18 @@ class ClimbTerminalConfigTest(unittest.TestCase):
                 )
                 term_keywords = {keyword.arg: keyword.value for keyword in assignment.value.keywords}
                 self.assertEqual(ast.unparse(term_keywords["func"]), function_name)
-                self.assertTrue(ast.literal_eval(term_keywords["time_out"]))
+                self.assertFalse(ast.literal_eval(term_keywords["time_out"]))
+
+        episode_timeout_assignment = next(
+            node
+            for node in terminations_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "time_out" for target in node.targets)
+        )
+        episode_timeout_keywords = {
+            keyword.arg: keyword.value for keyword in episode_timeout_assignment.value.keywords
+        }
+        self.assertTrue(ast.literal_eval(episode_timeout_keywords["time_out"]))
 
         success_assignment = next(
             node
@@ -259,7 +280,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         }
         self.assertEqual(ast.unparse(motion_clip_end_keywords["func"]), "mdp.motion_clip_end")
         self.assertIsInstance(motion_clip_end_keywords["time_out"], ast.Constant)
-        self.assertTrue(motion_clip_end_keywords["time_out"].value)
+        self.assertFalse(motion_clip_end_keywords["time_out"].value)
         self.assertIsInstance(motion_clip_end_keywords["params"], ast.Dict)
         motion_clip_end_params = {
             ast.literal_eval(key): ast.literal_eval(value)
@@ -325,6 +346,77 @@ class ClimbTerminalConfigTest(unittest.TestCase):
                 self.assertNotIn("first_foothold_height_offsets", term_names)
                 self.assertNotIn("terminal_default_pose_alpha", term_names)
                 self.assertNotIn("terminal_default_pose_active", term_names)
+
+    def test_joint_position_targets_use_hard_limits_after_existing_scale(self):
+        tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))
+        actions_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbActionsCfg"
+        )
+        joint_pos_assignment = next(
+            node
+            for node in actions_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "joint_pos" for target in node.targets)
+        )
+        keywords = {keyword.arg: keyword.value for keyword in joint_pos_assignment.value.keywords}
+
+        self.assertEqual(ast.unparse(keywords["scale"]), "ELF3_CLIMB_ACTION_SCALE")
+        self.assertEqual(ast.unparse(keywords["clip"]), "ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS")
+        self.assertTrue(ast.literal_eval(keywords["use_default_offset"]))
+        self.assertTrue(ast.literal_eval(keywords["preserve_order"]))
+
+    def test_joint_position_target_limits_cover_actions_and_match_urdf(self):
+        tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))
+        assignments = _top_level_assignments(tree)
+        action_joint_names = ast.literal_eval(assignments["ELF3_CLIMB_JOINT_NAMES"])
+        target_limits = ast.literal_eval(assignments["ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS"])
+
+        self.assertEqual(len(action_joint_names), 29)
+        self.assertEqual(len(action_joint_names), len(set(action_joint_names)))
+        self.assertEqual(list(target_limits), action_joint_names)
+        for joint_name, (lower, upper) in target_limits.items():
+            with self.subTest(joint=joint_name):
+                self.assertLess(lower, upper)
+
+        urdf_root = ET.parse(_ELF3_URDF_PATH).getroot()
+        urdf_limits = {}
+        for joint in urdf_root.findall("joint"):
+            joint_name = joint.attrib.get("name")
+            if joint_name not in target_limits:
+                continue
+            limit = joint.find("limit")
+            self.assertIsNotNone(limit, msg=f"URDF joint {joint_name} has no limit element")
+            urdf_limits[joint_name] = (
+                float(limit.attrib["lower"]),
+                float(limit.attrib["upper"]),
+            )
+
+        self.assertEqual(set(urdf_limits), set(action_joint_names))
+        for joint_name, expected_limits in target_limits.items():
+            with self.subTest(urdf_joint=joint_name):
+                self.assertAlmostEqual(urdf_limits[joint_name][0], expected_limits[0], places=7)
+                self.assertAlmostEqual(urdf_limits[joint_name][1], expected_limits[1], places=7)
+
+    def test_climb_expert_joint_positions_are_inside_hard_target_limits(self):
+        tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))
+        assignments = _top_level_assignments(tree)
+        action_joint_names = ast.literal_eval(assignments["ELF3_CLIMB_JOINT_NAMES"])
+        target_limits = ast.literal_eval(assignments["ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS"])
+        lower = np.asarray([target_limits[name][0] for name in action_joint_names])
+        upper = np.asarray([target_limits[name][1] for name in action_joint_names])
+        motion_files = sorted(_CLIMB_MOTION_DIR.glob("*.npz"))
+
+        self.assertTrue(motion_files, msg=f"No climb motions found in {_CLIMB_MOTION_DIR}")
+        for motion_file in motion_files:
+            with self.subTest(motion=motion_file.name), np.load(motion_file, allow_pickle=False) as data:
+                motion_joint_names = [str(name) for name in np.asarray(data["joint_names"]).tolist()]
+                joint_pos = np.asarray(data["joint_pos"])
+                self.assertEqual(motion_joint_names, action_joint_names)
+                self.assertEqual(joint_pos.ndim, 2)
+                self.assertEqual(joint_pos.shape[1], len(action_joint_names))
+                self.assertTrue(np.all(np.isfinite(joint_pos)))
+                self.assertGreaterEqual(float(np.min(joint_pos - lower)), -2.0e-6)
+                self.assertGreaterEqual(float(np.min(upper - joint_pos)), -2.0e-6)
 
     def test_terminal_diagnostic_joint_groups_cover_robot_once(self):
         tree = ast.parse(_CONFIG_PATH.read_text(encoding="utf-8"))

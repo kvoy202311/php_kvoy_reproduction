@@ -48,7 +48,7 @@ def _points_inside_oriented_box_xy(points, box_positions, box_quaternions, box_s
     return torch.all(torch.abs(relative_xy) <= 0.5 * box_sizes[:, None, :2], dim=-1)
 
 
-def _motion_clip_timeout_mask(motion_finished, terminated):
+def _motion_clip_boundary_mask(motion_finished, terminated):
     return motion_finished & ~terminated
 
 
@@ -86,8 +86,8 @@ def _load_terminations_module():
     stub_modules["isaaclab.managers"].SceneEntityCfg = _SceneEntityCfg
     stub_modules["isaaclab.sensors"].ContactSensor = object
     stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.commands"].MotionCommand = object
-    stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.motion_data"].motion_clip_timeout_mask = (
-        _motion_clip_timeout_mask
+    stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.motion_data"].motion_clip_boundary_mask = (
+        _motion_clip_boundary_mask
     )
     stub_modules["php_kvoy_reproduction.tasks.tracking.mdp.obstacle"].get_climb_box_sizes = (
         _get_climb_box_sizes
@@ -153,7 +153,7 @@ class MotionClipEndTerminationTest(unittest.TestCase):
         env.termination_manager.terminated[:] = terminated
         return env
 
-    def test_completed_motion_is_a_timeout_only_when_physics_has_not_terminated(self):
+    def test_completed_motion_is_a_boundary_only_when_physics_has_not_terminated(self):
         env = self._env(
             terminate_on_motion_end=True,
             motion_finished=torch.tensor([True, True, False]),
@@ -164,7 +164,7 @@ class MotionClipEndTerminationTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(result, torch.tensor([True, False, False])))
 
-    def test_disabled_motion_end_never_requests_a_clip_timeout(self):
+    def test_disabled_motion_end_never_requests_a_clip_boundary(self):
         env = self._env(
             terminate_on_motion_end=False,
             motion_finished=torch.tensor([True, True]),
@@ -533,11 +533,15 @@ class MotionEndSuccessTest(unittest.TestCase):
         bad_final = self._standing_result(torch.tensor([True, False, True]))
         success = self._call_frame(term, env, command, 19, finished=True, standing=bad_final)
         env.termination_manager.get_term = lambda name: success
+        env.termination_manager.terminated |= success
         failure = terminations.motion_end_failure(env, "motion", "motion_end_success")
+        env.termination_manager.terminated |= failure
+        generic_boundary = terminations.motion_clip_end(env, "motion")
 
         torch.testing.assert_close(success, torch.tensor([True, False, True]))
         torch.testing.assert_close(failure, torch.tensor([False, True, False]))
         torch.testing.assert_close(success ^ failure, command.motion_finished)
+        torch.testing.assert_close(generic_boundary, torch.zeros(3, dtype=torch.bool))
 
     def test_physical_termination_is_neither_boundary_success_nor_failure(self):
         term, env, command = _make_success_term()
@@ -546,10 +550,14 @@ class MotionEndSuccessTest(unittest.TestCase):
         env.termination_manager.terminated[1] = True
         success = self._call_frame(term, env, command, 19, finished=True)
         env.termination_manager.get_term = lambda name: success
+        env.termination_manager.terminated |= success
         failure = terminations.motion_end_failure(env, "motion", "motion_end_success")
+        env.termination_manager.terminated |= failure
+        generic_boundary = terminations.motion_clip_end(env, "motion")
 
         torch.testing.assert_close(success, torch.tensor([True, False, True]))
         torch.testing.assert_close(failure, torch.zeros(3, dtype=torch.bool))
+        torch.testing.assert_close(generic_boundary, torch.zeros(3, dtype=torch.bool))
 
     def test_random_phase_clip_end_is_neither_quality_success_nor_failure(self):
         term, env, command = _make_success_term()
@@ -559,14 +567,15 @@ class MotionEndSuccessTest(unittest.TestCase):
 
         success = self._call_frame(term, env, command, 19, finished=True)
         env.termination_manager.get_term = lambda name: success
+        env.termination_manager.terminated |= success
         failure = terminations.motion_end_failure(env, "motion", "motion_end_success")
+        env.termination_manager.terminated |= failure
+        generic_boundary = terminations.motion_clip_end(env, "motion")
 
         torch.testing.assert_close(success, torch.tensor([True, False, True]))
         torch.testing.assert_close(failure, torch.zeros(3, dtype=torch.bool))
-        torch.testing.assert_close(
-            terminations.motion_clip_end(env, "motion"),
-            torch.ones(3, dtype=torch.bool),
-        )
+        torch.testing.assert_close(generic_boundary, torch.tensor([False, True, False]))
+        torch.testing.assert_close(success | failure | generic_boundary, command.motion_finished)
 
     def test_terminal_quality_requires_the_complete_trial_marker(self):
         term, env, command = _make_success_term()

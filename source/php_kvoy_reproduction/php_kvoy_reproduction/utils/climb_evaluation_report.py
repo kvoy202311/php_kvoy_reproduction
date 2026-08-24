@@ -29,7 +29,7 @@ COMPLETION_ONLY_CONDITION_NAME = "expert_motion_completed"
 
 
 class TerminalSnapshotRecorder:
-    """Capture the first pre-reset terminal state for every vector environment."""
+    """Capture the first pre-reset state and separate task boundaries from failures."""
 
     def __init__(
         self,
@@ -79,9 +79,19 @@ class TerminalSnapshotRecorder:
             return
         manager = self._env.termination_manager
         self.motion_ids[new_env_ids] = self._command.motion_ids[new_env_ids]
-        self.physically_terminated[new_env_ids] = manager.terminated[new_env_ids]
+        boundary_terminated = torch.zeros(
+            new_env_ids.numel(), dtype=torch.bool, device=self._env.device
+        )
         for name in self._termination_term_names:
-            self.termination_terms[name][new_env_ids] = manager.get_term(name)[new_env_ids]
+            term_value = manager.get_term(name)[new_env_ids]
+            self.termination_terms[name][new_env_ids] = term_value
+            boundary_terminated |= term_value
+        # The recorded clip-boundary terms are true MDP terminations.  Remove
+        # their union from the manager's net termination before classifying a
+        # reset as a physical tracking failure.
+        self.physically_terminated[new_env_ids] = (
+            manager.terminated[new_env_ids] & ~boundary_terminated
+        )
         for key in self._metric_keys:
             self.metrics[key][new_env_ids] = self._command.metrics[key][new_env_ids]
         self.captured[new_env_ids] = True

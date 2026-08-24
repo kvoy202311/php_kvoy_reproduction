@@ -318,14 +318,15 @@ class MotionBoundaryContractTest(unittest.TestCase):
 
         self.assertEqual(selected_frames.tolist(), [3, 5, 12, 6])
 
-    def test_clip_timeout_never_overlaps_a_physical_termination(self):
+    def test_clip_boundary_never_overlaps_an_earlier_termination(self):
         finished = torch.tensor([True, True, False, False])
         terminated = torch.tensor([False, True, True, False])
 
-        timeout = motion_data.motion_clip_timeout_mask(finished, terminated)
+        boundary = motion_data.motion_clip_boundary_mask(finished, terminated)
 
-        self.assertEqual(timeout.tolist(), [True, False, False, False])
-        self.assertFalse(torch.any(timeout & terminated))
+        self.assertEqual(boundary.tolist(), [True, False, False, False])
+        self.assertFalse(torch.any(boundary & terminated))
+        self.assertIs(motion_data.motion_clip_timeout_mask, motion_data.motion_clip_boundary_mask)
 
     def test_adaptive_failure_includes_configured_end_state_failures(self):
         terminated = torch.tensor([False, True, False, False])

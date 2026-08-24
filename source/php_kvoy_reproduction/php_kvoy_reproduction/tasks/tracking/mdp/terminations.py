@@ -17,7 +17,7 @@ from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
 from php_kvoy_reproduction.tasks.tracking.mdp.commands import MotionCommand
-from php_kvoy_reproduction.tasks.tracking.mdp.motion_data import motion_clip_timeout_mask
+from php_kvoy_reproduction.tasks.tracking.mdp.motion_data import motion_clip_boundary_mask
 from php_kvoy_reproduction.tasks.tracking.mdp.obstacle import get_climb_box_sizes, points_inside_oriented_box_xy
 from php_kvoy_reproduction.tasks.tracking.mdp.platform_foot_support import (
     platform_foot_load_valid,
@@ -106,18 +106,18 @@ def bad_motion_body_pos_z_only(
 def motion_clip_end(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Request an episode boundary after the final frame of a motion clip.
 
-    Configure this term with ``time_out=True``.  The clip boundary is an
-    external data boundary rather than a physical failure, so PPO should cut
-    the rollout while retaining value bootstrapping.
+    The end of the authored task is an MDP terminal, so configure this term
+    with ``time_out=False``.  A continuing-state value bootstrap beyond that
+    task horizon would assign the wrong return to the final transition.
     """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
     if not command.cfg.terminate_on_motion_end:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    # Physical-failure terms must be configured before this timeout term.  The
-    # masks are kept mutually exclusive because RSL-RL bootstraps every timeout,
-    # including a timeout that coincides with a true termination.
-    return motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
+    # Physical failures and the more specific success/failure classifiers must
+    # be configured first.  Their accumulated true-termination mask makes all
+    # boundary labels mutually exclusive.
+    return motion_clip_boundary_mask(command.motion_finished, env.termination_manager.terminated)
 
 
 def _expert_joint_position_rms(command: MotionCommand) -> torch.Tensor:
@@ -357,7 +357,7 @@ def _episode_started_at_motion_beginning(command: MotionCommand) -> torch.Tensor
     that starts inside the terminal window may not have enough elapsed time to
     satisfy the contact and contiguous-stability durations.  Such a partial
     trial must therefore be neither a terminal-quality success nor a
-    terminal-quality failure; the generic clip-boundary timeout still ends it.
+    terminal-quality failure; the generic clip-boundary terminal still ends it.
     """
 
     started = getattr(command, "episode_started_at_motion_beginning", None)
@@ -930,8 +930,8 @@ class motion_end_success(ManagerTermBase):
 
         continuously_stable = self._stable_steps >= self._required_stable_steps
         complete_trial = _episode_started_at_motion_beginning(command)
-        clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
-        return clip_timeout & complete_trial & at_final_frame & continuously_stable
+        clip_boundary = motion_clip_boundary_mask(command.motion_finished, env.termination_manager.terminated)
+        return clip_boundary & complete_trial & at_final_frame & continuously_stable
 
 
 def motion_end_failure(
@@ -944,7 +944,7 @@ def motion_end_failure(
     command: MotionCommand = env.command_manager.get_term(command_name)
     if not command.cfg.terminate_on_motion_end:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    clip_timeout = motion_clip_timeout_mask(command.motion_finished, env.termination_manager.terminated)
+    clip_boundary = motion_clip_boundary_mask(command.motion_finished, env.termination_manager.terminated)
     # Only episodes that started at the authored first frame are eligible for
     # end-quality classification.  A random-phase episode can begin too close
     # to the boundary to accumulate the required contact/stability time; if it
@@ -954,4 +954,4 @@ def motion_end_failure(
     # The success term is configured immediately before this term.  Reusing
     # its result partitions every eligible completed clip exactly once.
     successful = env.termination_manager.get_term(success_term_name)
-    return clip_timeout & complete_trial & ~successful
+    return clip_boundary & complete_trial & ~successful

@@ -92,6 +92,43 @@ ELF3_CLIMB_ACTION_SCALE = {
     ".*_wrist_z_joint": 0.373,
 }
 
+# Absolute joint-position targets are clipped only after Isaac Lab applies the
+# existing action scale and the articulation's default-position offset.  These
+# are the ELF3 URDF hard limits, not inward-shrunk soft limits: the expert clips
+# legitimately reach several hard bounds, while a target outside them can only
+# request an unphysical PD set point and amplify a terminal policy attractor.
+ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS = {
+    "l_shoulder_y_joint": (-2.8798, 2.8798),
+    "r_shoulder_y_joint": (-2.8798, 2.8798),
+    "waist_y_joint": (-0.5236, 0.5236),
+    "l_shoulder_x_joint": (-0.34907, 3.0543),
+    "r_shoulder_x_joint": (-3.0543, 0.34907),
+    "waist_x_joint": (-0.2618, 0.2618),
+    "l_shoulder_z_joint": (-2.8798, 2.8798),
+    "r_shoulder_z_joint": (-2.8798, 2.8798),
+    "waist_z_joint": (-2.8798, 2.8798),
+    "l_elbow_y_joint": (-0.95993, 1.6581),
+    "r_elbow_y_joint": (-0.95993, 1.6581),
+    "l_hip_y_joint": (-2.8798, 2.8798),
+    "r_hip_y_joint": (-2.8798, 2.8798),
+    "l_wrist_x_joint": (-2.8798, 2.8798),
+    "r_wrist_x_joint": (-2.8798, 2.8798),
+    "l_hip_x_joint": (-0.48869, 3.0543),
+    "r_hip_x_joint": (-3.0543, 0.48869),
+    "l_wrist_y_joint": (-1.309, 1.309),
+    "r_wrist_y_joint": (-1.309, 1.309),
+    "l_hip_z_joint": (-2.8798, 2.8798),
+    "r_hip_z_joint": (-2.8798, 2.8798),
+    "l_wrist_z_joint": (-0.7854, 0.7854),
+    "r_wrist_z_joint": (-0.7854, 0.7854),
+    "l_knee_y_joint": (-0.087266, 2.618),
+    "r_knee_y_joint": (-0.087266, 2.618),
+    "l_ankle_y_joint": (-0.87266, 0.7854),
+    "r_ankle_y_joint": (-0.87266, 0.7854),
+    "l_ankle_x_joint": (-0.34907, 0.34907),
+    "r_ankle_x_joint": (-0.34907, 0.34907),
+}
+
 
 ELF3_CLIMB_TRACKED_BODY_NAMES = [
     "waist_z_link",
@@ -601,6 +638,7 @@ class ELF3ClimbActionsCfg:
         asset_name="robot",
         joint_names=ELF3_CLIMB_JOINT_NAMES,
         scale=ELF3_CLIMB_ACTION_SCALE,
+        clip=ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS,
         use_default_offset=True,
         preserve_order=True,
     )
@@ -1009,14 +1047,14 @@ class ELF3ClimbTerminationsCfg:
             "body_names": ELF3_CLIMB_END_EFFECTOR_NAMES,
         },
     )
-    # Keep physical failures above all boundary classifiers.  Success is
-    # accumulated inside the authored static tail; success, quality failure,
-    # and the generic clip boundary remain timeouts, so this classification
-    # changes curriculum/sampling semantics without adding a terminal reward
-    # or changing PPO value bootstrapping.
+    # Keep physical failures above all boundary classifiers.  The authored
+    # clip boundary is a task-defined terminal state, not an external timeout:
+    # PPO must not retain a continuing-state value bootstrap beyond it.
+    # This order also makes success, quality failure, and the generic boundary
+    # mutually exclusive through the accumulated ``terminated`` mask.
     motion_end_success = DoneTerm(
         func=mdp.motion_end_success,
-        time_out=True,
+        time_out=False,
         params={
             "command_name": "motion",
             "platform_cfg": SceneEntityCfg("platform"),
@@ -1051,7 +1089,7 @@ class ELF3ClimbTerminationsCfg:
     )
     motion_end_failure = DoneTerm(
         func=mdp.motion_end_failure,
-        time_out=True,
+        time_out=False,
         params={
             "command_name": "motion",
             "success_term_name": "motion_end_success",
@@ -1059,7 +1097,7 @@ class ELF3ClimbTerminationsCfg:
     )
     motion_clip_end = DoneTerm(
         func=mdp.motion_clip_end,
-        time_out=True,
+        time_out=False,
         params={"command_name": "motion"},
     )
 

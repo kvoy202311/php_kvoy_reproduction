@@ -399,8 +399,8 @@ def apply_forced_motion_starts(
     return torch.where(force_start_mask, motion_start_idx[motion_ids], sampled_time_steps)
 
 
-def motion_clip_timeout_mask(motion_finished: torch.Tensor, terminated: torch.Tensor) -> torch.Tensor:
-    """Return clip-boundary timeouts that do not overlap true terminations."""
+def motion_clip_boundary_mask(motion_finished: torch.Tensor, terminated: torch.Tensor) -> torch.Tensor:
+    """Return completed clip boundaries not claimed by an earlier termination."""
 
     if motion_finished.shape != terminated.shape:
         raise ValueError(
@@ -410,6 +410,11 @@ def motion_clip_timeout_mask(motion_finished: torch.Tensor, terminated: torch.Te
     if motion_finished.dtype != torch.bool or terminated.dtype != torch.bool:
         raise TypeError("motion_finished and terminated must use torch.bool values.")
     return motion_finished & ~terminated
+
+
+# Backward-compatible import alias for external code written while clip ends
+# were classified as timeouts.  New code should use the semantic name above.
+motion_clip_timeout_mask = motion_clip_boundary_mask
 
 
 def adaptive_failure_mask(
