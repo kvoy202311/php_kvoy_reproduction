@@ -129,6 +129,41 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertIn("first_foothold_surface_alignment", reward_names)
         self.assertIn("platform_foot_surface_alignment", reward_names)
 
+        for reward_name in ("platform_foot_contact", "platform_foot_surface_alignment"):
+            with self.subTest(physical_platform_reward=reward_name):
+                assignment = next(
+                    node
+                    for node in rewards_class.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == reward_name for target in node.targets)
+                )
+                reward_keywords = {keyword.arg: keyword.value for keyword in assignment.value.keywords}
+                reward_params = {
+                    ast.literal_eval(key): value
+                    for key, value in zip(
+                        reward_keywords["params"].keys,
+                        reward_keywords["params"].values,
+                        strict=True,
+                    )
+                }
+                self.assertNotIn("terminal_window_time_s", reward_params)
+                self.assertIn("expert_pose_modulation_params", reward_params)
+                modulation = reward_params["expert_pose_modulation_params"]
+                self.assertIsInstance(modulation, ast.Dict)
+                modulation_params = {
+                    ast.literal_eval(key): value
+                    for key, value in zip(modulation.keys, modulation.values, strict=True)
+                }
+                self.assertEqual(
+                    ast.unparse(modulation_params["joint_groups"]),
+                    "ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS",
+                )
+                self.assertEqual(ast.literal_eval(modulation_params["group_aggregation"]), "harmonic")
+                self.assertEqual(
+                    ast.unparse(modulation_params["worst_group_weight"]),
+                    "ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT",
+                )
+
         continuous_joint_groups = assignments["ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS"]
         self.assertIsInstance(continuous_joint_groups, ast.Dict)
         continuous_group_names = {

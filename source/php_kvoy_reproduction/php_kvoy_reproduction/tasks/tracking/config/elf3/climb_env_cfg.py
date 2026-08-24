@@ -343,9 +343,11 @@ ELF3_CLIMB_PROGRESS_LIFT_PHASE_END = 0.75
 ELF3_CLIMB_PROGRESS_APPROACH_WEIGHT = 0.65
 ELF3_CLIMB_PROGRESS_LIFT_WEIGHT = 0.35
 ELF3_CLIMB_PROGRESS_MAX_DELTA_PER_STEP = 0.05
-# Foot-surface shaping remains physical and terrain-conditioned throughout the
-# climb.  The authored whole-body pose and velocity rewards remain continuous
-# through the source tail; no extra phase-gated terminal objective is added.
+# Foot-surface shaping remains physical and terrain-conditioned.  Final
+# bilateral support is gated by real platform geometry/contact rather than
+# distance to the last source frame, and its score is coupled to the same
+# continuous non-ankle expert pose used throughout the clip.  This prevents a
+# hidden late objective from trading the arms or waist for foot reward.
 ELF3_CLIMB_FINAL_FOOT_SURFACE_REWARD_WEIGHT = 4.0
 ELF3_CLIMB_FINAL_FOOT_SURFACE_YAW_STD = 0.35
 ELF3_CLIMB_FINAL_EXPERT_JOINT_POSE_WINDOW_S = 0.50
@@ -942,7 +944,16 @@ class ELF3ClimbRewardsCfg:
             "foot_height_std": ELF3_CLIMB_TERMINAL_DEFAULT_POSE_SOLE_HEIGHT_TOLERANCE,
             "min_contact_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "contact_time_scale": ELF3_CLIMB_MIN_FOOT_CONTACT_TIME_S,
-            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
+            "expert_pose_modulation_params": {
+                "joint_groups": ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS,
+                "group_stds": ELF3_CLIMB_EXPERT_JOINT_POSITION_GROUP_STDS,
+                "group_weights": ELF3_CLIMB_EXPERT_JOINT_GROUP_WEIGHTS,
+                "score_exponent": ELF3_CLIMB_EXPERT_JOINT_SCORE_EXPONENT,
+                "worst_joint_count": ELF3_CLIMB_EXPERT_JOINT_WORST_COUNT,
+                "worst_joint_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT,
+                "group_aggregation": "harmonic",
+                "worst_group_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT,
+            },
             "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
         },
     )
@@ -956,8 +967,17 @@ class ELF3ClimbRewardsCfg:
             "platform_support_params": ELF3_CLIMB_PLATFORM_FOOT_SUPPORT_PARAMS,
             "min_upward_force": ELF3_CLIMB_MIN_FOOT_CONTACT_FORCE_N,
             "sole_height_tolerance": ELF3_CLIMB_SOLE_SURFACE_HEIGHT_TOLERANCE,
-            "terminal_window_time_s": ELF3_CLIMB_TERMINAL_REWARD_WINDOW_S,
             "yaw_std": ELF3_CLIMB_FINAL_FOOT_SURFACE_YAW_STD,
+            "expert_pose_modulation_params": {
+                "joint_groups": ELF3_CLIMB_EXPERT_JOINT_TRACKING_GROUPS,
+                "group_stds": ELF3_CLIMB_EXPERT_JOINT_POSITION_GROUP_STDS,
+                "group_weights": ELF3_CLIMB_EXPERT_JOINT_GROUP_WEIGHTS,
+                "score_exponent": ELF3_CLIMB_EXPERT_JOINT_SCORE_EXPONENT,
+                "worst_joint_count": ELF3_CLIMB_EXPERT_JOINT_WORST_COUNT,
+                "worst_joint_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT,
+                "group_aggregation": "harmonic",
+                "worst_group_weight": ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT,
+            },
         },
     )
     first_foothold_support_quality = RewTerm(

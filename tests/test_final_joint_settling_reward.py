@@ -1478,5 +1478,88 @@ class FinalExpertFullJointPoseRewardTest(unittest.TestCase):
         torch.testing.assert_close(reward[2:], torch.zeros(3))
 
 
+class PlatformRewardExpertPoseCouplingTest(unittest.TestCase):
+    def test_bilateral_contact_is_state_gated_and_pose_modulated_without_phase(self):
+        command = SimpleNamespace()
+        env = SimpleNamespace(command_manager=_CommandManager(command))
+        contact_scores = torch.tensor([[1.0, 0.8], [0.2, 0.9]], dtype=torch.float32)
+        pose_quality = torch.tensor([0.5, 0.25], dtype=torch.float32)
+
+        with (
+            patch.object(rewards, "_platform_foot_contact_scores", return_value=contact_scores),
+            patch.object(
+                rewards,
+                "_grouped_expert_joint_pose_score_details",
+                return_value=SimpleNamespace(aggregate=pose_quality),
+            ),
+        ):
+            reward = rewards.platform_foot_contact(
+                env,
+                command_name="motion",
+                platform_cfg=_SceneEntityCfg("platform"),
+                contact_sensor_cfg=_SceneEntityCfg("contact_forces", body_ids=[0, 1]),
+                base_size=(0.51, 0.8, 0.66),
+                foot_body_names=["left", "right"],
+                footprint_inset=0.02,
+                foot_height_std=0.03,
+                min_contact_force=10.0,
+                contact_time_scale=0.25,
+                expert_pose_modulation_params={},
+            )
+
+        torch.testing.assert_close(reward, torch.tensor([0.4, 0.05]))
+
+    def test_surface_alignment_is_bilateral_and_pose_modulated_without_phase(self):
+        command = SimpleNamespace(
+            cfg=SimpleNamespace(body_names=["left", "right"]),
+            robot=object(),
+            device="cpu",
+            body_quat_relative_w=torch.zeros(2, 2, 4),
+            robot_body_quat_w=torch.zeros(2, 2, 4),
+            metrics={},
+        )
+        env = SimpleNamespace(command_manager=_CommandManager(command))
+        support = SimpleNamespace(
+            settings=SimpleNamespace(foot_body_names=("left", "right")),
+            dense_surface_score=torch.tensor([[1.0, 0.5], [0.25, 1.0]], dtype=torch.float32),
+            sole_surface_height_error=torch.zeros(2, 2),
+            sole_height_spread=torch.zeros(2, 2),
+            upward_forces=torch.ones(2, 2),
+            contact_support=torch.tensor([[True, True], [True, False]]),
+            active_support=torch.ones(2, 2, dtype=torch.bool),
+        )
+        pose_quality = torch.tensor([0.5, 0.25], dtype=torch.float32)
+
+        with (
+            patch.object(rewards, "platform_foot_support_state", return_value=support),
+            patch.object(rewards, "_named_body_ids", return_value=[0, 1]),
+            patch.object(rewards.math_utils, "yaw_quat", side_effect=lambda value: value, create=True),
+            patch.object(rewards, "quat_error_magnitude", return_value=torch.zeros(2, 2)),
+            patch.object(
+                rewards,
+                "_grouped_expert_joint_pose_score_details",
+                return_value=SimpleNamespace(aggregate=pose_quality),
+            ),
+        ):
+            reward = rewards.platform_foot_surface_alignment(
+                env,
+                command_name="motion",
+                platform_cfg=_SceneEntityCfg("platform"),
+                base_size=(0.51, 0.8, 0.66),
+                platform_support_params={},
+                min_upward_force=10.0,
+                sole_height_tolerance=0.03,
+                yaw_std=0.35,
+                expert_pose_modulation_params={},
+            )
+
+        # The first harmonic surface score is 2/3 before pose modulation; the
+        # second environment has only one contacted foot and receives zero.
+        torch.testing.assert_close(reward, torch.tensor([1.0 / 3.0, 0.0]))
+        torch.testing.assert_close(
+            command.metrics["final_standing_platform_expert_pose_quality"], pose_quality
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

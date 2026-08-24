@@ -3094,13 +3094,19 @@ def platform_foot_contact(
     foot_height_std: float,
     min_contact_force: float,
     contact_time_scale: float,
-    terminal_window_time_s: float,
+    expert_pose_modulation_params: Mapping[str, object],
     platform_support_params: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
-    """Reward actual two-foot contact with the physical platform top."""
+    """Reward physical two-foot support without creating a late phase objective.
+
+    Bilateral contact already provides the necessary state-dependent gate: the
+    score is zero until both feet really support the platform.  Multiplying it
+    by continuous expert-pose quality prevents the much larger foot reward
+    from being harvested by moving the waist or arms into a non-expert
+    counterbalance posture near the end of the clip.
+    """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    gate = _final_phase_gate(command, terminal_window_time_s, env.step_dt)
     per_foot_scores = _platform_foot_contact_scores(
         env,
         command,
@@ -3116,7 +3122,12 @@ def platform_foot_contact(
     )
     # A mean would let one planted foot hide an unsupported second foot.  The
     # minimum makes this a genuine bilateral-platform reward.
-    return gate * per_foot_scores.amin(dim=1)
+    bilateral_contact = per_foot_scores.amin(dim=1)
+    expert_pose_quality = _grouped_expert_joint_pose_score_details(
+        command,
+        **expert_pose_modulation_params,
+    ).aggregate
+    return bilateral_contact * expert_pose_quality
 
 
 def platform_foot_surface_alignment(
@@ -3127,15 +3138,16 @@ def platform_foot_surface_alignment(
     platform_support_params: Mapping[str, object],
     min_upward_force: float,
     sole_height_tolerance: float,
-    terminal_window_time_s: float,
     yaw_std: float,
+    expert_pose_modulation_params: Mapping[str, object],
 ) -> torch.Tensor:
-    """Reward two terrain-aligned feet while preserving the expert headings.
+    """Reward two contacted, terrain-aligned feet while preserving expert pose.
 
-    This is deliberately independent of expert ankle pitch/roll and contact
-    force.  It supplies a geometric correction before impact; the separate
-    platform-contact and load terms decide whether the aligned feet are
-    physically supporting the robot.
+    First-foothold shaping owns the pre-contact landing signal.  This bilateral
+    term begins only after both soles have real upward platform contact, so
+    removing the source-time gate cannot pull ground-standing feet toward the
+    box early.  Expert ankle pitch/roll stays exempt, while non-ankle pose
+    quality prevents compensating with the rest of the body.
     """
 
     if not math.isfinite(yaw_std) or yaw_std <= 0.0:
@@ -3162,7 +3174,10 @@ def platform_foot_surface_alignment(
     yaw_error = quat_error_magnitude(reference_yaw, actual_yaw)
     yaw_score = torch.rsqrt(1.0 + torch.square(yaw_error / yaw_std))
     per_foot_score = support.dense_surface_score * yaw_score
-    gate = _final_phase_gate(command, terminal_window_time_s, env.step_dt)
+    expert_pose_quality = _grouped_expert_joint_pose_score_details(
+        command,
+        **expert_pose_modulation_params,
+    ).aggregate
 
     metrics = getattr(command, "metrics", None)
     if metrics is not None:
@@ -3175,7 +3190,7 @@ def platform_foot_surface_alignment(
                     f"Terminal foot-surface diagnostic {name!r} has shape {metric.shape}, "
                     f"expected {value.shape}."
                 )
-            metric.copy_(gate * value)
+            metric.copy_(value)
 
         for foot_index, side_name in enumerate(side_names):
             record(
@@ -3196,13 +3211,15 @@ def platform_foot_surface_alignment(
             )
             record(
                 f"final_standing_{side_name}_strict_active_support",
-                support.active_support[:, foot_index].to(dtype=gate.dtype),
+                support.active_support[:, foot_index].to(dtype=per_foot_score.dtype),
             )
+        record("final_standing_platform_expert_pose_quality", expert_pose_quality)
     tiny = torch.finfo(per_foot_score.dtype).tiny
     bilateral_score = per_foot_score.shape[1] / torch.sum(
         torch.reciprocal(per_foot_score.clamp_min(tiny)), dim=1
     )
-    return gate * bilateral_score
+    bilateral_platform_contact = support.contact_support.all(dim=1).to(dtype=bilateral_score.dtype)
+    return bilateral_platform_contact * bilateral_score * expert_pose_quality
 
 
 def final_ankle_surface_settling(
