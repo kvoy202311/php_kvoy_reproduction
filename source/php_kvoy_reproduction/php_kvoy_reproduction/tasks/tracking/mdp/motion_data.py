@@ -20,6 +20,37 @@ _REQUIRED_MOTION_KEYS = (
 )
 
 
+_TERMINAL_REPEAT_STATE_ATOL = 1.0e-6
+_TERMINAL_REPEAT_VELOCITY_ATOL = 1.0e-6
+
+
+def _repeated_terminal_suffix_start(arrays: Mapping[str, np.ndarray]) -> int:
+    """Return the first frame of a physically identical terminal suffix.
+
+    This deliberately does *not* classify a frame as terminal merely because
+    it moves slowly.  A frame belongs to the suffix only when every stored
+    pose is equal to the final pose within a tight conversion tolerance and
+    every stored velocity is effectively zero.  Consequently a slow
+    bend-to-stand transition remains eligible as a random reset state, while
+    converter-appended copies of the final standing frame do not create
+    observation-identical episodes with different hidden horizons.
+    """
+
+    state_keys = ("joint_pos", "body_pos_w", "body_quat_w")
+    velocity_keys = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w")
+    frame_count = arrays["joint_pos"].shape[0]
+    repeated = np.ones(frame_count, dtype=np.bool_)
+    for key in state_keys:
+        values = arrays[key].reshape(frame_count, -1)
+        repeated &= np.max(np.abs(values - values[-1]), axis=1) <= _TERMINAL_REPEAT_STATE_ATOL
+    for key in velocity_keys:
+        values = arrays[key].reshape(frame_count, -1)
+        repeated &= np.max(np.abs(values), axis=1) <= _TERMINAL_REPEAT_VELOCITY_ATOL
+
+    non_repeated = np.flatnonzero(~repeated)
+    return 0 if non_repeated.size == 0 else int(non_repeated[-1]) + 1
+
+
 def _motion_file_signature(path: Path) -> str:
     """Return a path-independent identity for one motion file."""
 
@@ -45,7 +76,13 @@ def _read_optional_names(data: np.lib.npyio.NpzFile, key: str, expected_count: i
 class MotionLoader:
     """Load and validate one whole-body tracking motion NPZ."""
 
-    def __init__(self, motion_file: str | Path, body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_file: str | Path,
+        body_indexes: Sequence[int],
+        device: str = "cpu",
+        exclude_repeated_terminal_frames_from_random_starts: bool = False,
+    ):
         self.motion_file = Path(motion_file).expanduser().resolve()
         if not self.motion_file.is_file():
             raise FileNotFoundError(f"Motion file does not exist or is not a file: {self.motion_file}")
@@ -95,6 +132,23 @@ class MotionLoader:
         self.motion_lengths = torch.tensor([self.time_step_total], dtype=torch.long, device=device)
         self.motion_start_idx = torch.zeros(1, dtype=torch.long, device=device)
         self.motion_end_idx = self.motion_lengths.clone()
+        repeated_suffix_start = (
+            _repeated_terminal_suffix_start(arrays)
+            if exclude_repeated_terminal_frames_from_random_starts
+            else self.time_step_total - 1
+        )
+        # Exclusive reset-start boundary.  Retain frame zero as the sole
+        # candidate for a completely static clip, and otherwise stop before
+        # the first converter-repeated terminal frame.  If the clip has no
+        # zero-velocity repeated suffix, fall back to the historical boundary
+        # that excludes only its final frame.
+        random_start_end_idx = min(
+            self.time_step_total - 1,
+            max(1, repeated_suffix_start),
+        )
+        self.motion_random_start_end_idx = torch.tensor(
+            [random_start_end_idx], dtype=torch.long, device=device
+        )
         self.motion_files = (str(self.motion_file),)
         self.motion_signatures = (_motion_file_signature(self.motion_file),)
 
@@ -161,7 +215,13 @@ class MotionLoader:
 class MultiMotionLoader:
     """Load all NPZ files in one directory as separate clips in one motion dataset."""
 
-    def __init__(self, motion_dir: str | Path, body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_dir: str | Path,
+        body_indexes: Sequence[int],
+        device: str = "cpu",
+        exclude_repeated_terminal_frames_from_random_starts: bool = False,
+    ):
         self.motion_dir = Path(motion_dir).expanduser().resolve()
         if not self.motion_dir.is_dir():
             raise NotADirectoryError(f"Motion directory does not exist or is not a directory: {self.motion_dir}")
@@ -170,7 +230,17 @@ class MultiMotionLoader:
         if not motion_files:
             raise FileNotFoundError(f"No .npz motion files found directly inside: {self.motion_dir}")
 
-        loaders = [MotionLoader(path, body_indexes, device=device) for path in motion_files]
+        loaders = [
+            MotionLoader(
+                path,
+                body_indexes,
+                device=device,
+                exclude_repeated_terminal_frames_from_random_starts=(
+                    exclude_repeated_terminal_frames_from_random_starts
+                ),
+            )
+            for path in motion_files
+        ]
         reference = loaders[0]
         for loader in loaders[1:]:
             self._validate_compatible(reference, loader)
@@ -190,6 +260,14 @@ class MultiMotionLoader:
         self.motion_end_idx = self.motion_lengths.cumsum(dim=0)
         self.motion_start_idx = torch.cat(
             [torch.zeros(1, dtype=torch.long, device=device), self.motion_end_idx[:-1]], dim=0
+        )
+        self.motion_random_start_end_idx = torch.tensor(
+            [
+                int(start.item()) + int(loader.motion_random_start_end_idx[0].item())
+                for start, loader in zip(self.motion_start_idx, loaders, strict=True)
+            ],
+            dtype=torch.long,
+            device=device,
         )
         self.num_motions = len(loaders)
 
@@ -263,14 +341,29 @@ def load_motion_dataset(
     motion_dir: str | Path | None,
     body_indexes: Sequence[int],
     device: str = "cpu",
+    exclude_repeated_terminal_frames_from_random_starts: bool = False,
 ) -> MotionLoader | MultiMotionLoader:
     """Load exactly one configured motion source."""
 
     if (motion_file is None) == (motion_dir is None):
         raise ValueError("Configure exactly one of 'motion_file' or 'motion_dir'.")
     if motion_dir is not None:
-        return MultiMotionLoader(motion_dir, body_indexes, device=device)
-    return MotionLoader(motion_file, body_indexes, device=device)
+        return MultiMotionLoader(
+            motion_dir,
+            body_indexes,
+            device=device,
+            exclude_repeated_terminal_frames_from_random_starts=(
+                exclude_repeated_terminal_frames_from_random_starts
+            ),
+        )
+    return MotionLoader(
+        motion_file,
+        body_indexes,
+        device=device,
+        exclude_repeated_terminal_frames_from_random_starts=(
+            exclude_repeated_terminal_frames_from_random_starts
+        ),
+    )
 
 
 def advance_motion_frames(
@@ -451,6 +544,7 @@ class MultiMotionAdaptiveSampler:
         adaptive_uniform_ratio: float = 0.1,
         adaptive_alpha: float = 0.001,
         motion_signatures: Sequence[str] | None = None,
+        random_start_end_idx: torch.Tensor | None = None,
     ):
         if motion_start_idx.ndim != 1 or motion_end_idx.shape != motion_start_idx.shape:
             raise ValueError("motion_start_idx and motion_end_idx must be one-dimensional tensors of equal shape.")
@@ -476,6 +570,28 @@ class MultiMotionAdaptiveSampler:
         self.motion_lengths = self.motion_end_idx - self.motion_start_idx
         if torch.any(self.motion_lengths < 2):
             raise ValueError("Every motion must contain at least two frames.")
+        self.random_start_boundary_is_restricted = random_start_end_idx is not None
+        if random_start_end_idx is None:
+            self.random_start_end_idx = self.motion_end_idx - 1
+        else:
+            if random_start_end_idx.shape != self.motion_start_idx.shape or random_start_end_idx.ndim != 1:
+                raise ValueError(
+                    "random_start_end_idx must be one-dimensional and match motion_start_idx, "
+                    f"got {random_start_end_idx.shape} and {self.motion_start_idx.shape}."
+                )
+            self.random_start_end_idx = random_start_end_idx.to(device=device, dtype=torch.long)
+        if torch.any(self.random_start_end_idx <= self.motion_start_idx):
+            raise ValueError("Every motion must retain at least one eligible random start frame.")
+        if torch.any(self.random_start_end_idx > self.motion_end_idx - 1):
+            raise ValueError("random_start_end_idx cannot include or cross a clip's final frame.")
+        self.random_start_lengths = self.random_start_end_idx - self.motion_start_idx
+        # Preserve the historical adaptive-bin topology for callers that do
+        # not opt into a restricted reset boundary.  The climb-specific path
+        # bins only its eligible moving prefix, so late failures fold into the
+        # final reachable reset bin rather than reopening the repeated suffix.
+        self.phase_bin_lengths = (
+            self.random_start_lengths if self.random_start_boundary_is_restricted else self.motion_lengths
+        )
 
         self.num_motions = self.motion_lengths.numel()
         if motion_signatures is not None and len(motion_signatures) != self.num_motions:
@@ -484,7 +600,7 @@ class MultiMotionAdaptiveSampler:
                 f"got {len(motion_signatures)}."
             )
         self.motion_signatures = None if motion_signatures is None else tuple(str(value) for value in motion_signatures)
-        self.bin_counts = torch.floor(self.motion_lengths.float() / env_fps).long() + 1
+        self.bin_counts = torch.floor(self.phase_bin_lengths.float() / env_fps).long() + 1
         self._bin_counts_list = self.bin_counts.cpu().tolist()
         self.max_bin_count = int(self.bin_counts.max().item())
         self.adaptive_uniform_ratio = adaptive_uniform_ratio
@@ -505,15 +621,16 @@ class MultiMotionAdaptiveSampler:
     def state_dict(self) -> dict[str, torch.Tensor | tuple[str, ...] | int | None]:
         """Return a portable checkpoint of the learned phase distribution.
 
-        Motion boundaries are included as an identity contract. This prevents
-        silently applying failure statistics to a different set or ordering of
-        NPZ clips when training is resumed.
+        Motion and eligible-reset boundaries are included as an identity
+        contract. This prevents silently applying failure statistics to a
+        different set, ordering, or reset-phase range when training resumes.
         """
 
         return {
-            "version": 1,
+            "version": 2,
             "motion_start_idx": self.motion_start_idx.detach().cpu().clone(),
             "motion_end_idx": self.motion_end_idx.detach().cpu().clone(),
+            "random_start_end_idx": self.random_start_end_idx.detach().cpu().clone(),
             "bin_counts": self.bin_counts.detach().cpu().clone(),
             "motion_signatures": self.motion_signatures,
             "bin_failed_count": self.bin_failed_count.detach().cpu().clone(),
@@ -535,14 +652,24 @@ class MultiMotionAdaptiveSampler:
         missing_keys = sorted(required_keys - set(state_dict))
         if missing_keys:
             raise KeyError(f"Motion sampler checkpoint is missing keys: {missing_keys}.")
-        if state_dict["version"] != 1:
-            raise ValueError(f"Unsupported motion sampler checkpoint version: {state_dict['version']!r}.")
+        version = state_dict["version"]
+        if version not in (1, 2):
+            raise ValueError(f"Unsupported motion sampler checkpoint version: {version!r}.")
+        if version == 1 and self.random_start_boundary_is_restricted:
+            raise ValueError(
+                "Motion sampler checkpoint version 1 does not record random_start_end_idx and cannot "
+                "be safely restored into a sampler with restricted random-start boundaries."
+            )
+        if version == 2 and "random_start_end_idx" not in state_dict:
+            raise KeyError("Motion sampler checkpoint version 2 is missing 'random_start_end_idx'.")
 
         topology = {
             "motion_start_idx": self.motion_start_idx,
             "motion_end_idx": self.motion_end_idx,
             "bin_counts": self.bin_counts,
         }
+        if version == 2:
+            topology["random_start_end_idx"] = self.random_start_end_idx
         for name, expected in topology.items():
             restored = torch.as_tensor(state_dict[name], dtype=torch.long, device=self.device)
             if restored.shape != expected.shape or not torch.equal(restored, expected):
@@ -586,9 +713,11 @@ class MultiMotionAdaptiveSampler:
             return
         motion_ids = motion_ids.long()
         local_time_steps = global_time_steps.long() - self.motion_start_idx[motion_ids]
-        local_time_steps = torch.minimum(torch.clamp(local_time_steps, min=0), self.motion_lengths[motion_ids] - 1)
+        local_time_steps = torch.minimum(
+            torch.clamp(local_time_steps, min=0), self.random_start_lengths[motion_ids] - 1
+        )
         failed_bins = torch.minimum(
-            (local_time_steps * self.bin_counts[motion_ids]) // self.motion_lengths[motion_ids],
+            (local_time_steps * self.bin_counts[motion_ids]) // self.phase_bin_lengths[motion_ids],
             self.bin_counts[motion_ids] - 1,
         )
         flat_indices = motion_ids * self.max_bin_count + failed_bins
@@ -639,8 +768,8 @@ class MultiMotionAdaptiveSampler:
         phase = (sampled_bins.float() + torch.rand(num_samples, device=self.device)) / self.bin_counts[
             motion_ids
         ].float()
-        local_time_steps = (phase * (self.motion_lengths[motion_ids] - 1).float()).long()
-        local_time_steps = torch.minimum(local_time_steps, self.motion_lengths[motion_ids] - 2)
+        local_time_steps = (phase * self.random_start_lengths[motion_ids].float()).long()
+        local_time_steps = torch.minimum(local_time_steps, self.random_start_lengths[motion_ids] - 1)
         global_time_steps = self.motion_start_idx[motion_ids] + local_time_steps
         return motion_ids, global_time_steps
 
@@ -655,7 +784,7 @@ class MultiMotionAdaptiveSampler:
 
         motion_ids = torch.randint(0, self.num_motions, (num_samples,), device=self.device)
         local_time_steps = (
-            torch.rand(num_samples, device=self.device) * (self.motion_lengths[motion_ids] - 1).float()
+            torch.rand(num_samples, device=self.device) * self.random_start_lengths[motion_ids].float()
         ).long()
         return motion_ids, self.motion_start_idx[motion_ids] + local_time_steps
 

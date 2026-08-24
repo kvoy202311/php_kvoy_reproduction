@@ -103,21 +103,36 @@ def bad_motion_body_pos_z_only(
     return _expert_reference_termination_active(command) & torch.any(error > threshold, dim=-1)
 
 
-def motion_clip_end(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """Request an episode boundary after the final frame of a motion clip.
+def motion_clip_end(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    classified_term_names: Sequence[str] = (),
+) -> torch.Tensor:
+    """Request a truncated episode boundary after a motion clip's final frame.
 
-    The end of the authored task is an MDP terminal, so configure this term
-    with ``time_out=False``.  A continuing-state value bootstrap beyond that
-    task horizon would assign the wrong return to the final transition.
+    Configure normal clip-completion terms with ``time_out=True``.  The source
+    ends in a repeated stationary reference, so truncation preserves its
+    continuing value and prevents an artificial zero-value terminal cliff.
+    Physical tracking failures remain separate true terminations.
     """
 
     command: MotionCommand = env.command_manager.get_term(command_name)
     if not command.cfg.terminate_on_motion_end:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     # Physical failures and the more specific success/failure classifiers must
-    # be configured first.  Their accumulated true-termination mask makes all
-    # boundary labels mutually exclusive.
-    return motion_clip_boundary_mask(command.motion_finished, env.termination_manager.terminated)
+    # be configured first.  Timeout classifiers do not enter the manager's
+    # ``terminated`` tensor, so include their raw term masks explicitly to
+    # keep every boundary label mutually exclusive.
+    claimed = env.termination_manager.terminated.clone()
+    for term_name in classified_term_names:
+        term_value = env.termination_manager.get_term(term_name)
+        if term_value.shape != claimed.shape or term_value.dtype != torch.bool:
+            raise RuntimeError(
+                f"Classified clip-boundary term {term_name!r} must be a bool tensor with shape "
+                f"{claimed.shape}, got {term_value.shape} and {term_value.dtype}."
+            )
+        claimed |= term_value
+    return motion_clip_boundary_mask(command.motion_finished, claimed)
 
 
 def _expert_joint_position_rms(command: MotionCommand) -> torch.Tensor:

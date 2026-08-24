@@ -136,6 +136,10 @@ class _CommandManager:
 class _TerminationManager:
     def __init__(self, num_envs):
         self.terminated = torch.zeros(num_envs, dtype=torch.bool)
+        self.term_values = {}
+
+    def get_term(self, name):
+        return self.term_values[name]
 
 
 class MotionClipEndTerminationTest(unittest.TestCase):
@@ -174,6 +178,25 @@ class MotionClipEndTerminationTest(unittest.TestCase):
         result = terminations.motion_clip_end(env, "motion")
 
         self.assertTrue(torch.equal(result, torch.tensor([False, False])))
+
+    def test_timeout_classifiers_remain_mutually_exclusive_with_generic_boundary(self):
+        env = self._env(
+            terminate_on_motion_end=True,
+            motion_finished=torch.tensor([True, True, True]),
+            terminated=torch.tensor([False, False, False]),
+        )
+        env.termination_manager.term_values = {
+            "motion_end_success": torch.tensor([True, False, False]),
+            "motion_end_failure": torch.tensor([False, True, False]),
+        }
+
+        result = terminations.motion_clip_end(
+            env,
+            "motion",
+            ("motion_end_success", "motion_end_failure"),
+        )
+
+        self.assertTrue(torch.equal(result, torch.tensor([False, False, True])))
 
 
 class _DiagnosticContactSensor:

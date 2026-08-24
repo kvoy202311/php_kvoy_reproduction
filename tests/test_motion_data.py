@@ -18,8 +18,18 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(motion_data)
 
 
-def _write_motion(path: Path, frame_count: int, fps: float = 50.0, joint_count: int = 2, body_count: int = 3):
+def _write_motion(
+    path: Path,
+    frame_count: int,
+    fps: float = 50.0,
+    joint_count: int = 2,
+    body_count: int = 3,
+    repeated_terminal_frames: int = 1,
+):
     joint_pos = np.arange(frame_count * joint_count, dtype=np.float32).reshape(frame_count, joint_count)
+    if repeated_terminal_frames < 1 or repeated_terminal_frames > frame_count:
+        raise ValueError("repeated_terminal_frames must lie in [1, frame_count].")
+    joint_pos[-repeated_terminal_frames:] = joint_pos[-1]
     body_pos = np.zeros((frame_count, body_count, 3), dtype=np.float32)
     body_quat = np.zeros((frame_count, body_count, 4), dtype=np.float32)
     body_quat[..., 0] = 1.0
@@ -52,6 +62,92 @@ class MultiMotionLoaderTest(unittest.TestCase):
             self.assertEqual(loader.num_motions, 1)
             self.assertEqual(loader.motion_start_idx.tolist(), [0])
             self.assertEqual(loader.motion_end_idx.tolist(), [6])
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [5])
+
+    def test_detects_only_the_identical_zero_velocity_terminal_suffix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            motion_file = Path(temp_dir) / "terminal_repeat.npz"
+            _write_motion(motion_file, frame_count=8, repeated_terminal_frames=3)
+
+            loader = motion_data.MotionLoader(
+                motion_file,
+                body_indexes=[0],
+                exclude_repeated_terminal_frames_from_random_starts=True,
+            )
+
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [5])
+            self.assertFalse(torch.equal(loader.joint_pos[4], loader.joint_pos[-1]))
+            self.assertTrue(torch.equal(loader.joint_pos[5], loader.joint_pos[-1]))
+
+    def test_slow_but_nonidentical_terminal_transition_remains_eligible(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            motion_file = Path(temp_dir) / "slow_transition.npz"
+            _write_motion(motion_file, frame_count=8)
+            with np.load(motion_file) as data:
+                arrays = {key: data[key] for key in data.files}
+            arrays["joint_pos"][-2] = arrays["joint_pos"][-1] - 1.0e-4
+            arrays["joint_vel"][-2] = 1.0e-4
+            np.savez(motion_file, **arrays)
+
+            loader = motion_data.MotionLoader(
+                motion_file,
+                body_indexes=[0],
+                exclude_repeated_terminal_frames_from_random_starts=True,
+            )
+
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [7])
+
+    def test_moving_final_frame_falls_back_to_the_historical_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            motion_file = Path(temp_dir) / "moving_final.npz"
+            _write_motion(motion_file, frame_count=8)
+            with np.load(motion_file) as data:
+                arrays = {key: data[key] for key in data.files}
+            arrays["joint_vel"][-1] = 0.1
+            np.savez(motion_file, **arrays)
+
+            loader = motion_data.MotionLoader(
+                motion_file,
+                body_indexes=[0],
+                exclude_repeated_terminal_frames_from_random_starts=True,
+            )
+            sampler = motion_data.MultiMotionAdaptiveSampler(
+                loader.motion_start_idx,
+                loader.motion_end_idx,
+                env_fps=50.0,
+                device="cpu",
+                random_start_end_idx=loader.motion_random_start_end_idx,
+            )
+
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [7])
+            _, sampled_frames = sampler.sample_uniform(1_000)
+            self.assertTrue(torch.all(sampled_frames < 7))
+
+    def test_terminal_suffix_scan_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            motion_file = Path(temp_dir) / "terminal_repeat.npz"
+            _write_motion(motion_file, frame_count=8, repeated_terminal_frames=3)
+
+            loader = motion_data.MotionLoader(motion_file, body_indexes=[0])
+
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [7])
+
+    def test_directory_loader_propagates_terminal_suffix_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            motion_dir = Path(temp_dir)
+            _write_motion(motion_dir / "a.npz", frame_count=8, repeated_terminal_frames=3)
+            _write_motion(motion_dir / "b.npz", frame_count=6, repeated_terminal_frames=2)
+
+            loader = motion_data.load_motion_dataset(
+                motion_file=None,
+                motion_dir=motion_dir,
+                body_indexes=[0],
+                exclude_repeated_terminal_frames_from_random_starts=True,
+            )
+
+            self.assertEqual(loader.motion_start_idx.tolist(), [0, 8])
+            self.assertEqual(loader.motion_end_idx.tolist(), [8, 14])
+            self.assertEqual(loader.motion_random_start_end_idx.tolist(), [5, 12])
 
     def test_concatenates_sorted_clips_and_preserves_boundaries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -156,6 +252,39 @@ class MultiMotionAdaptiveSamplerTest(unittest.TestCase):
         self.assertTrue(torch.all(time_steps >= self.starts[motion_ids]))
         self.assertTrue(torch.all(time_steps < self.ends[motion_ids] - 1))
 
+    def test_both_sampling_modes_respect_terminal_repeat_boundaries(self):
+        random_start_ends = torch.tensor([3, 9, 15], dtype=torch.long)
+        sampler = motion_data.MultiMotionAdaptiveSampler(
+            self.starts,
+            self.ends,
+            env_fps=2.0,
+            device="cpu",
+            random_start_end_idx=random_start_ends,
+        )
+
+        for sample in (sampler.sample, sampler.sample_uniform):
+            with self.subTest(sample=sample.__name__):
+                torch.manual_seed(23)
+                motion_ids, time_steps = sample(20_000)
+                self.assertTrue(torch.all(time_steps >= self.starts[motion_ids]))
+                self.assertTrue(torch.all(time_steps < random_start_ends[motion_ids]))
+
+    def test_rejects_invalid_random_start_boundaries(self):
+        for invalid in (
+            torch.tensor([0, 9, 15]),
+            torch.tensor([5, 12, 16]),
+            torch.tensor([3, 9]),
+        ):
+            with self.subTest(random_start_end_idx=invalid.tolist()):
+                with self.assertRaises(ValueError):
+                    motion_data.MultiMotionAdaptiveSampler(
+                        self.starts,
+                        self.ends,
+                        env_fps=2.0,
+                        device="cpu",
+                        random_start_end_idx=invalid,
+                    )
+
     def test_checkpoint_round_trip_restores_adaptive_statistics(self):
         self.sampler.record_failures(torch.tensor([0, 1, 1]), torch.tensor([3, 10, 10]))
         self.sampler.update()
@@ -171,6 +300,8 @@ class MultiMotionAdaptiveSamplerTest(unittest.TestCase):
         )
         restored.load_state_dict(state_dict)
 
+        self.assertEqual(state_dict["version"], 2)
+        self.assertTrue(torch.equal(state_dict["random_start_end_idx"], self.sampler.random_start_end_idx))
         self.assertTrue(torch.equal(restored.bin_failed_count, self.sampler.bin_failed_count))
         self.assertTrue(torch.equal(restored._current_bin_failed, self.sampler._current_bin_failed))
         self.assertTrue(torch.equal(restored.phase_sampling_probabilities, expected_probabilities))
@@ -208,6 +339,59 @@ class MultiMotionAdaptiveSamplerTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "NPZ signatures"):
             different_files.load_state_dict(original.state_dict())
+
+    def test_checkpoint_rejects_a_different_random_start_boundary_with_equal_bin_counts(self):
+        starts = torch.tensor([0], dtype=torch.long)
+        ends = torch.tensor([10], dtype=torch.long)
+        original = motion_data.MultiMotionAdaptiveSampler(
+            starts,
+            ends,
+            env_fps=2.0,
+            device="cpu",
+            random_start_end_idx=torch.tensor([8]),
+        )
+        different_boundary = motion_data.MultiMotionAdaptiveSampler(
+            starts,
+            ends,
+            env_fps=2.0,
+            device="cpu",
+            random_start_end_idx=torch.tensor([9]),
+        )
+        self.assertEqual(original.bin_counts.tolist(), different_boundary.bin_counts.tolist())
+
+        with self.assertRaisesRegex(ValueError, "random_start_end_idx"):
+            different_boundary.load_state_dict(original.state_dict())
+
+    def test_version_one_checkpoint_remains_compatible_with_unrestricted_sampling(self):
+        legacy_state = self.sampler.state_dict()
+        legacy_state["version"] = 1
+        legacy_state.pop("random_start_end_idx")
+        restored = motion_data.MultiMotionAdaptiveSampler(
+            self.starts,
+            self.ends,
+            env_fps=2.0,
+            device="cpu",
+            adaptive_alpha=1.0,
+        )
+
+        restored.load_state_dict(legacy_state)
+
+        self.assertTrue(torch.equal(restored.bin_failed_count, self.sampler.bin_failed_count))
+
+    def test_version_one_checkpoint_is_rejected_for_restricted_sampling(self):
+        legacy_state = self.sampler.state_dict()
+        legacy_state["version"] = 1
+        legacy_state.pop("random_start_end_idx")
+        restricted = motion_data.MultiMotionAdaptiveSampler(
+            self.starts,
+            self.ends,
+            env_fps=2.0,
+            device="cpu",
+            random_start_end_idx=torch.tensor([3, 9, 15]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "version 1.*restricted random-start boundaries"):
+            restricted.load_state_dict(legacy_state)
 
 
 class MotionBoundaryContractTest(unittest.TestCase):

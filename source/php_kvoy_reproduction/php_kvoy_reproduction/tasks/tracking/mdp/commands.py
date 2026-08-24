@@ -71,6 +71,9 @@ class MotionCommand(CommandTerm):
             motion_dir=self.cfg.motion_dir,
             body_indexes=self.body_indexes,
             device=self.device,
+            exclude_repeated_terminal_frames_from_random_starts=(
+                self.cfg.exclude_repeated_terminal_frames_from_random_starts
+            ),
         )
         if self.motion.joint_count != len(self.robot.joint_names):
             raise ValueError(
@@ -185,6 +188,11 @@ class MotionCommand(CommandTerm):
             adaptive_uniform_ratio=self.cfg.adaptive_uniform_ratio,
             adaptive_alpha=self.cfg.adaptive_alpha,
             motion_signatures=self.motion.motion_signatures,
+            random_start_end_idx=(
+                self.motion.motion_random_start_end_idx
+                if self.cfg.exclude_repeated_terminal_frames_from_random_starts
+                else None
+            ),
         )
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
@@ -1331,6 +1339,12 @@ class MotionCommandCfg(CommandTermCfg):
     fixed_motion_id: int = 0
     start_at_motion_beginning: bool = False
     use_adaptive_sampling: bool = True
+    exclude_repeated_terminal_frames_from_random_starts: bool = False
+    """Exclude only converter-repeated final-pose frames from random resets.
+
+    Slow or moving terminal transitions remain eligible.  Episodes starting
+    earlier still traverse the complete repeated terminal suffix normally.
+    """
     terminate_on_motion_end: bool = False
     """Whether reaching a clip's final frame requests an episode boundary.
 

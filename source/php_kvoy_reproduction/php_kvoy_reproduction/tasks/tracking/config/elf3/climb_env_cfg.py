@@ -613,8 +613,12 @@ class ELF3ClimbCommandsCfg:
         terminate_on_motion_end=True,
         motion_end_hold_time_s=ELF3_CLIMB_FINAL_HOLD_TIME_S,
         # Uniform source-phase resets avoid concentrating training on a single
-        # adaptive failure bin.  End-of-clip quality remains diagnostic only.
+        # adaptive failure bin.  Do not reset directly into converter-repeated
+        # copies of the final standing pose: the complete bend-to-stand motion
+        # remains eligible, and every earlier episode still traverses the
+        # authored static suffix before the clip boundary.
         use_adaptive_sampling=False,
+        exclude_repeated_terminal_frames_from_random_starts=True,
         adaptive_failure_term_names=(),
         random_phase_env_mask_attr="_climb_box_random_phase_env_mask",
         reference_transform_asset_name="platform",
@@ -1047,14 +1051,14 @@ class ELF3ClimbTerminationsCfg:
             "body_names": ELF3_CLIMB_END_EFFECTOR_NAMES,
         },
     )
-    # Keep physical failures above all boundary classifiers.  The authored
-    # clip boundary is a task-defined terminal state, not an external timeout:
-    # PPO must not retain a continuing-state value bootstrap beyond it.
-    # This order also makes success, quality failure, and the generic boundary
-    # mutually exclusive through the accumulated ``terminated`` mask.
+    # Keep physical failures as true terminations.  Every normal authored clip
+    # completion is instead a truncation, including its success/failure label,
+    # so PPO bootstraps the value of the repeated stationary reference rather
+    # than learning an artificial zero-value cliff at the dataset boundary.
+    # Term order still makes the three completion labels mutually exclusive.
     motion_end_success = DoneTerm(
         func=mdp.motion_end_success,
-        time_out=False,
+        time_out=True,
         params={
             "command_name": "motion",
             "platform_cfg": SceneEntityCfg("platform"),
@@ -1089,7 +1093,7 @@ class ELF3ClimbTerminationsCfg:
     )
     motion_end_failure = DoneTerm(
         func=mdp.motion_end_failure,
-        time_out=False,
+        time_out=True,
         params={
             "command_name": "motion",
             "success_term_name": "motion_end_success",
@@ -1097,8 +1101,11 @@ class ELF3ClimbTerminationsCfg:
     )
     motion_clip_end = DoneTerm(
         func=mdp.motion_clip_end,
-        time_out=False,
-        params={"command_name": "motion"},
+        time_out=True,
+        params={
+            "command_name": "motion",
+            "classified_term_names": ("motion_end_success", "motion_end_failure"),
+        },
     )
 
 

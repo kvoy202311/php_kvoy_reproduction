@@ -66,6 +66,10 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         self.assertTrue(keywords["terminate_on_motion_end"].value)
         self.assertIsInstance(keywords["use_adaptive_sampling"], ast.Constant)
         self.assertFalse(keywords["use_adaptive_sampling"].value)
+        self.assertIsInstance(
+            keywords["exclude_repeated_terminal_frames_from_random_starts"], ast.Constant
+        )
+        self.assertTrue(keywords["exclude_repeated_terminal_frames_from_random_starts"].value)
         self.assertIsInstance(keywords["adaptive_failure_term_names"], ast.Tuple)
         self.assertEqual(keywords["adaptive_failure_term_names"].elts, [])
         for keyword_name in (
@@ -228,7 +232,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
                 )
                 term_keywords = {keyword.arg: keyword.value for keyword in assignment.value.keywords}
                 self.assertEqual(ast.unparse(term_keywords["func"]), function_name)
-                self.assertFalse(ast.literal_eval(term_keywords["time_out"]))
+                self.assertTrue(ast.literal_eval(term_keywords["time_out"]))
 
         episode_timeout_assignment = next(
             node
@@ -280,7 +284,7 @@ class ClimbTerminalConfigTest(unittest.TestCase):
         }
         self.assertEqual(ast.unparse(motion_clip_end_keywords["func"]), "mdp.motion_clip_end")
         self.assertIsInstance(motion_clip_end_keywords["time_out"], ast.Constant)
-        self.assertFalse(motion_clip_end_keywords["time_out"].value)
+        self.assertTrue(motion_clip_end_keywords["time_out"].value)
         self.assertIsInstance(motion_clip_end_keywords["params"], ast.Dict)
         motion_clip_end_params = {
             ast.literal_eval(key): ast.literal_eval(value)
@@ -290,7 +294,13 @@ class ClimbTerminalConfigTest(unittest.TestCase):
                 strict=True,
             )
         }
-        self.assertEqual(motion_clip_end_params, {"command_name": "motion"})
+        self.assertEqual(
+            motion_clip_end_params,
+            {
+                "command_name": "motion",
+                "classified_term_names": ("motion_end_success", "motion_end_failure"),
+            },
+        )
 
         curriculum_class = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ELF3ClimbCurriculumCfg"
