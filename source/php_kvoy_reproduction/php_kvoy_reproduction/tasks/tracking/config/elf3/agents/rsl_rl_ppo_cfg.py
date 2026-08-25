@@ -15,3 +15,10 @@ class ELF3ClimbPPORunnerCfg(G1FlatPPORunnerCfg):
     """PPO baseline for the ELF3 climb expert, logged separately from flat tracking."""
 
     experiment_name = "elf3_climb"
+
+
+@configclass
+class ELF3DownRollPPORunnerCfg(G1FlatPPORunnerCfg):
+    """PPO baseline for the fixed-platform ELF3 down-roll expert."""
+
+    experiment_name = "elf3_down_roll"

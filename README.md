@@ -1,6 +1,6 @@
 # PHP-Kvoy Reproduction
 
-基于 Isaac Lab 的 ELF3 机器人动作跟踪与攀爬专家策略训练工程。当前主要任务是让一个策略同时学习同一技能的多个 NPZ 动作片段，并在 0.60–0.70 m 随机高度的平台上完成攀爬和最终站立。
+基于 Isaac Lab 的 ELF3 机器人动作跟踪与平台技能专家策略训练工程。当前包含固定 0.66 m 平台的攀爬与 down-roll 专家任务。
 
 ## 环境与安装
 
@@ -34,11 +34,33 @@ conda run -n mimic python scripts/convert_elf3_holosoma2wbt_npz.py \
   data/processed_motions/elf3/climb_50hz_default_start_v1
 ```
 
+0.66 m down-roll 使用独立的离线接触修正版：
+
+```text
+data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1/
+```
+
+该版本只在足底会穿入 0.66 m 台面的离台阶段平滑修正根部 Z；29 个关节、根部 XY/姿态和首次地面接触后的滚翻恢复保持原数据不变。重新生成命令为：
+
+```bash
+conda run -p /home/kvoy/.holosoma_deps/miniconda3/envs/hsretargeting \
+  python scripts/rebuild_elf3_down_roll_platform_height.py \
+  data/motions/elf3/down_roll_50hz \
+  data/motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --holosoma-root /home/kvoy/Desktop/PHP-kvoy/holosoma \
+  --platform-height 0.66
+
+conda run -n mimic python scripts/convert_elf3_holosoma2wbt_npz.py \
+  data/motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1
+```
+
 ## 任务
 
 | 任务 | 用途 |
 | --- | --- |
-| `Tracking-Climb-ELF3-v0` | 0.60–0.70 m 平台攀爬专家训练与评估 |
+| `Tracking-Climb-ELF3-v0` | 固定 0.66 m 平台攀爬专家训练与评估 |
+| `Tracking-DownRoll-ELF3-v0` | 固定 0.66 m 平台下台翻滚专家训练与评估 |
 | `Tracking-Flat-ELF3-v0` | 平地动作跟踪 |
 
 ## 训练
@@ -67,6 +89,20 @@ python scripts/rsl_rl/train.py \
   --max_iterations 100000 \
   --logger tensorboard \
   --run_name elf3_climb_single \
+  --device cuda:0 \
+  --headless
+```
+
+### Down-roll 专家
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Tracking-DownRoll-ELF3-v0 \
+  --motion_dir /home/kvoy/Desktop/php_kvoy_reproduction/data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --num_envs 2048 \
+  --max_iterations 200000 \
+  --logger tensorboard \
+  --run_name elf3_down_roll \
   --device cuda:0 \
   --headless
 ```
