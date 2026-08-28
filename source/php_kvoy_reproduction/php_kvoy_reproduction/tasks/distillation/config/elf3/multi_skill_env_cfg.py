@@ -11,7 +11,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import ContactSensorCfg, TiledCameraCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, TiledCameraCfg, patterns
 from isaaclab.utils import configclass
 
 import php_kvoy_reproduction.tasks.distillation.mdp as mdp
@@ -27,6 +27,8 @@ from php_kvoy_reproduction.tasks.tracking.config.elf3.climb_env_cfg import (
     ELF3_CLIMB_EXPERT_JOINT_WORST_GROUP_WEIGHT,
     ELF3_CLIMB_EXPERT_JOINT_WORST_WEIGHT,
     ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET,
+    ELF3_CLIMB_HEIGHT_SCAN_RESOLUTION,
+    ELF3_CLIMB_HEIGHT_SCAN_SIZE,
     ELF3_CLIMB_JOINT_NAMES,
     ELF3_CLIMB_JOINT_POSITION_TARGET_LIMITS,
     ELF3_CLIMB_PLATFORM_CENTER,
@@ -44,11 +46,19 @@ from php_kvoy_reproduction.tasks.tracking.config.elf3.down_roll_env_cfg import (
 from php_kvoy_reproduction.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 
 
+# The D435i publishes 848x480 depth at 30 Hz on hardware.  Rendering the
+# student's 87x58 tensor directly avoids the prohibitive cost of a native-size
+# camera per environment while retaining the measured hardware field of view.
 DEPTH_HEIGHT = 58
 DEPTH_WIDTH = 87
 DEPTH_NEAR = 0.15
 DEPTH_FAR = 2.0
-DEPTH_CAPTURE_FREQUENCY_HZ = 30.0
+DEPTH_CAPTURE_FREQUENCY_HZ = mdp.ELF3_D435I_REFERENCE_DEPTH_FPS
+DEPTH_SENSOR_NEAR, DEPTH_SENSOR_FAR = mdp.ELF3_D435I_DEPLOYMENT_DEPTH_RANGE_M
+DEPTH_FOCAL_LENGTH = 11.2
+DEPTH_HORIZONTAL_APERTURE = 20.955
+DEPTH_VERTICAL_FOV_RAD = mdp.ELF3_D435I_REFERENCE_DEPTH_VERTICAL_FOV_RAD
+DEPTH_VERTICAL_APERTURE = 2.0 * DEPTH_FOCAL_LENGTH * math.tan(0.5 * DEPTH_VERTICAL_FOV_RAD)
 CAMERA_TRANSLATION_RANDOMIZATION = 0.025
 CAMERA_ROTATION_RANDOMIZATION = math.radians(2.5)
 
@@ -76,7 +86,7 @@ ELF3_DISTILL_MIN_GROUND_UPWARD_FORCE_N = 20.0
 
 @configclass
 class ELF3MultiSkillSceneCfg(ELF3ClimbSceneCfg):
-    """Randomized platform scene augmented with one batched torso depth camera."""
+    """Randomized platform scene augmented with one batched head D435i camera."""
 
     # Ground and platform contacts are deliberately independent per foot.  A
     # climb state may therefore contain one platform-supported foot and one
@@ -107,8 +117,33 @@ class ELF3MultiSkillSceneCfg(ELF3ClimbSceneCfg):
         debug_vis=False,
     )
 
+    # The TienKung locomotion teacher was trained with its 1.6 x 1.0 m scan
+    # centered on the torso (x=0).  The climb/down-roll teachers use the
+    # inherited x=0.4 m scanner.  Equal 187-D shapes do not make these two
+    # spatial contracts interchangeable, so each frozen teacher receives its
+    # own exact ray origin while the analytical platform overlay remains
+    # shared.
+    locomotion_height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(
+            resolution=ELF3_CLIMB_HEIGHT_SCAN_RESOLUTION,
+            size=ELF3_CLIMB_HEIGHT_SCAN_SIZE,
+        ),
+        mesh_prim_paths=["/World/ground"],
+        update_period=0.02,
+        debug_vis=False,
+        drift_range=(0.0, 0.0),
+        ray_cast_drift_range={"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+    )
+
     depth_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/torso_link/DistillationDepthCamera",
+        # The unmodified URDF contains d435i_link, but fixed-link merging folds
+        # it into torso_link in the runtime USD.  This sensor prim therefore
+        # remains a torso child while its offset is the exact URDF head-camera
+        # transform evaluated at the fixed deployment head pitch.
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link/HeadD435iDepthCamera",
         # Rendering remains on the 50 Hz control grid.  The observation term
         # performs absolute-time 30 Hz scheduling and reads this sensor only
         # when a capture is due.
@@ -117,15 +152,20 @@ class ELF3MultiSkillSceneCfg(ELF3ClimbSceneCfg):
         height=DEPTH_HEIGHT,
         data_types=["distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=11.2,
-            horizontal_aperture=20.955,
-            clipping_range=(DEPTH_NEAR, DEPTH_FAR),
+            focal_length=DEPTH_FOCAL_LENGTH,
+            horizontal_aperture=DEPTH_HORIZONTAL_APERTURE,
+            # Resizing a physical D435i stream to 87x58 must retain its field
+            # of view.  Setting this explicitly avoids deriving an incorrect
+            # vertical FOV from the non-native output aspect ratio.
+            vertical_aperture=DEPTH_VERTICAL_APERTURE,
+            # Match the verified deployment simulator's raw operating range.
+            # The observation term independently clips the network input to
+            # 0.15--2.0 m before normalization.
+            clipping_range=(DEPTH_SENSOR_NEAR, DEPTH_SENSOR_FAR),
         ),
-        # Camera world convention is +X forward and +Z up.  A 15 degree
-        # downward pitch keeps both the near ground and 0.66 m edge visible.
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.10, 0.0, 0.25),
-            rot=(0.9914448614, 0.0, 0.1305261922, 0.0),
+            pos=mdp.ELF3_HEAD_D435I_CAMERA_POS,
+            rot=mdp.ELF3_HEAD_D435I_CAMERA_ROT,
             convention="world",
         ),
     )
@@ -290,7 +330,7 @@ class ELF3MultiSkillObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.box_obstacle_height_scan,
             params={
-                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "sensor_cfg": SceneEntityCfg("locomotion_height_scanner"),
                 "asset_cfg": SceneEntityCfg("platform"),
                 "base_size": ELF3_CLIMB_PLATFORM_SIZE,
                 "offset": ELF3_CLIMB_HEIGHT_SCAN_VALUE_OFFSET,
@@ -573,6 +613,10 @@ class ELF3MultiSkillRewardsCfg:
 @configclass
 class ELF3MultiSkillTerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    transition_failure = DoneTerm(
+        func=mdp.routed_transition_failure,
+        params={"command_name": "multi_skill"},
+    )
     motion_tracking_failure = DoneTerm(
         func=mdp.routed_motion_tracking_failure,
         params={"command_name": "multi_skill"},
@@ -634,6 +678,9 @@ class ELF3MultiSkillEventCfg:
         mode="reset",
         params={
             "sensor_cfg": SceneEntityCfg("depth_camera"),
+            # d435i_link is merged into this rigid body by the checked-in USD;
+            # randomization composes around the deployment-aligned nominal
+            # sensor transform above, without changing the robot asset.
             "parent_asset_cfg": SceneEntityCfg("robot", body_names=["torso_link"]),
             "translation_range_m": (
                 -CAMERA_TRANSLATION_RANDOMIZATION,
@@ -673,6 +720,7 @@ class ELF3MultiSkillEnvCfg(TrackingEnvCfg):
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+        self.scene.locomotion_height_scanner.update_period = self.decimation * self.sim.dt
         self.viewer.eye = (2.5, 2.5, 2.0)
         self.viewer.origin_type = "world"
         self.viewer.asset_name = None

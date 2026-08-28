@@ -71,6 +71,31 @@ class _FakeTeacherRouter:
         )
 
 
+class _FakeIterationCommand:
+    def __init__(self) -> None:
+        self.iterations: list[int] = []
+
+    def set_training_iteration(self, iteration: int) -> None:
+        self.iterations.append(iteration)
+
+
+class _FakeCommandManager:
+    def __init__(self, command: _FakeIterationCommand) -> None:
+        self.command = command
+
+    def get_term(self, name: str):
+        assert name == "multi_skill"
+        return self.command
+
+
+class _FakeEnvironmentWithIteration(_FakeEnvironment):
+    def __init__(self) -> None:
+        super().__init__()
+        self.iteration_command = _FakeIterationCommand()
+        self.command_manager = _FakeCommandManager(self.iteration_command)
+        self.unwrapped = self
+
+
 def _train_cfg() -> dict:
     return {
         "device": "cpu",
@@ -152,6 +177,83 @@ def test_checkpoint_restores_absolute_iteration_and_adapted_learning_rate(tmp_pa
     assert {group["lr"] for group in resumed.alg.optimizer.param_groups} == {7.5e-5}
 
 
+def test_checkpoint_stage_allows_same_resume_and_only_adjacent_warm_start(tmp_path) -> None:
+    atomic = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="atomic",
+    )
+    atomic_checkpoint = tmp_path / "atomic.pt"
+    atomic.save(atomic_checkpoint)
+
+    atomic_resume = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="atomic",
+    )
+    atomic_resume.load(atomic_checkpoint)
+    assert atomic_resume.loaded_training_stage == "atomic"
+
+    transition = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="transition",
+    )
+    transition.load(atomic_checkpoint, load_optimizer=False)
+    transition_checkpoint = tmp_path / "transition.pt"
+    transition.save(transition_checkpoint)
+
+    full = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="full",
+    )
+    full.load(transition_checkpoint, load_optimizer=False)
+    with pytest.raises(ValueError, match="immediately preceding"):
+        full.load(atomic_checkpoint, load_optimizer=False)
+
+
+def test_checkpoint_stage_rejects_cross_stage_resume_and_unverifiable_source(tmp_path) -> None:
+    atomic = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="atomic",
+    )
+    atomic_checkpoint = tmp_path / "atomic.pt"
+    atomic.save(atomic_checkpoint)
+
+    transition = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        training_stage="transition",
+    )
+    with pytest.raises(ValueError, match="same curriculum stage"):
+        transition.load(atomic_checkpoint)
+
+    unspecified = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+    )
+    unspecified_checkpoint = tmp_path / "unspecified.pt"
+    unspecified.save(unspecified_checkpoint)
+    with pytest.raises(ValueError, match="does not record"):
+        transition.load(unspecified_checkpoint, load_optimizer=False)
+
+
 def test_checkpoint_rejects_changed_teacher_fingerprints(tmp_path) -> None:
     source = DistillationRunner(
         _FakeEnvironment(),
@@ -216,6 +318,56 @@ def test_warm_start_allows_intentional_environment_contract_change(tmp_path) -> 
     warm_started.load(checkpoint, load_optimizer=False)
 
 
+@pytest.mark.parametrize(
+    "load_kwargs",
+    ({}, {"load_optimizer": False}, {"load_optimizer": False, "restore_training_state": True}),
+)
+def test_checkpoint_always_rejects_changed_policy_input_contract(tmp_path, load_kwargs) -> None:
+    source = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        policy_input_contract={"camera_parent": "head", "vfov": 58.0},
+    )
+    checkpoint = tmp_path / "model_0.pt"
+    source.save(checkpoint)
+    target = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        policy_input_contract={"camera_parent": "torso", "vfov": 58.0},
+    )
+    with pytest.raises(ValueError, match="Student camera"):
+        target.load(checkpoint, **load_kwargs)
+
+
+def test_legacy_checkpoint_without_policy_input_contract_warns(tmp_path) -> None:
+    source = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        policy_input_contract={"camera_parent": "head"},
+    )
+    checkpoint = tmp_path / "legacy.pt"
+    source.save(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload.pop("policy_input_contract_fingerprint")
+    torch.save(payload, checkpoint)
+
+    target = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+        policy_input_contract={"camera_parent": "head"},
+    )
+    with pytest.warns(RuntimeWarning, match="predates"):
+        target.load(checkpoint, load_optimizer=False)
+
+
 def test_checkpoint_warm_start_loads_student_but_resets_training_state(tmp_path) -> None:
     source = DistillationRunner(
         _FakeEnvironment(),
@@ -248,6 +400,58 @@ def test_checkpoint_warm_start_loads_student_but_resets_training_state(tmp_path)
     assert warm_started.tot_time == 0.0
     assert warm_started.alg.learning_rate == 1.0e-4
     assert {group["lr"] for group in warm_started.alg.optimizer.param_groups} == {1.0e-4}
+
+
+def test_checkpoint_inference_restores_iteration_without_optimizer(tmp_path) -> None:
+    source = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+    )
+    source.current_learning_iteration = 10_001
+    source.tot_timesteps = 123_456
+    checkpoint = tmp_path / "model_10000.pt"
+    source.save(checkpoint)
+
+    inference_cfg = _train_cfg()
+    inference_cfg["environment_iteration_command"] = "multi_skill"
+    inference_env = _FakeEnvironmentWithIteration()
+    inference = DistillationRunner(
+        inference_env,
+        inference_cfg,
+        _FakeTeacherRouter(),
+        device="cpu",
+    )
+    inference.load(
+        checkpoint,
+        load_optimizer=False,
+        restore_training_state=True,
+    )
+
+    assert inference.current_learning_iteration == 10_001
+    assert inference.tot_timesteps == 123_456
+    assert inference.alg.learning_rate == 1.0e-4
+    assert inference_env.iteration_command.iterations == [10_000]
+
+
+def test_checkpoint_rejects_optimizer_without_training_state(tmp_path) -> None:
+    source = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+    )
+    checkpoint = tmp_path / "model_0.pt"
+    source.save(checkpoint)
+    target = DistillationRunner(
+        _FakeEnvironment(),
+        _train_cfg(),
+        _FakeTeacherRouter(),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="optimizer requires"):
+        target.load(checkpoint, load_optimizer=True, restore_training_state=False)
 
 
 def test_serialized_cuda_rng_states_are_restored_as_cpu_byte_tensors() -> None:

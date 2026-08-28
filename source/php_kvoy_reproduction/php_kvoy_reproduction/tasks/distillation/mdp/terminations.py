@@ -6,7 +6,6 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply_inverse
 
 from .commands import MultiSkillCommand
 
@@ -26,6 +25,12 @@ def routed_motion_clip_end(env, command_name: str) -> torch.Tensor:
     return direct_motion_end | command.episode_complete
 
 
+def routed_transition_failure(env, command_name: str) -> torch.Tensor:
+    """Terminate an approach/settle that missed its bounded transition contract."""
+
+    return _command(env, command_name).transition_failed
+
+
 def routed_motion_tracking_failure(env, command_name: str) -> torch.Tensor:
     """Terminate outside a scheduled relaxation of the teacher's scope.
 
@@ -39,30 +44,14 @@ def routed_motion_tracking_failure(env, command_name: str) -> torch.Tensor:
     command = _command(env, command_name)
     motion = command.motion_mask
     scale = command.student_termination_scale
-    anchor_z_error = torch.abs(command.anchor_pos_w[:, 2] - command.robot_anchor_pos_w[:, 2])
-    reference_gravity = quat_apply_inverse(
-        command.anchor_quat_w,
-        command.robot.data.GRAVITY_VEC_W,
-    )
-    robot_gravity = quat_apply_inverse(
-        command.robot_anchor_quat_w,
-        command.robot.data.GRAVITY_VEC_W,
-    )
-    orientation_error = torch.abs(reference_gravity[:, 2] - robot_gravity[:, 2])
-    end_effector_ids = torch.tensor(
-        [command.cfg.body_names.index(name) for name in command.cfg.teacher_end_effector_names],
-        device=command.device,
-        dtype=torch.long,
-    )
-    end_effector_z_error = torch.abs(
-        command.body_pos_relative_w[:, end_effector_ids, 2]
-        - command.robot_body_pos_w[:, end_effector_ids, 2]
-    ).amax(dim=1)
-    outside = (
-        (anchor_z_error > command.cfg.teacher_anchor_z_threshold * scale)
-        | (orientation_error > command.cfg.teacher_orientation_threshold * scale)
-        | (end_effector_z_error > command.cfg.teacher_end_effector_z_threshold * scale)
-    )
+    outside = torch.zeros(command.num_envs, device=command.device, dtype=torch.bool)
+    motion_ids = torch.where(motion)[0]
+    if motion_ids.numel() > 0:
+        outside[motion_ids] = ~command.motion_kinematic_scope_valid(
+            motion_ids,
+            command.skill_ids[motion_ids],
+            threshold_scale=scale,
+        )
     return motion & command.motion_tracking_termination_enabled & outside
 
 
@@ -106,7 +95,7 @@ def locomotion_illegal_contact(
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     forces = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids]
     contact = torch.any(torch.linalg.vector_norm(forces, dim=-1) > threshold, dim=(1, 2))
-    return command.locomotion_mask & contact
+    return command.locomotion_mask & command.locomotion_contact_termination_enabled & contact
 
 
 def non_finite_robot_state(
@@ -129,4 +118,5 @@ __all__ = [
     "non_finite_robot_state",
     "routed_motion_clip_end",
     "routed_motion_tracking_failure",
+    "routed_transition_failure",
 ]

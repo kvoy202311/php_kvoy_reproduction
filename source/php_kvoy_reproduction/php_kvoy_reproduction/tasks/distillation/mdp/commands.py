@@ -27,8 +27,13 @@ from php_kvoy_reproduction.distillation.skill_routing import (
     DOWN_ROLL_SKILL_ID,
     LOCOMOTION_SKILL_ID,
     NUM_SKILLS,
+    approach_transition_status,
     balanced_skill_ids,
+    climb_settle_geometry_ready,
+    down_roll_settle_geometry_ready,
     down_roll_transition_ready,
+    motion_boundary_alignment_ready,
+    planar_command_speed_valid,
     platform_height_teacher_confidence,
     platform_reference_center_offsets,
 )
@@ -103,7 +108,7 @@ class MultiSkillCommand(CommandTerm):
     This makes transition exposure independent of the very different episode
     lengths.  A configurable subset of climb/down-roll resets additionally
     traverses observable locomotion-to-motion and motion-to-locomotion stages;
-    the remaining resets retain uniform atomic-motion phase coverage.
+    the remaining resets mix complete atomic clips with uniform phase coverage.
     """
 
     cfg: "MultiSkillCommandCfg"
@@ -123,12 +128,61 @@ class MultiSkillCommand(CommandTerm):
             or cfg.platform_size[2] != cfg.platform_height
         ):
             raise ValueError("platform_size z and platform_height must be the same positive value")
+        if (
+            len(cfg.motion_world_command) != 2
+            or not all(math.isfinite(value) for value in cfg.motion_world_command)
+            or math.hypot(*cfg.motion_world_command) <= 0.0
+        ):
+            raise ValueError("motion_world_command must contain one finite non-zero planar command")
+        if cfg.forced_world_command is not None and (
+            len(cfg.forced_world_command) != 2
+            or not all(math.isfinite(value) for value in cfg.forced_world_command)
+        ):
+            raise ValueError("forced_world_command must contain two finite values")
         if not 0.0 <= cfg.locomotion_standing_fraction < 1.0:
             raise ValueError("locomotion_standing_fraction must lie in [0, 1)")
         if not 0.0 < cfg.locomotion_speed_range[0] <= cfg.locomotion_speed_range[1]:
             raise ValueError("locomotion_speed_range must be positive and ordered")
+        if (
+            len(cfg.locomotion_teacher_lin_vel_x_range) != 2
+            or not all(math.isfinite(value) for value in cfg.locomotion_teacher_lin_vel_x_range)
+            or cfg.locomotion_teacher_lin_vel_x_range[0]
+            > cfg.locomotion_teacher_lin_vel_x_range[1]
+            or cfg.locomotion_teacher_lin_vel_x_range[1] <= 0.0
+        ):
+            raise ValueError(
+                "locomotion_teacher_lin_vel_x_range must be finite, ordered, and allow positive speed"
+            )
+        if cfg.locomotion_speed_range[1] > cfg.locomotion_teacher_lin_vel_x_range[1]:
+            raise ValueError(
+                "locomotion_speed_range maximum must not exceed the locomotion teacher maximum"
+            )
+        maximum_requested_speed = cfg.locomotion_speed_range[1]
+        if math.hypot(*cfg.motion_world_command) > maximum_requested_speed:
+            raise ValueError(
+                "motion_world_command speed must not exceed locomotion_speed_range maximum"
+            )
+        if (
+            cfg.forced_world_command is not None
+            and math.hypot(*cfg.forced_world_command) > maximum_requested_speed
+        ):
+            raise ValueError(
+                "forced_world_command speed must not exceed locomotion_speed_range maximum"
+            )
         if cfg.locomotion_command_resampling_time_s <= 0.0:
             raise ValueError("locomotion command resampling time must be positive")
+        if not isinstance(cfg.locked_command_resampling_enabled, bool):
+            raise ValueError("locked_command_resampling_enabled must be a boolean")
+        if (
+            len(cfg.locked_command_resampling_time_range_s) != 2
+            or not all(
+                math.isfinite(value) and value > 0.0
+                for value in cfg.locked_command_resampling_time_range_s
+            )
+            or cfg.locked_command_resampling_time_range_s[0]
+            > cfg.locked_command_resampling_time_range_s[1]
+        ):
+            raise ValueError("locked command resampling time range must be positive and ordered")
         if cfg.gait_cycle <= 0.0:
             raise ValueError("gait_cycle must be positive")
         if not 0.0 <= cfg.composed_episode_fraction <= 1.0:
@@ -137,8 +191,22 @@ class MultiSkillCommand(CommandTerm):
             raise ValueError("approach_distance_range must be positive and ordered")
         if cfg.approach_switch_distance <= 0.0:
             raise ValueError("approach_switch_distance must be positive")
-        if cfg.composed_locomotion_speed <= 0.0:
-            raise ValueError("composed_locomotion_speed must be positive")
+        for name, value in (
+            ("approach_lateral_tolerance", cfg.approach_lateral_tolerance),
+            ("approach_maximum_overshoot", cfg.approach_maximum_overshoot),
+            ("approach_timeout_s", cfg.approach_timeout_s),
+            ("transition_maximum_settle_time_s", cfg.transition_maximum_settle_time_s),
+            ("transition_maximum_joint_position_rms", cfg.transition_maximum_joint_position_rms),
+            ("transition_maximum_joint_speed_rms", cfg.transition_maximum_joint_speed_rms),
+            ("transition_maximum_gravity_xy_norm", cfg.transition_maximum_gravity_xy_norm),
+            ("climb_maximum_heading_error", cfg.climb_maximum_heading_error),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if cfg.climb_maximum_heading_error > math.pi:
+            raise ValueError("climb_maximum_heading_error must not exceed pi")
+        if not 0.0 <= cfg.atomic_motion_start_at_beginning_fraction <= 1.0:
+            raise ValueError("atomic_motion_start_at_beginning_fraction must lie in [0, 1]")
         for name, duration_range in (
             ("transition_settle_time_range_s", cfg.transition_settle_time_range_s),
             ("post_locomotion_time_range_s", cfg.post_locomotion_time_range_s),
@@ -164,10 +232,15 @@ class MultiSkillCommand(CommandTerm):
         if not 0.0 <= cfg.motion_tracking_termination_min_confidence <= 1.0:
             raise ValueError("motion_tracking_termination_min_confidence must lie in [0, 1]")
         if (
-            not math.isfinite(cfg.top_locomotion_settle_time_s)
-            or cfg.top_locomotion_settle_time_s < 0.0
+            not math.isfinite(cfg.post_motion_command_release_time_s)
+            or cfg.post_motion_command_release_time_s < 0.0
         ):
-            raise ValueError("top_locomotion_settle_time_s must be non-negative")
+            raise ValueError("post_motion_command_release_time_s must be non-negative")
+        if (
+            not math.isfinite(cfg.post_climb_contact_grace_time_s)
+            or cfg.post_climb_contact_grace_time_s < 0.0
+        ):
+            raise ValueError("post_climb_contact_grace_time_s must be non-negative")
         if (
             len(cfg.down_roll_edge_distance_range) != 2
             or not all(math.isfinite(value) for value in cfg.down_roll_edge_distance_range)
@@ -261,19 +334,44 @@ class MultiSkillCommand(CommandTerm):
         self.transition_time_left = torch.zeros(self.num_envs, device=self.device)
         self.transition_stage_elapsed = torch.zeros(self.num_envs, device=self.device)
         self.transition_target_xy = torch.zeros(self.num_envs, 2, device=self.device)
+        self.pending_motion_skill_ids = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.transition_failed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.last_motion_skill_ids = torch.full(
             (self.num_envs,), -1, device=self.device, dtype=torch.long
         )
-        self.top_locomotion_released = torch.zeros(
+        self.post_motion_command_released = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self.training_iteration = 0
         self.episode_started_at_motion_beginning = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.episode_reached_motion = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.episode_completed_climb = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.episode_reached_top_locomotion = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.episode_started_down_roll = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        # Keep the live deployment request separate from the privileged
+        # training controller.  The Actor always observes the latest request,
+        # while ``world_command`` may deliberately stop the locomotion teacher
+        # during a committed climb/down-roll boundary and resumes the latest
+        # request only after that motion has been released safely.
+        self.requested_world_command = torch.zeros(self.num_envs, 2, device=self.device)
         self.world_command = torch.zeros(self.num_envs, 2, device=self.device)
         self.heading_target = self.robot.data.heading_w.clone()
         self.locomotion_command_time_left = torch.zeros(self.num_envs, device=self.device)
+        self.locked_command_time_left = torch.full(
+            (self.num_envs,), float("inf"), device=self.device
+        )
         self.gait_time = torch.zeros(self.num_envs, device=self.device)
         self.gait_phase = torch.zeros(self.num_envs, 2, device=self.device)
         self.phase_ratio = torch.tensor(cfg.gait_air_ratios, device=self.device).repeat(self.num_envs, 1)
@@ -294,6 +392,31 @@ class MultiSkillCommand(CommandTerm):
         self.metrics["platform_length"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["platform_width"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["platform_height"] = torch.zeros(self.num_envs, device=self.device)
+        for name in (
+            "stage_approach",
+            "stage_settle",
+            "stage_motion",
+            "stage_post_locomotion",
+            "approach_longitudinal_error",
+            "approach_lateral_error",
+            "settle_joint_position_rms",
+            "settle_joint_speed_rms",
+            "settle_gravity_xy_norm",
+            "settle_geometry_ready",
+            "settle_kinematic_scope_valid",
+            "motion_control_locked",
+            "command_suppressed",
+            "requested_command_speed",
+            "active_command_speed",
+            "post_motion_command_released",
+            "transition_failed",
+            "motion_started_at_beginning",
+            "episode_reached_motion",
+            "episode_completed_climb",
+            "episode_reached_top_locomotion",
+            "episode_started_down_roll",
+        ):
+            self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -316,6 +439,21 @@ class MultiSkillCommand(CommandTerm):
     @property
     def motion_mask(self) -> torch.Tensor:
         return self.skill_ids != LOCOMOTION_SKILL_ID
+
+    @property
+    def motion_control_locked(self) -> torch.Tensor:
+        """Whether a committed motion temporarily owns whole-body control.
+
+        Approach remains ordinary command-responsive locomotion.  Locking
+        begins at the boundary settle, covers the complete climb/down-roll
+        clip, and ends only after the short post-motion safety release.
+        """
+
+        settling = self.transition_stage == _SETTLE_STAGE
+        post_release = (self.transition_stage == _POST_LOCOMOTION_STAGE) & (
+            ~self.post_motion_command_released
+        )
+        return settling | self.motion_mask | post_release
 
     def mask_for_skill(self, skill: str | int) -> torch.Tensor:
         if isinstance(skill, str):
@@ -364,8 +502,15 @@ class MultiSkillCommand(CommandTerm):
         self.transition_stage[ids] = _DIRECT_STAGE
         self.transition_time_left[ids] = 0.0
         self.transition_stage_elapsed[ids] = 0.0
+        self.pending_motion_skill_ids[ids] = -1
+        self.transition_failed[ids] = False
         self.last_motion_skill_ids[ids] = -1
-        self.top_locomotion_released[ids] = False
+        self.post_motion_command_released[ids] = False
+        self.locked_command_time_left[ids] = float("inf")
+        self.episode_reached_motion[ids] = False
+        self.episode_completed_climb[ids] = False
+        self.episode_reached_top_locomotion[ids] = False
+        self.episode_started_down_roll[ids] = False
         self.gait_time[ids] = 0.0
         self.gait_phase[ids] = self.phase_offset[ids]
 
@@ -373,6 +518,9 @@ class MultiSkillCommand(CommandTerm):
         climb_ids = ids[sampled == CLIMB_SKILL_ID]
         down_ids = ids[sampled == DOWN_ROLL_SKILL_ID]
         self._reset_platform(ids, sampled)
+        motion_route_ids = ids[sampled != LOCOMOTION_SKILL_ID]
+        if motion_route_ids.numel() > 0:
+            self._initialize_motion_requested_command(motion_route_ids)
         if locomotion_ids.numel() > 0:
             self._reset_locomotion(locomotion_ids)
         for routed_ids, skill_id in (
@@ -389,7 +537,7 @@ class MultiSkillCommand(CommandTerm):
             direct_ids = routed_ids[~compose]
             composed_ids = routed_ids[compose]
             if direct_ids.numel() > 0:
-                self._reset_motion_skill(direct_ids, skill_id)
+                self._reset_atomic_motion(direct_ids, skill_id)
             if composed_ids.numel() > 0:
                 self._reset_motion_skill(
                     composed_ids,
@@ -459,6 +607,158 @@ class MultiSkillCommand(CommandTerm):
 
     def _candidate_motion_ids(self, skill_id: int) -> torch.Tensor:
         return self.motion.climb_motion_ids if skill_id == CLIMB_SKILL_ID else self.motion.down_roll_motion_ids
+
+    def _reset_atomic_motion(self, env_ids: torch.Tensor, skill_id: int) -> None:
+        """Mix full-clip starts with uniform phase coverage for atomic skills."""
+
+        self.episode_reached_motion[env_ids] = True
+        if skill_id == DOWN_ROLL_SKILL_ID:
+            self.episode_started_down_roll[env_ids] = True
+        if self.cfg.start_at_motion_beginning:
+            self._reset_motion_skill(env_ids, skill_id, start_at_beginning=True)
+        else:
+            full_start = torch.rand(env_ids.numel(), device=self.device) < (
+                self.cfg.atomic_motion_start_at_beginning_fraction
+            )
+            if torch.any(full_start):
+                self._reset_motion_skill(env_ids[full_start], skill_id, start_at_beginning=True)
+            if torch.any(~full_start):
+                self._reset_motion_skill(env_ids[~full_start], skill_id, start_at_beginning=False)
+        # Atomic clips terminate before returning to locomotion, so immediately
+        # randomizing the still-visible deployment request teaches command
+        # invariance without disrupting a composed transition curriculum.
+        self._begin_motion_command_lock(env_ids, randomize_immediately=True)
+
+    def _reset_gait_phase(self, env_ids: torch.Tensor) -> None:
+        self.gait_time[env_ids] = 0.0
+        self.gait_phase[env_ids] = self.phase_offset[env_ids]
+
+    def _initialize_motion_requested_command(self, env_ids: torch.Tensor) -> None:
+        """Publish the initial live deployment request for a motion-family episode."""
+
+        values = (
+            self.cfg.motion_world_command
+            if self.cfg.forced_world_command is None
+            else self.cfg.forced_world_command
+        )
+        self.requested_world_command[env_ids] = torch.tensor(
+            values,
+            device=self.device,
+            dtype=self.requested_world_command.dtype,
+        )
+
+    def _sample_requested_command_values(self, count: int) -> torch.Tensor:
+        """Sample realistic world-frame deployment requests without applying them."""
+
+        if count < 0:
+            raise ValueError("requested command sample count must be non-negative")
+        if count == 0:
+            return torch.empty(0, 2, device=self.device)
+        if self.cfg.forced_world_command is not None:
+            forced = torch.tensor(
+                self.cfg.forced_world_command,
+                device=self.device,
+                dtype=self.requested_world_command.dtype,
+            )
+            return forced.expand(count, -1).clone()
+        speed = torch.empty(count, device=self.device).uniform_(*self.cfg.locomotion_speed_range)
+        angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+        standing = torch.rand(count, device=self.device) < self.cfg.locomotion_standing_fraction
+        speed[standing] = 0.0
+        return torch.stack((speed * torch.cos(angle), speed * torch.sin(angle)), dim=1)
+
+    def _sync_requested_locomotion_command(self, env_ids: torch.Tensor) -> None:
+        """Apply the latest public request to command-responsive locomotion."""
+
+        if env_ids.numel() == 0:
+            return
+        self._set_fixed_world_command(
+            env_ids,
+            self.requested_world_command[env_ids].clone(),
+        )
+
+    def set_requested_world_command(
+        self,
+        env_ids: Sequence[int] | slice,
+        command: torch.Tensor | Sequence[float],
+    ) -> None:
+        """Update the live deployment request and apply it only when unlocked.
+
+        Hardware may continue publishing joystick commands during climb or
+        down-roll.  Those values remain visible to the Student and are retained
+        here, but they cannot interrupt a committed motion.  The newest value is
+        applied automatically when locomotion is released again.
+        """
+
+        ids = self._normalize_env_ids(env_ids)
+        values = torch.as_tensor(
+            command,
+            device=self.device,
+            dtype=self.requested_world_command.dtype,
+        )
+        if values.shape == (2,):
+            values = values.expand(ids.numel(), -1)
+        if values.shape != (ids.numel(), 2):
+            raise ValueError("requested world command must have shape [2] or [num_envs, 2]")
+        if not bool(torch.isfinite(values).all()):
+            raise ValueError("requested world command must contain only finite values")
+        valid_speed = planar_command_speed_valid(
+            values,
+            maximum_speed=self.cfg.locomotion_speed_range[1],
+        )
+        if not bool(torch.all(valid_speed)):
+            raise ValueError(
+                "requested world command speed must not exceed "
+                f"{self.cfg.locomotion_speed_range[1]:g} m/s"
+            )
+        self.requested_world_command[ids] = values
+        responsive = self.locomotion_mask[ids] & ~self.motion_control_locked[ids]
+        self._sync_requested_locomotion_command(ids[responsive])
+
+    def _begin_motion_command_lock(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        randomize_immediately: bool,
+    ) -> None:
+        """Start nuisance-command scheduling for a committed motion."""
+
+        if env_ids.numel() == 0:
+            return
+        # A new settle/motion commitment supersedes any release state left by
+        # the preceding skill (notably climb -> top locomotion -> down-roll).
+        self.post_motion_command_released[env_ids] = False
+        if not self.cfg.locked_command_resampling_enabled or self.cfg.forced_world_command is not None:
+            self.locked_command_time_left[env_ids] = float("inf")
+            return
+        if randomize_immediately:
+            self.requested_world_command[env_ids] = self._sample_requested_command_values(
+                env_ids.numel()
+            )
+        self.locked_command_time_left[env_ids] = self._sample_transition_duration(
+            env_ids,
+            self.cfg.locked_command_resampling_time_range_s,
+        )
+
+    def _update_locked_requested_commands(self) -> None:
+        """Change only Actor-visible requests while committed motion owns control."""
+
+        locked = self.motion_control_locked
+        if (
+            not self.cfg.locked_command_resampling_enabled
+            or self.cfg.forced_world_command is not None
+            or not torch.any(locked)
+        ):
+            return
+        self.locked_command_time_left[locked] -= self._env.step_dt
+        due = torch.where(locked & (self.locked_command_time_left <= 0.0))[0]
+        if due.numel() == 0:
+            return
+        self.requested_world_command[due] = self._sample_requested_command_values(due.numel())
+        self.locked_command_time_left[due] = self._sample_transition_duration(
+            due,
+            self.cfg.locked_command_resampling_time_range_s,
+        )
 
     def _reset_motion_skill(
         self,
@@ -535,6 +835,12 @@ class MultiSkillCommand(CommandTerm):
         *,
         current_heading: torch.Tensor | None = None,
     ) -> None:
+        """Set only the privileged locomotion-control command.
+
+        The Student-visible deployment request intentionally remains unchanged
+        across approach, settle, motion and post-motion stage transitions.
+        """
+
         if command.shape != (env_ids.numel(), 2):
             raise ValueError("fixed world command must have shape [num_envs, 2]")
         if current_heading is None:
@@ -570,13 +876,20 @@ class MultiSkillCommand(CommandTerm):
         self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
         self.transition_target_xy[env_ids] = target_pos[:, :2]
         self.skill_ids[env_ids] = LOCOMOTION_SKILL_ID
+        self.pending_motion_skill_ids[env_ids] = CLIMB_SKILL_ID
         self.transition_stage[env_ids] = _APPROACH_STAGE
-        speed = torch.full(
-            (env_ids.numel(), 1),
-            self.cfg.composed_locomotion_speed,
-            device=self.device,
+        self.transition_stage_elapsed[env_ids] = 0.0
+        self._reset_gait_phase(env_ids)
+        root_forward = quat_apply(
+            root_state[:, 3:7],
+            torch.tensor((1.0, 0.0, 0.0), device=self.device).expand(env_ids.numel(), -1),
         )
-        self._set_fixed_world_command(env_ids, direction * speed)
+        reset_heading = torch.atan2(root_forward[:, 1], root_forward[:, 0])
+        self._set_fixed_world_command(
+            env_ids,
+            self.requested_world_command[env_ids].clone(),
+            current_heading=reset_heading,
+        )
 
     def _sample_transition_duration(
         self,
@@ -593,17 +906,20 @@ class MultiSkillCommand(CommandTerm):
         )
         reset_heading = torch.atan2(root_forward[:, 1], root_forward[:, 0])
         self.skill_ids[env_ids] = LOCOMOTION_SKILL_ID
+        self.pending_motion_skill_ids[env_ids] = DOWN_ROLL_SKILL_ID
         self.transition_stage[env_ids] = _SETTLE_STAGE
         self.transition_time_left[env_ids] = self._sample_transition_duration(
             env_ids,
             self.cfg.transition_settle_time_range_s,
         )
         self.transition_stage_elapsed[env_ids] = 0.0
+        self._reset_gait_phase(env_ids)
         self._set_fixed_world_command(
             env_ids,
             torch.zeros(env_ids.numel(), 2, device=self.device),
             current_heading=reset_heading,
         )
+        self._begin_motion_command_lock(env_ids, randomize_immediately=False)
 
     def _begin_motion_stage(
         self,
@@ -611,7 +927,7 @@ class MultiSkillCommand(CommandTerm):
         skill_ids: torch.Tensor | None = None,
     ) -> None:
         if skill_ids is None:
-            skill_ids = self.episode_skill_ids[env_ids]
+            skill_ids = self.pending_motion_skill_ids[env_ids]
         if skill_ids.shape != (env_ids.numel(),):
             raise ValueError("motion-stage skill_ids must contain one route per environment")
         if torch.any((skill_ids != CLIMB_SKILL_ID) & (skill_ids != DOWN_ROLL_SKILL_ID)):
@@ -621,6 +937,10 @@ class MultiSkillCommand(CommandTerm):
         self.transition_stage[env_ids] = _MOTION_STAGE
         self.transition_stage_elapsed[env_ids] = 0.0
         self.motion_finished[env_ids] = False
+        self.pending_motion_skill_ids[env_ids] = -1
+        self.episode_reached_motion[env_ids] = True
+        down_roll = skill_ids == DOWN_ROLL_SKILL_ID
+        self.episode_started_down_roll[env_ids[down_roll]] = True
         direction = self._motion_direction_w(env_ids)
         speed = float(math.hypot(*self.cfg.motion_world_command))
         self._set_fixed_world_command(env_ids, direction * speed)
@@ -636,11 +956,14 @@ class MultiSkillCommand(CommandTerm):
         self.last_motion_skill_ids[env_ids] = completed_skill_ids
         self.transition_stage[env_ids] = _POST_LOCOMOTION_STAGE
         self.transition_stage_elapsed[env_ids] = 0.0
-        self.top_locomotion_released[env_ids] = completed_skill_ids != CLIMB_SKILL_ID
+        self._reset_gait_phase(env_ids)
+        self.post_motion_command_released[env_ids] = False
         climb = completed_skill_ids == CLIMB_SKILL_ID
         down_roll = completed_skill_ids == DOWN_ROLL_SKILL_ID
         if torch.any(climb):
             climb_ids = env_ids[climb]
+            self.episode_completed_climb[climb_ids] = True
+            self.episode_reached_top_locomotion[climb_ids] = True
             self.transition_time_left[climb_ids] = self._sample_transition_duration(
                 climb_ids,
                 self.cfg.top_locomotion_time_range_s,
@@ -651,15 +974,15 @@ class MultiSkillCommand(CommandTerm):
                 down_ids,
                 self.cfg.post_locomotion_time_range_s,
             )
-        direction = self._motion_direction_w(env_ids)
-        speed = torch.where(
-            completed_skill_ids == DOWN_ROLL_SKILL_ID,
-            torch.full((env_ids.numel(),), self.cfg.composed_locomotion_speed, device=self.device),
-            torch.zeros(env_ids.numel(), device=self.device),
+        # Both skills retain control for one short safety interval.  A joystick
+        # request may keep changing during this interval, but it is applied only
+        # when the post-motion release gate opens below.
+        self._set_fixed_world_command(
+            env_ids,
+            torch.zeros(env_ids.numel(), 2, device=self.device),
         )
-        self._set_fixed_world_command(env_ids, direction * speed[:, None])
 
-    def _start_down_roll_from_edge(self, env_ids: torch.Tensor) -> None:
+    def _begin_down_roll_from_edge_settle(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
         self._reset_motion_skill(
@@ -668,10 +991,20 @@ class MultiSkillCommand(CommandTerm):
             start_at_beginning=True,
             write_robot_state=False,
         )
-        routes = torch.full(
-            (env_ids.numel(),), DOWN_ROLL_SKILL_ID, device=self.device, dtype=torch.long
+        self.skill_ids[env_ids] = LOCOMOTION_SKILL_ID
+        self.pending_motion_skill_ids[env_ids] = DOWN_ROLL_SKILL_ID
+        self.transition_stage[env_ids] = _SETTLE_STAGE
+        self.transition_time_left[env_ids] = self._sample_transition_duration(
+            env_ids,
+            self.cfg.transition_settle_time_range_s,
         )
-        self._begin_motion_stage(env_ids, routes)
+        self.transition_stage_elapsed[env_ids] = 0.0
+        self._reset_gait_phase(env_ids)
+        self._set_fixed_world_command(
+            env_ids,
+            torch.zeros(env_ids.numel(), 2, device=self.device),
+        )
+        self._begin_motion_command_lock(env_ids, randomize_immediately=False)
 
     def _down_roll_ready(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sizes = self.platform_sizes[env_ids]
@@ -685,7 +1018,14 @@ class MultiSkillCommand(CommandTerm):
         direction = self._motion_direction_w(env_ids)
         command_forward_speed = torch.sum(self.world_command[env_ids] * direction, dim=1)
         platform_heading = torch.atan2(direction[:, 1], direction[:, 0])
-        heading_error = wrap_to_pi(platform_heading - self.robot.data.heading_w[env_ids])
+        command_heading = torch.atan2(
+            self.world_command[env_ids, 1],
+            self.world_command[env_ids, 0],
+        )
+        command_heading_error = wrap_to_pi(platform_heading - command_heading)
+        body_heading_error = wrap_to_pi(
+            platform_heading - self.robot.data.heading_w[env_ids]
+        )
         gravity_xy_norm = torch.linalg.vector_norm(
             self.robot.data.projected_gravity_b[env_ids, :2], dim=1
         )
@@ -694,7 +1034,8 @@ class MultiSkillCommand(CommandTerm):
             local_xy[:, 1],
             0.5 * sizes[:, 1],
             command_forward_speed,
-            heading_error,
+            command_heading_error,
+            body_heading_error,
             gravity_xy_norm,
             minimum_edge_distance=self.cfg.down_roll_edge_distance_range[0],
             maximum_edge_distance=self.cfg.down_roll_edge_distance_range[1],
@@ -704,6 +1045,135 @@ class MultiSkillCommand(CommandTerm):
             maximum_gravity_xy_norm=self.cfg.down_roll_maximum_gravity_xy_norm,
         )
         return ready, forward_edge_distance
+
+    def _approach_errors(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        direction = self._motion_direction_w(env_ids)
+        delta = self.transition_target_xy[env_ids] - self.robot.data.root_pos_w[env_ids, :2]
+        longitudinal = torch.sum(delta * direction, dim=1)
+        lateral_direction = torch.stack((-direction[:, 1], direction[:, 0]), dim=1)
+        lateral = torch.sum(delta * lateral_direction, dim=1)
+        return longitudinal, lateral
+
+    def _motion_boundary_alignment(
+        self,
+        env_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_joint_pos = self.motion.joint_pos[self.time_steps[env_ids]]
+        joint_position_rms = torch.sqrt(
+            torch.mean(torch.square(self.robot.data.joint_pos[env_ids] - target_joint_pos), dim=1)
+        )
+        # This is a settle gate, not a velocity-tracking reward.  Measure the
+        # robot's absolute joint speed so it cannot enter a new frozen teacher
+        # merely by matching a non-zero first-frame velocity while still
+        # moving quickly.
+        joint_speed_rms = torch.sqrt(
+            torch.mean(torch.square(self.robot.data.joint_vel[env_ids]), dim=1)
+        )
+        gravity_xy_norm = torch.linalg.vector_norm(
+            self.robot.data.projected_gravity_b[env_ids, :2], dim=1
+        )
+        ready = motion_boundary_alignment_ready(
+            joint_position_rms,
+            joint_speed_rms,
+            gravity_xy_norm,
+            maximum_joint_position_rms=self.cfg.transition_maximum_joint_position_rms,
+            maximum_joint_speed_rms=self.cfg.transition_maximum_joint_speed_rms,
+            maximum_gravity_xy_norm=self.cfg.transition_maximum_gravity_xy_norm,
+        )
+        return ready, joint_position_rms, joint_speed_rms, gravity_xy_norm
+
+    def _settle_geometry_ready(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Check the pending teacher's physical entrance at the end of settle."""
+
+        pending = self.pending_motion_skill_ids[env_ids]
+        if torch.any((pending != CLIMB_SKILL_ID) & (pending != DOWN_ROLL_SKILL_ID)):
+            raise RuntimeError("settle environments must have a pending climb or down-roll skill")
+        ready = torch.zeros(env_ids.numel(), device=self.device, dtype=torch.bool)
+
+        climb = pending == CLIMB_SKILL_ID
+        if torch.any(climb):
+            climb_ids = env_ids[climb]
+            longitudinal, lateral = self._approach_errors(climb_ids)
+            direction = self._motion_direction_w(climb_ids)
+            platform_heading = torch.atan2(direction[:, 1], direction[:, 0])
+            heading_error = wrap_to_pi(platform_heading - self.robot.data.heading_w[climb_ids])
+            ready[climb] = climb_settle_geometry_ready(
+                longitudinal,
+                lateral,
+                heading_error,
+                switch_distance=self.cfg.approach_switch_distance,
+                maximum_overshoot=self.cfg.approach_maximum_overshoot,
+                lateral_tolerance=self.cfg.approach_lateral_tolerance,
+                maximum_heading_error=self.cfg.climb_maximum_heading_error,
+            )
+
+        down_roll = pending == DOWN_ROLL_SKILL_ID
+        if torch.any(down_roll):
+            down_ids = env_ids[down_roll]
+            sizes = self.platform_sizes[down_ids]
+            local_xy = oriented_box_local_xy(
+                self.robot.data.root_pos_w[down_ids, None, :],
+                self.platform_pos_w[down_ids],
+                self.platform_quat_w[down_ids],
+            ).squeeze(1)
+            forward_edge_distance = 0.5 * sizes[:, 0] - local_xy[:, 0]
+            direction = self._motion_direction_w(down_ids)
+            platform_heading = torch.atan2(direction[:, 1], direction[:, 0])
+            heading_error = wrap_to_pi(platform_heading - self.robot.data.heading_w[down_ids])
+            ready[down_roll] = down_roll_settle_geometry_ready(
+                forward_edge_distance,
+                local_xy[:, 1],
+                0.5 * sizes[:, 1],
+                heading_error,
+                minimum_edge_distance=self.cfg.down_roll_edge_distance_range[0],
+                maximum_edge_distance=self.cfg.down_roll_edge_distance_range[1],
+                lateral_margin=self.cfg.down_roll_lateral_margin,
+                maximum_heading_error=self.cfg.down_roll_maximum_heading_error,
+            )
+        return ready
+
+    def motion_kinematic_scope_valid(
+        self,
+        env_ids: torch.Tensor,
+        skill_ids: torch.Tensor,
+        *,
+        threshold_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """Return frozen-motion kinematic validity for explicit routed skills."""
+
+        if env_ids.ndim != 1 or skill_ids.shape != env_ids.shape:
+            raise ValueError("motion scope env_ids and skill_ids must share one-dimensional shape")
+        if torch.any((skill_ids != CLIMB_SKILL_ID) & (skill_ids != DOWN_ROLL_SKILL_ID)):
+            raise ValueError("motion scope accepts only climb and down-roll skill IDs")
+        if not math.isfinite(threshold_scale) or threshold_scale < 1.0:
+            raise ValueError("motion scope threshold_scale must be finite and at least one")
+        if env_ids.numel() == 0:
+            return torch.empty(0, device=self.device, dtype=torch.bool)
+
+        source_pos = self._source_body_pos_w_for(env_ids, skill_ids)
+        source_quat = self._source_body_quat_w_for(env_ids)
+        source_anchor_pos = source_pos[:, self.motion_anchor_body_index]
+        source_anchor_quat = source_quat[:, self.motion_anchor_body_index]
+        robot_anchor_pos = self.robot_anchor_pos_w[env_ids]
+        robot_anchor_quat = self.robot_anchor_quat_w[env_ids]
+        anchor_z_error = torch.abs(source_anchor_pos[:, 2] - robot_anchor_pos[:, 2])
+        reference_gravity = quat_apply_inverse(source_anchor_quat, self.robot.data.GRAVITY_VEC_W[env_ids])
+        robot_gravity = quat_apply_inverse(robot_anchor_quat, self.robot.data.GRAVITY_VEC_W[env_ids])
+        orientation_error = torch.abs(reference_gravity[:, 2] - robot_gravity[:, 2])
+        end_effector_ids = torch.tensor(
+            [self.cfg.body_names.index(name) for name in self.cfg.teacher_end_effector_names],
+            device=self.device,
+            dtype=torch.long,
+        )
+        end_effector_z_error = torch.abs(
+            source_pos[:, end_effector_ids, 2]
+            - self.robot_body_pos_w[env_ids][:, end_effector_ids, 2]
+        ).amax(dim=1)
+        return (
+            (anchor_z_error <= self.cfg.teacher_anchor_z_threshold * threshold_scale)
+            & (orientation_error <= self.cfg.teacher_orientation_threshold * threshold_scale)
+            & (end_effector_z_error <= self.cfg.teacher_end_effector_z_threshold * threshold_scale)
+        )
 
     def _nominal_geometry_mask(self, env_ids: torch.Tensor) -> torch.Tensor:
         stored = getattr(self.platform, "_climb_box_random_phase_env_mask", None)
@@ -736,16 +1206,20 @@ class MultiSkillCommand(CommandTerm):
             angle = torch.empty(env_ids.numel(), device=self.device).uniform_(-math.pi, math.pi)
             standing = torch.rand(env_ids.numel(), device=self.device) < self.cfg.locomotion_standing_fraction
             speed[standing] = 0.0
-            self.world_command[env_ids, 0] = speed * torch.cos(angle)
-            self.world_command[env_ids, 1] = speed * torch.sin(angle)
+            self.requested_world_command[env_ids, 0] = speed * torch.cos(angle)
+            self.requested_world_command[env_ids, 1] = speed * torch.sin(angle)
         else:
             forced = torch.tensor(self.cfg.forced_world_command, device=self.device)
             if forced.shape != (2,) or not bool(torch.isfinite(forced).all()):
                 raise ValueError("forced_world_command must contain two finite values")
-            self.world_command[env_ids] = forced
-            speed = torch.linalg.vector_norm(self.world_command[env_ids], dim=1)
-            angle = torch.atan2(self.world_command[env_ids, 1], self.world_command[env_ids, 0])
+            self.requested_world_command[env_ids] = forced
+            speed = torch.linalg.vector_norm(self.requested_world_command[env_ids], dim=1)
+            angle = torch.atan2(
+                self.requested_world_command[env_ids, 1],
+                self.requested_world_command[env_ids, 0],
+            )
             standing = speed <= 1.0e-6
+        self.world_command[env_ids] = self.requested_world_command[env_ids]
         if current_heading is None:
             current_heading = self.robot.data.heading_w[env_ids]
         elif current_heading.shape != (env_ids.numel(),):
@@ -772,6 +1246,57 @@ class MultiSkillCommand(CommandTerm):
         self.metrics["platform_length"][:] = self.platform_sizes[:, 0]
         self.metrics["platform_width"][:] = self.platform_sizes[:, 1]
         self.metrics["platform_height"][:] = self.platform_sizes[:, 2]
+        self.metrics["stage_approach"][:] = self.transition_stage == _APPROACH_STAGE
+        self.metrics["stage_settle"][:] = self.transition_stage == _SETTLE_STAGE
+        self.metrics["stage_motion"][:] = self.transition_stage == _MOTION_STAGE
+        self.metrics["stage_post_locomotion"][:] = self.transition_stage == _POST_LOCOMOTION_STAGE
+        self.metrics["approach_longitudinal_error"][:] = 0.0
+        self.metrics["approach_lateral_error"][:] = 0.0
+        approach_ids = torch.where(self.transition_stage == _APPROACH_STAGE)[0]
+        if approach_ids.numel() > 0:
+            longitudinal, lateral = self._approach_errors(approach_ids)
+            self.metrics["approach_longitudinal_error"][approach_ids] = longitudinal
+            self.metrics["approach_lateral_error"][approach_ids] = torch.abs(lateral)
+        self.metrics["settle_joint_position_rms"][:] = 0.0
+        self.metrics["settle_joint_speed_rms"][:] = 0.0
+        self.metrics["settle_gravity_xy_norm"][:] = 0.0
+        self.metrics["settle_geometry_ready"][:] = 0.0
+        self.metrics["settle_kinematic_scope_valid"][:] = 0.0
+        settle_ids = torch.where(self.transition_stage == _SETTLE_STAGE)[0]
+        if settle_ids.numel() > 0:
+            _, pose_rms, speed_rms, gravity_norm = self._motion_boundary_alignment(settle_ids)
+            self.metrics["settle_joint_position_rms"][settle_ids] = pose_rms
+            self.metrics["settle_joint_speed_rms"][settle_ids] = speed_rms
+            self.metrics["settle_gravity_xy_norm"][settle_ids] = gravity_norm
+            self.metrics["settle_geometry_ready"][settle_ids] = self._settle_geometry_ready(
+                settle_ids
+            )
+            self.metrics["settle_kinematic_scope_valid"][settle_ids] = (
+                self.motion_kinematic_scope_valid(
+                    settle_ids,
+                    self.pending_motion_skill_ids[settle_ids],
+                )
+            )
+        locked = self.motion_control_locked
+        requested_speed = torch.linalg.vector_norm(self.requested_world_command, dim=1)
+        active_speed = torch.linalg.vector_norm(self.world_command, dim=1)
+        self.metrics["motion_control_locked"][:] = locked
+        self.metrics["requested_command_speed"][:] = requested_speed
+        self.metrics["active_command_speed"][:] = active_speed
+        self.metrics["command_suppressed"][:] = locked & (
+            torch.linalg.vector_norm(
+                self.requested_world_command - self.world_command,
+                dim=1,
+            )
+            > 1.0e-4
+        )
+        self.metrics["post_motion_command_released"][:] = self.post_motion_command_released
+        self.metrics["transition_failed"][:] = self.transition_failed
+        self.metrics["motion_started_at_beginning"][:] = self.episode_started_at_motion_beginning
+        self.metrics["episode_reached_motion"][:] = self.episode_reached_motion
+        self.metrics["episode_completed_climb"][:] = self.episode_completed_climb
+        self.metrics["episode_reached_top_locomotion"][:] = self.episode_reached_top_locomotion
+        self.metrics["episode_started_down_roll"][:] = self.episode_started_down_roll
         top_ids = torch.where(
             self.locomotion_mask & (self.last_motion_skill_ids == CLIMB_SKILL_ID)
         )[0]
@@ -781,6 +1306,11 @@ class MultiSkillCommand(CommandTerm):
             self.metrics["forward_edge_distance"][top_ids] = distance
 
     def _update_command(self) -> None:
+        # Update the public joystick request first.  While a motion owns
+        # control this deliberately changes only the Actor input; the active
+        # teacher command remains locked until post-motion release.
+        self._update_locked_requested_commands()
+
         locomotion = self.locomotion_mask
         if torch.any(locomotion):
             self.locomotion_command_time_left[locomotion] -= self._env.step_dt
@@ -805,12 +1335,18 @@ class MultiSkillCommand(CommandTerm):
             self.composed_episode & (self.transition_stage == _APPROACH_STAGE)
         )[0]
         if approach_ids.numel() > 0:
-            error = torch.linalg.vector_norm(
-                self.robot.data.root_pos_w[approach_ids, :2]
-                - self.transition_target_xy[approach_ids],
-                dim=1,
+            self.transition_stage_elapsed[approach_ids] += self._env.step_dt
+            longitudinal, lateral = self._approach_errors(approach_ids)
+            ready_mask, failed_mask = approach_transition_status(
+                longitudinal,
+                lateral,
+                self.transition_stage_elapsed[approach_ids],
+                switch_distance=self.cfg.approach_switch_distance,
+                lateral_tolerance=self.cfg.approach_lateral_tolerance,
+                maximum_overshoot=self.cfg.approach_maximum_overshoot,
+                timeout=self.cfg.approach_timeout_s,
             )
-            reached = approach_ids[error <= self.cfg.approach_switch_distance]
+            reached = approach_ids[ready_mask]
             if reached.numel() > 0:
                 self.transition_stage[reached] = _SETTLE_STAGE
                 self.transition_time_left[reached] = self._sample_transition_duration(
@@ -821,6 +1357,10 @@ class MultiSkillCommand(CommandTerm):
                     reached,
                     torch.zeros(reached.numel(), 2, device=self.device),
                 )
+                self.transition_stage_elapsed[reached] = 0.0
+                self._begin_motion_command_lock(reached, randomize_immediately=False)
+            failed = approach_ids[failed_mask]
+            self.transition_failed[failed] = True
 
         settle_ids = torch.where(
             self.composed_episode & (self.transition_stage == _SETTLE_STAGE)
@@ -828,9 +1368,22 @@ class MultiSkillCommand(CommandTerm):
         if settle_ids.numel() > 0:
             self.transition_time_left[settle_ids] -= self._env.step_dt
             self.transition_stage_elapsed[settle_ids] += self._env.step_dt
-            ready = settle_ids[self.transition_time_left[settle_ids] <= 0.0]
+            minimum_elapsed = self.transition_time_left[settle_ids] <= 0.0
+            alignment_ready, _, _, _ = self._motion_boundary_alignment(settle_ids)
+            geometry_ready = self._settle_geometry_ready(settle_ids)
+            kinematic_scope_valid = self.motion_kinematic_scope_valid(
+                settle_ids,
+                self.pending_motion_skill_ids[settle_ids],
+            )
+            transition_ready = alignment_ready & geometry_ready & kinematic_scope_valid
+            ready = settle_ids[minimum_elapsed & transition_ready]
             if ready.numel() > 0:
                 self._begin_motion_stage(ready)
+            failed = settle_ids[
+                (~transition_ready)
+                & (self.transition_stage_elapsed[settle_ids] >= self.cfg.transition_maximum_settle_time_s)
+            ]
+            self.transition_failed[failed] = True
 
         finished_ids = torch.where(
             self.composed_episode
@@ -848,35 +1401,31 @@ class MultiSkillCommand(CommandTerm):
         if post_ids.numel() > 0:
             self.transition_stage_elapsed[post_ids] += self._env.step_dt
             top = self.last_motion_skill_ids[post_ids] == CLIMB_SKILL_ID
-            previously_released = self.top_locomotion_released[post_ids].clone()
-            release = top & ~self.top_locomotion_released[post_ids] & (
-                self.transition_stage_elapsed[post_ids] >= self.cfg.top_locomotion_settle_time_s
+            previously_released = self.post_motion_command_released[post_ids].clone()
+            release = ~self.post_motion_command_released[post_ids] & (
+                self.transition_stage_elapsed[post_ids]
+                >= self.cfg.post_motion_command_release_time_s
             )
             if torch.any(release):
                 release_ids = post_ids[release]
-                direction = self._motion_direction_w(release_ids)
-                speed = torch.full(
-                    (release_ids.numel(), 1),
-                    self.cfg.composed_locomotion_speed,
-                    device=self.device,
-                )
-                self._set_fixed_world_command(release_ids, direction * speed)
-                self.top_locomotion_released[release_ids] = True
+                self._sync_requested_locomotion_command(release_ids)
+                self.post_motion_command_released[release_ids] = True
+                self.locked_command_time_left[release_ids] = float("inf")
 
-            top_ready = top & self.top_locomotion_released[post_ids]
+            top_ready = top & self.post_motion_command_released[post_ids]
             start_down = torch.zeros(post_ids.numel(), device=self.device, dtype=torch.bool)
             if torch.any(top_ready):
                 candidate_ids = post_ids[top_ready]
                 ready, _ = self._down_roll_ready(candidate_ids)
                 start_down[top_ready] = ready
-                self._start_down_roll_from_edge(candidate_ids[ready])
+                self._begin_down_roll_from_edge_settle(candidate_ids[ready])
 
             remaining = ~start_down
             remaining_ids = post_ids[remaining]
-            # The sampled 2--4 s top-locomotion duration begins only after the
-            # zero-command settle has completed.  Do not consume one control
-            # step on the same update that publishes the forward command.
-            countdown = remaining & (~top | previously_released)
+            # The post-motion duration begins only after the zero-command
+            # safety interval.  Do not consume one control step on the same
+            # update that publishes the latest deployment request.
+            countdown = remaining & previously_released
             countdown_ids = post_ids[countdown]
             self.transition_time_left[countdown_ids] -= self._env.step_dt
             complete = remaining_ids[self.transition_time_left[remaining_ids] <= 0.0]
@@ -906,27 +1455,53 @@ class MultiSkillCommand(CommandTerm):
         self.body_pos_relative_w = target_pos
         self.body_quat_relative_w = target_quat
 
-    def _source_body_pos_w(self) -> torch.Tensor:
-        positions = self.motion.body_pos_w[self.time_steps]
-        transformed = positions + self._env.scene.env_origins[:, None, :]
-        platform_quat = yaw_quat(self.platform_quat_w)
+    def _source_body_pos_w_for(
+        self,
+        env_ids: torch.Tensor,
+        skill_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if env_ids.ndim != 1 or skill_ids.shape != env_ids.shape:
+            raise ValueError("source body env_ids and skill_ids must share one-dimensional shape")
+        if torch.any((skill_ids != CLIMB_SKILL_ID) & (skill_ids != DOWN_ROLL_SKILL_ID)):
+            raise ValueError("source body transforms accept only climb and down-roll skill IDs")
+        positions = self.motion.body_pos_w[self.time_steps[env_ids]]
+        transformed = positions + self._env.scene.env_origins[env_ids, None, :]
+        platform_quat = yaw_quat(self.platform_quat_w[env_ids])
         nominal_xy = torch.tensor(self.cfg.platform_center[:2], device=self.device, dtype=positions.dtype)
         delta = torch.zeros_like(positions)
         delta[..., :2] = positions[..., :2] - nominal_xy
         rotated = quat_apply(platform_quat[:, None, :].expand(-1, positions.shape[1], -1), delta)
         climb_offset, down_roll_offset = platform_reference_center_offsets(
-            self.platform_sizes[:, 0], nominal_length=self.cfg.platform_size[0]
+            self.platform_sizes[env_ids, 0], nominal_length=self.cfg.platform_size[0]
         )
-        reference_offset = torch.where(self.down_roll_mask, down_roll_offset, climb_offset)
-        direction = self._motion_direction_w(torch.arange(self.num_envs, device=self.device))
-        reference_center_xy = self.platform_pos_w[:, :2] + direction * reference_offset[:, None]
+        reference_offset = torch.where(
+            skill_ids == DOWN_ROLL_SKILL_ID,
+            down_roll_offset,
+            climb_offset,
+        )
+        direction = self._motion_direction_w(env_ids)
+        reference_center_xy = self.platform_pos_w[env_ids, :2] + direction * reference_offset[:, None]
         transformed[..., :2] = reference_center_xy[:, None, :] + rotated[..., :2]
         return transformed
 
-    def _source_body_quat_w(self) -> torch.Tensor:
-        orientations = self.motion.body_quat_w[self.time_steps]
-        platform_quat = yaw_quat(self.platform_quat_w)
+    def _source_body_pos_w(self) -> torch.Tensor:
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        source_skills = torch.where(
+            self.down_roll_mask,
+            DOWN_ROLL_SKILL_ID,
+            CLIMB_SKILL_ID,
+        )
+        return self._source_body_pos_w_for(env_ids, source_skills)
+
+    def _source_body_quat_w_for(self, env_ids: torch.Tensor) -> torch.Tensor:
+        if env_ids.ndim != 1:
+            raise ValueError("source body quaternion env_ids must be one-dimensional")
+        orientations = self.motion.body_quat_w[self.time_steps[env_ids]]
+        platform_quat = yaw_quat(self.platform_quat_w[env_ids])
         return quat_mul(platform_quat[:, None, :].expand(-1, orientations.shape[1], -1), orientations)
+
+    def _source_body_quat_w(self) -> torch.Tensor:
+        return self._source_body_quat_w_for(torch.arange(self.num_envs, device=self.device))
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -1040,33 +1615,23 @@ class MultiSkillCommand(CommandTerm):
         """Continuous confidence inside each frozen teacher's verified scope."""
 
         valid = torch.zeros(self.num_envs, dtype=self.world_command.dtype, device=self.device)
-        pure_locomotion = self.locomotion_mask & (
-            self.episode_skill_ids == LOCOMOTION_SKILL_ID
-        )
-        valid[pure_locomotion] = 1.0
-        motion = self.motion_mask
-        anchor_z_error = torch.abs(self.anchor_pos_w[:, 2] - self.robot_anchor_pos_w[:, 2])
-        reference_gravity = quat_apply_inverse(self.anchor_quat_w, self.robot.data.GRAVITY_VEC_W)
-        robot_gravity = quat_apply_inverse(self.robot_anchor_quat_w, self.robot.data.GRAVITY_VEC_W)
-        orientation_error = torch.abs(reference_gravity[:, 2] - robot_gravity[:, 2])
-        end_effector_ids = torch.tensor(
-            [self.cfg.body_names.index(name) for name in self.cfg.teacher_end_effector_names],
-            device=self.device,
-            dtype=torch.long,
-        )
-        ee_z_error = torch.abs(
-            self.body_pos_relative_w[:, end_effector_ids, 2]
-            - self.robot_body_pos_w[:, end_effector_ids, 2]
-        ).amax(dim=1)
-        inside_scope = (
-            (anchor_z_error <= self.cfg.teacher_anchor_z_threshold)
-            & (orientation_error <= self.cfg.teacher_orientation_threshold)
-            & (ee_z_error <= self.cfg.teacher_end_effector_z_threshold)
-        )
-        valid[motion] = (
-            self.motion_teacher_geometry_confidence[motion]
-            * inside_scope[motion].to(dtype=valid.dtype)
-        )
+        # The locomotion teacher remains the valid supervisor during every
+        # physically locomoting stage: pure walking, climb approach, boundary
+        # settle, top traversal, and post-skill recovery.  Restricting labels
+        # to the pure-locomotion episode family left all composed transitions
+        # without an imitation gradient even though they use the same frozen
+        # locomotion observation/action contract.
+        valid[self.locomotion_mask] = 1.0
+        motion_ids = torch.where(self.motion_mask)[0]
+        if motion_ids.numel() > 0:
+            inside_scope = self.motion_kinematic_scope_valid(
+                motion_ids,
+                self.skill_ids[motion_ids],
+            )
+            valid[motion_ids] = (
+                self.motion_teacher_geometry_confidence[motion_ids]
+                * inside_scope.to(dtype=valid.dtype)
+            )
         return valid
 
     @property
@@ -1087,6 +1652,16 @@ class MultiSkillCommand(CommandTerm):
         return self.motion_teacher_geometry_confidence >= (
             self.cfg.motion_tracking_termination_min_confidence
         )
+
+    @property
+    def locomotion_contact_termination_enabled(self) -> torch.Tensor:
+        post_climb_grace = (
+            self.composed_episode
+            & (self.transition_stage == _POST_LOCOMOTION_STAGE)
+            & (self.last_motion_skill_ids == CLIMB_SKILL_ID)
+            & (self.transition_stage_elapsed < self.cfg.post_climb_contact_grace_time_s)
+        )
+        return ~post_climb_grace
 
     def _set_debug_vis_impl(self, debug_vis: bool) -> None:  # noqa: ARG002
         return
@@ -1115,6 +1690,9 @@ class MultiSkillCommandCfg(CommandTermCfg):
     motion_sampling_mode: Literal["random", "fixed", "round_robin"] = "random"
     fixed_motion_id: int = 0
     start_at_motion_beginning: bool = False
+    # Within direct atomic episodes, explicitly train complete execution from
+    # frame zero while retaining random-phase recovery coverage.
+    atomic_motion_start_at_beginning_fraction: float = 0.5
     motion_world_command: tuple[float, float] = (0.6, 0.0)
 
     platform_size: tuple[float, float, float] = (0.51, 0.80, 0.66)
@@ -1127,6 +1705,12 @@ class MultiSkillCommandCfg(CommandTermCfg):
     locomotion_standing_fraction: float = 0.10
     forced_world_command: tuple[float, float] | None = None
     locomotion_command_resampling_time_s: float = 10.0
+    # During a committed climb/down-roll, these resamples change only the
+    # Actor-visible deployment request.  Frozen motion teachers remain
+    # command-independent, teaching the Student to finish an irreversible
+    # skill even if the hardware joystick keeps moving.
+    locked_command_resampling_enabled: bool = True
+    locked_command_resampling_time_range_s: tuple[float, float] = (1.0, 2.0)
     locomotion_teacher_lin_vel_x_range: tuple[float, float] = (-0.6, 1.0)
     locomotion_teacher_ang_vel_range: tuple[float, float] = (-1.57, 1.57)
     heading_control_stiffness: float = 0.5
@@ -1134,16 +1718,29 @@ class MultiSkillCommandCfg(CommandTermCfg):
     gait_phase_offsets: tuple[float, float] = (0.38, 0.88)
     gait_cycle: float = 0.85
 
-    # Half of motion-family resets retain uniform atomic phase sampling; the
-    # other half explicitly covers observable teacher transitions.
+    # Fraction of motion-family episodes that execute the continuous
+    # locomotion -> expert -> locomotion route.  The remainder use the direct
+    # atomic start mixture configured above.
     composed_episode_fraction: float = 0.5
     approach_distance_range: tuple[float, float] = (0.4, 1.0)
     approach_switch_distance: float = 0.08
+    approach_lateral_tolerance: float = 0.20
+    approach_maximum_overshoot: float = 0.20
+    approach_timeout_s: float = 3.0
     transition_settle_time_range_s: tuple[float, float] = (0.2, 0.5)
+    transition_maximum_settle_time_s: float = 1.0
+    # The checked-in four-clip datasets have at most about 0.289 rad RMS
+    # between a default-like locomotion stance and a motion boundary pose.
+    # This leaves a small physical-policy margin without admitting an
+    # unrelated posture.
+    transition_maximum_joint_position_rms: float = 0.35
+    transition_maximum_joint_speed_rms: float = 1.0
+    transition_maximum_gravity_xy_norm: float = 0.35
+    climb_maximum_heading_error: float = 0.35
     post_locomotion_time_range_s: tuple[float, float] = (0.8, 1.2)
     top_locomotion_time_range_s: tuple[float, float] = (2.0, 4.0)
-    top_locomotion_settle_time_s: float = 0.2
-    composed_locomotion_speed: float = 0.6
+    post_motion_command_release_time_s: float = 0.2
+    post_climb_contact_grace_time_s: float = 0.2
     down_roll_edge_distance_range: tuple[float, float] = (-0.05, 0.48)
     down_roll_lateral_margin: float = 0.08
     down_roll_minimum_forward_speed: float = 0.1

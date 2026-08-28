@@ -15,6 +15,7 @@ from php_kvoy_reproduction.tasks.tracking.mdp import (  # noqa: F401
     motion_relative_body_position_error_exp,
 )
 
+from .camera_geometry import *  # noqa: F401, F403
 from .commands import *  # noqa: F401, F403
 from .depth_buffer import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403

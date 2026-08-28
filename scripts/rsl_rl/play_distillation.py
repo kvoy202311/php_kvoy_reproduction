@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from collections.abc import Mapping
 from pathlib import Path
 import sys
 
@@ -38,6 +39,12 @@ parser.add_argument(
     help="Stop cleanly after this many control steps; omit for interactive playback.",
 )
 parser.add_argument("--no_depth_noise", action="store_true", default=False)
+parser.add_argument(
+    "--quiet_reset_log",
+    action="store_true",
+    default=False,
+    help="Suppress per-reset termination summaries during interactive playback.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -104,6 +111,8 @@ from php_kvoy_reproduction.distillation.runner import DistillationRunner
 from php_kvoy_reproduction.distillation.teacher_manifest import TeacherManifest
 from php_kvoy_reproduction.distillation.teacher_policy import TeacherPolicy
 from php_kvoy_reproduction.distillation.teacher_router import TeacherRouter
+from php_kvoy_reproduction.distillation.training_contract import student_policy_input_contract
+from php_kvoy_reproduction.distillation.training_stage import configure_training_stage
 
 
 def _router(device: str) -> TeacherRouter:
@@ -131,6 +140,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
+
+    # Match the environment curriculum to the checkpoint before constructing
+    # the scene.  In particular, a nominal transition checkpoint must not be
+    # silently evaluated with full-stage randomized geometry.
+    checkpoint_metadata = torch.load(
+        args_cli.checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(checkpoint_metadata, Mapping):
+        raise TypeError("Distillation checkpoint payload must be a mapping.")
+    checkpoint_stage = checkpoint_metadata.get("training_stage")
+    if checkpoint_stage not in ("atomic", "transition", "full"):
+        raise ValueError(
+            "Distillation playback requires a checkpoint with one verified "
+            f"training_stage, got {checkpoint_stage!r}."
+        )
+    configure_training_stage(env_cfg, agent_cfg, checkpoint_stage)
+
     command = env_cfg.commands.multi_skill
     command.climb_motion_dir = str(args_cli.climb_motion_dir)
     command.climb_motion_file = None
@@ -180,8 +208,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             agent_cfg.to_dict(),
             router,
             device=agent_cfg.device,
+            policy_input_contract=student_policy_input_contract(
+                env_cfg,
+                task=args_cli.task,
+            ),
         )
-        runner.load(args_cli.checkpoint_path, load_optimizer=False)
+        runner.load(
+            args_cli.checkpoint_path,
+            load_optimizer=False,
+            restore_training_state=True,
+        )
+        command_term = env.unwrapped.command_manager.get_term("multi_skill")
+        completed_iteration = max(0, runner.current_learning_iteration - 1)
+        termination_scale = float(command_term.student_termination_scale)
+        print(
+            "[INFO] Inference checkpoint: "
+            f"training_stage={runner.loaded_training_stage or 'unspecified'}, "
+            f"completed_iteration={completed_iteration}, "
+            f"motion_termination_scale={termination_scale:.4f}, "
+            "thresholds=("
+            f"anchor_z={command_term.cfg.teacher_anchor_z_threshold * termination_scale:.4f}, "
+            f"orientation={command_term.cfg.teacher_orientation_threshold * termination_scale:.4f}, "
+            "end_effector_z="
+            f"{command_term.cfg.teacher_end_effector_z_threshold * termination_scale:.4f})"
+        )
         policy = runner.get_inference_policy(device=agent_cfg.device)
         observations, _ = env.get_observations()
         step_count = 0
@@ -190,7 +240,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
         ):
             with torch.inference_mode():
                 actions = policy(observations)
-                observations, _, _, _ = env.step(actions)
+                observations, _, dones, extras = env.step(actions)
+            if not args_cli.quiet_reset_log and torch.any(dones):
+                log = extras.get("log", extras.get("episode", {}))
+                reasons = []
+                if isinstance(log, dict):
+                    for key, value in sorted(log.items()):
+                        if "Termination/" not in key:
+                            continue
+                        tensor = torch.as_tensor(value, dtype=torch.float32)
+                        if tensor.numel() == 0:
+                            continue
+                        scalar = float(tensor.mean().item())
+                        if scalar > 0.0:
+                            reasons.append(f"{key.rsplit('/', 1)[-1]}={scalar:.4f}")
+                suffix = ", ".join(reasons) if reasons else "reason unavailable in environment log"
+                print(f"[INFO] Reset {int(torch.count_nonzero(dones).item())} env(s): {suffix}")
             step_count += 1
     finally:
         if runner is not None:

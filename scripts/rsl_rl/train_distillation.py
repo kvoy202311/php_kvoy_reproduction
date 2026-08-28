@@ -23,6 +23,15 @@ parser.add_argument("--down_roll_motion_dir", type=Path, required=True)
 parser.add_argument("--locomotion_manifest", type=Path, required=True)
 parser.add_argument("--climb_manifest", type=Path, required=True)
 parser.add_argument("--down_roll_manifest", type=Path, required=True)
+parser.add_argument(
+    "--training_stage",
+    choices=("atomic", "transition", "full"),
+    required=True,
+    help=(
+        "Required curriculum stage: atomic learns nominal independent skills, "
+        "transition learns nominal continuous compositions, and full adds randomized geometry."
+    ),
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -81,7 +90,14 @@ from php_kvoy_reproduction.distillation.runner import DistillationRunner
 from php_kvoy_reproduction.distillation.teacher_manifest import TeacherManifest
 from php_kvoy_reproduction.distillation.teacher_policy import TeacherPolicy
 from php_kvoy_reproduction.distillation.teacher_router import TeacherRouter
-from php_kvoy_reproduction.distillation.training_contract import environment_training_contract
+from php_kvoy_reproduction.distillation.training_contract import (
+    environment_training_contract,
+    student_policy_input_contract,
+)
+from php_kvoy_reproduction.distillation.training_stage import (
+    configure_training_stage,
+    validate_training_stage_checkpoint_mode,
+)
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -129,6 +145,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
     command_cfg.climb_motion_dir = str(args_cli.climb_motion_dir)
     command_cfg.down_roll_motion_file = None
     command_cfg.down_roll_motion_dir = str(args_cli.down_roll_motion_dir)
+    configure_training_stage(env_cfg, agent_cfg, args_cli.training_stage)
+    validate_training_stage_checkpoint_mode(
+        args_cli.training_stage,
+        resume=bool(agent_cfg.resume),
+        warm_start=bool(args_cli.warm_start),
+    )
 
     log_root = Path("logs/rsl_rl") / agent_cfg.experiment_name
     log_root = log_root.resolve()
@@ -136,6 +158,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
     if agent_cfg.run_name:
         run_name += f"_{agent_cfg.run_name}"
     log_dir = log_root / run_name
+    print(f"[INFO] Distillation training stage: {args_cli.training_stage}")
     print(f"[INFO] Distillation log directory: {log_dir}")
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -159,6 +182,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
                 climb_motion_dir=args_cli.climb_motion_dir,
                 down_roll_motion_dir=args_cli.down_roll_motion_dir,
             ),
+            policy_input_contract=student_policy_input_contract(
+                env_cfg,
+                task=args_cli.task,
+            ),
+            training_stage=args_cli.training_stage,
         )
         runner.add_git_repo_to_log(__file__)
 

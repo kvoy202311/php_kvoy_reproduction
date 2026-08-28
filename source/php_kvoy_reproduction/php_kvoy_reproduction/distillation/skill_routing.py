@@ -13,6 +13,170 @@ DOWN_ROLL_SKILL_ID = 2
 NUM_SKILLS = 3
 
 
+def planar_command_speed_valid(
+    commands: torch.Tensor,
+    *,
+    maximum_speed: float,
+) -> torch.Tensor:
+    """Return which finite planar commands stay inside the deployment speed contract."""
+
+    if commands.ndim != 2 or commands.shape[1] != 2 or not commands.is_floating_point():
+        raise ValueError("commands must be a floating-point [N, 2] tensor")
+    if not torch.isfinite(commands).all():
+        raise ValueError("commands must contain only finite values")
+    if not math.isfinite(maximum_speed) or maximum_speed <= 0.0:
+        raise ValueError("maximum_speed must be finite and positive")
+    return torch.linalg.vector_norm(commands, dim=1) <= maximum_speed + 1.0e-6
+
+
+def approach_transition_status(
+    longitudinal_error: torch.Tensor,
+    lateral_error: torch.Tensor,
+    elapsed_time: torch.Tensor,
+    *,
+    switch_distance: float,
+    lateral_tolerance: float,
+    maximum_overshoot: float,
+    timeout: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return robust approach-ready and failed masks in platform coordinates.
+
+    A signed longitudinal condition remains true after crossing the target
+    line, unlike Euclidean distance to one point.  The bounded overshoot and
+    timeout turn a missed lateral corridor into an explicit failed rollout
+    instead of leaving the environment in locomotion forever.
+    """
+
+    tensors = (longitudinal_error, lateral_error, elapsed_time)
+    if any(value.ndim != 1 for value in tensors):
+        raise ValueError("approach transition inputs must be one-dimensional")
+    if len({tuple(value.shape) for value in tensors}) != 1:
+        raise ValueError("approach transition inputs must share one shape")
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in tensors):
+        raise ValueError("approach transition inputs must be finite floating-point tensors")
+    limits = (switch_distance, lateral_tolerance, maximum_overshoot, timeout)
+    if any(not math.isfinite(value) or value <= 0.0 for value in limits):
+        raise ValueError("approach transition limits must be finite and positive")
+
+    ready = (
+        (longitudinal_error <= switch_distance)
+        & (longitudinal_error >= -maximum_overshoot)
+        & (torch.abs(lateral_error) <= lateral_tolerance)
+    )
+    failed = (~ready) & (
+        (longitudinal_error < -maximum_overshoot) | (elapsed_time >= timeout)
+    )
+    return ready, failed
+
+
+def motion_boundary_alignment_ready(
+    joint_position_rms: torch.Tensor,
+    joint_speed_rms: torch.Tensor,
+    gravity_xy_norm: torch.Tensor,
+    *,
+    maximum_joint_position_rms: float,
+    maximum_joint_speed_rms: float,
+    maximum_gravity_xy_norm: float,
+) -> torch.Tensor:
+    """Gate a teacher switch on overlapping default-like boundary states."""
+
+    tensors = (joint_position_rms, joint_speed_rms, gravity_xy_norm)
+    if any(value.ndim != 1 for value in tensors):
+        raise ValueError("boundary-alignment inputs must be one-dimensional")
+    if len({tuple(value.shape) for value in tensors}) != 1:
+        raise ValueError("boundary-alignment inputs must share one shape")
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in tensors):
+        raise ValueError("boundary-alignment inputs must be finite floating-point tensors")
+    if any(torch.any(value < 0.0) for value in tensors):
+        raise ValueError("boundary-alignment errors must be non-negative")
+    limits = (
+        maximum_joint_position_rms,
+        maximum_joint_speed_rms,
+        maximum_gravity_xy_norm,
+    )
+    if any(not math.isfinite(value) or value <= 0.0 for value in limits):
+        raise ValueError("boundary-alignment limits must be finite and positive")
+    return (
+        (joint_position_rms <= maximum_joint_position_rms)
+        & (joint_speed_rms <= maximum_joint_speed_rms)
+        & (gravity_xy_norm <= maximum_gravity_xy_norm)
+    )
+
+
+def climb_settle_geometry_ready(
+    longitudinal_error: torch.Tensor,
+    lateral_error: torch.Tensor,
+    heading_error: torch.Tensor,
+    *,
+    switch_distance: float,
+    maximum_overshoot: float,
+    lateral_tolerance: float,
+    maximum_heading_error: float,
+) -> torch.Tensor:
+    """Revalidate the climb entrance immediately before teacher activation."""
+
+    tensors = (longitudinal_error, lateral_error, heading_error)
+    if any(value.ndim != 1 for value in tensors):
+        raise ValueError("climb-settle geometry inputs must be one-dimensional")
+    if len({tuple(value.shape) for value in tensors}) != 1:
+        raise ValueError("climb-settle geometry inputs must share one shape")
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in tensors):
+        raise ValueError("climb-settle geometry inputs must be finite floating-point tensors")
+    limits = (switch_distance, maximum_overshoot, lateral_tolerance, maximum_heading_error)
+    if any(not math.isfinite(value) or value <= 0.0 for value in limits):
+        raise ValueError("climb-settle geometry limits must be finite and positive")
+    return (
+        (longitudinal_error <= switch_distance)
+        & (longitudinal_error >= -maximum_overshoot)
+        & (torch.abs(lateral_error) <= lateral_tolerance)
+        & (torch.abs(heading_error) <= maximum_heading_error)
+    )
+
+
+def down_roll_settle_geometry_ready(
+    forward_edge_distance: torch.Tensor,
+    lateral_offset: torch.Tensor,
+    half_width: torch.Tensor,
+    heading_error: torch.Tensor,
+    *,
+    minimum_edge_distance: float,
+    maximum_edge_distance: float,
+    lateral_margin: float,
+    maximum_heading_error: float,
+) -> torch.Tensor:
+    """Revalidate the platform edge without requiring motion during settle."""
+
+    tensors = (forward_edge_distance, lateral_offset, half_width, heading_error)
+    if any(value.ndim != 1 for value in tensors):
+        raise ValueError("down-roll-settle geometry inputs must be one-dimensional")
+    if len({tuple(value.shape) for value in tensors}) != 1:
+        raise ValueError("down-roll-settle geometry inputs must share one shape")
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in tensors):
+        raise ValueError("down-roll-settle geometry inputs must be finite floating-point tensors")
+    if not all(
+        math.isfinite(value)
+        for value in (
+            minimum_edge_distance,
+            maximum_edge_distance,
+            lateral_margin,
+            maximum_heading_error,
+        )
+    ):
+        raise ValueError("down-roll-settle geometry limits must be finite")
+    if minimum_edge_distance > maximum_edge_distance:
+        raise ValueError("edge-distance bounds must be ordered")
+    if lateral_margin < 0.0 or maximum_heading_error <= 0.0:
+        raise ValueError("lateral margin must be non-negative and heading limit positive")
+
+    lateral_limit = (half_width - lateral_margin).clamp_min(0.0)
+    return (
+        (forward_edge_distance >= minimum_edge_distance)
+        & (forward_edge_distance <= maximum_edge_distance)
+        & (torch.abs(lateral_offset) <= lateral_limit)
+        & (torch.abs(heading_error) <= maximum_heading_error)
+    )
+
+
 def platform_height_teacher_confidence(
     heights: torch.Tensor,
     *,
@@ -77,7 +241,8 @@ def down_roll_transition_ready(
     lateral_offset: torch.Tensor,
     half_width: torch.Tensor,
     command_forward_speed: torch.Tensor,
-    heading_error: torch.Tensor,
+    command_heading_error: torch.Tensor,
+    body_heading_error: torch.Tensor,
     gravity_xy_norm: torch.Tensor,
     *,
     minimum_edge_distance: float,
@@ -94,7 +259,8 @@ def down_roll_transition_ready(
         lateral_offset,
         half_width,
         command_forward_speed,
-        heading_error,
+        command_heading_error,
+        body_heading_error,
         gravity_xy_norm,
     )
     if any(value.ndim != 1 for value in tensors):
@@ -116,7 +282,8 @@ def down_roll_transition_ready(
         & (forward_edge_distance <= maximum_edge_distance)
         & (torch.abs(lateral_offset) <= lateral_limit)
         & (command_forward_speed >= minimum_forward_speed)
-        & (torch.abs(heading_error) <= maximum_heading_error)
+        & (torch.abs(command_heading_error) <= maximum_heading_error)
+        & (torch.abs(body_heading_error) <= maximum_heading_error)
         & (gravity_xy_norm <= maximum_gravity_xy_norm)
     )
 
@@ -257,12 +424,17 @@ __all__ = [
     "DOWN_ROLL_SKILL_ID",
     "LOCOMOTION_SKILL_ID",
     "NUM_SKILLS",
+    "approach_transition_status",
     "balanced_skill_ids",
+    "climb_settle_geometry_ready",
     "climb_geometry_progress_score",
     "down_roll_geometry_progress_score",
     "down_roll_transition_ready",
+    "down_roll_settle_geometry_ready",
     "filtered_contact_upward_forces",
     "lower_ground_contact_support_score",
+    "motion_boundary_alignment_ready",
+    "planar_command_speed_valid",
     "platform_height_teacher_confidence",
     "platform_reference_center_offsets",
 ]

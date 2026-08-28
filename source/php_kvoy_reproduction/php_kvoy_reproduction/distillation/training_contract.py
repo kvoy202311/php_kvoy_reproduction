@@ -20,6 +20,16 @@ _IGNORED_ENVIRONMENT_KEYS = {
     "viewer",
 }
 
+# These fields deliberately change between the atomic, transition and full
+# curricula.  They affect augmentation, not the meaning, order or units of a
+# policy input, so they must not prevent an intentional stage warm-start.
+_POLICY_AUGMENTATION_KEYS = {
+    "delay_range_s",
+    "image_offset_range",
+    "noise_enabled",
+    "pixel_noise_std",
+}
+
 
 def _canonical(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -71,6 +81,28 @@ def _strip_operational_fields(value: Any) -> Any:
     return value
 
 
+def _strip_policy_augmentation_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_policy_augmentation_fields(item)
+            for key, item in value.items()
+            if str(key) not in _POLICY_AUGMENTATION_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_strip_policy_augmentation_fields(item) for item in value]
+    return value
+
+
+def _config_dict(value: Any, *, name: str) -> dict[str, Any]:
+    to_dict = getattr(value, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError(f"{name} must expose to_dict()")
+    result = to_dict()
+    if not isinstance(result, Mapping):
+        raise TypeError(f"{name}.to_dict() must return a mapping")
+    return dict(result)
+
+
 def environment_training_contract(
     env_cfg: Any,
     *,
@@ -91,8 +123,55 @@ def environment_training_contract(
     }
 
 
+def student_policy_input_contract(env_cfg: Any, *, task: str) -> dict[str, Any]:
+    """Capture deployment-critical Actor input and action semantics.
+
+    This deliberately excludes curriculum-only image corruption and camera
+    extrinsic randomization.  It includes the nominal camera transform and
+    intrinsics, depth tensor geometry/range, ordered policy-observation terms,
+    control period and action mapping.  Consequently atomic -> transition ->
+    full warm-starts remain valid, while a torso/head camera, FOV, crop, term
+    order or actuator-contract mismatch is rejected before a checkpoint can be
+    used.
+    """
+
+    if not isinstance(task, str) or not task:
+        raise ValueError("task must be a non-empty string")
+    try:
+        scene = env_cfg.scene
+        camera = scene.depth_camera
+        policy_observations = env_cfg.observations.policy
+        actions = env_cfg.actions
+        sim_dt = float(env_cfg.sim.dt)
+        decimation = int(env_cfg.decimation)
+    except AttributeError as exc:
+        raise TypeError(
+            "env_cfg must expose scene.depth_camera, observations.policy, actions, sim.dt and decimation"
+        ) from exc
+    if sim_dt <= 0.0 or decimation <= 0:
+        raise ValueError("environment simulation dt and decimation must be positive")
+
+    return {
+        "task": task,
+        # Bump this string whenever the meaning of an unchanged-shape Actor
+        # input changes.  The command channel carries the latest live deployment
+        # request; committed climb/down-roll control ignores it until the
+        # post-motion release gate, without hiding it from the Actor.
+        "actor_command_semantics": (
+            "bounded_live_requested_world_velocity_body_frame_motion_lock_v4"
+        ),
+        "control_dt": sim_dt * decimation,
+        "depth_camera": _config_dict(camera, name="env_cfg.scene.depth_camera"),
+        "policy_observations": _strip_policy_augmentation_fields(
+            _config_dict(policy_observations, name="env_cfg.observations.policy")
+        ),
+        "actions": _config_dict(actions, name="env_cfg.actions"),
+    }
+
+
 __all__ = [
     "contract_fingerprint",
     "environment_training_contract",
     "motion_directory_contract",
+    "student_policy_input_contract",
 ]

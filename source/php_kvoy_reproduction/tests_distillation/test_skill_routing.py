@@ -1,19 +1,87 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
 from php_kvoy_reproduction.distillation.skill_routing import (
     NUM_SKILLS,
+    approach_transition_status,
     balanced_skill_ids,
     climb_geometry_progress_score,
+    climb_settle_geometry_ready,
     down_roll_geometry_progress_score,
+    down_roll_settle_geometry_ready,
     down_roll_transition_ready,
     filtered_contact_upward_forces,
     lower_ground_contact_support_score,
+    motion_boundary_alignment_ready,
+    planar_command_speed_valid,
     platform_height_teacher_confidence,
     platform_reference_center_offsets,
 )
+
+
+def test_approach_transition_accepts_target_crossing_inside_lateral_corridor() -> None:
+    ready, failed = approach_transition_status(
+        longitudinal_error=torch.tensor([0.10, 0.05, -0.10, -0.25, 0.02]),
+        lateral_error=torch.tensor([0.00, 0.10, 0.15, 0.00, 0.25]),
+        elapsed_time=torch.tensor([1.0, 1.0, 1.0, 1.0, 4.0]),
+        switch_distance=0.08,
+        lateral_tolerance=0.20,
+        maximum_overshoot=0.20,
+        timeout=3.0,
+    )
+    assert ready.tolist() == [False, True, True, False, False]
+    assert failed.tolist() == [False, False, False, True, True]
+
+
+def test_planar_command_speed_contract_uses_vector_magnitude() -> None:
+    valid = planar_command_speed_valid(
+        torch.tensor([[0.0, 0.0], [0.6, 0.8], [1.01, 0.0], [0.8, 0.8]]),
+        maximum_speed=1.0,
+    )
+    assert valid.tolist() == [True, True, False, False]
+
+
+def test_motion_boundary_alignment_requires_pose_speed_and_upright_state() -> None:
+    ready = motion_boundary_alignment_ready(
+        joint_position_rms=torch.tensor([0.10, 0.40, 0.10, 0.10]),
+        joint_speed_rms=torch.tensor([0.20, 0.20, 1.20, 0.20]),
+        gravity_xy_norm=torch.tensor([0.05, 0.05, 0.05, 0.50]),
+        maximum_joint_position_rms=0.35,
+        maximum_joint_speed_rms=1.0,
+        maximum_gravity_xy_norm=0.35,
+    )
+    assert ready.tolist() == [True, False, False, False]
+
+
+def test_climb_settle_rechecks_position_and_heading_after_waiting() -> None:
+    ready = climb_settle_geometry_ready(
+        longitudinal_error=torch.tensor([0.05, 0.09, -0.21, 0.05, 0.05]),
+        lateral_error=torch.tensor([0.0, 0.0, 0.0, 0.21, 0.0]),
+        heading_error=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.36]),
+        switch_distance=0.08,
+        maximum_overshoot=0.20,
+        lateral_tolerance=0.20,
+        maximum_heading_error=0.35,
+    )
+    assert ready.tolist() == [True, False, False, False, False]
+
+
+def test_down_roll_settle_rechecks_edge_without_requiring_forward_speed() -> None:
+    ready = down_roll_settle_geometry_ready(
+        forward_edge_distance=torch.tensor([0.40, 0.49, -0.06, 0.40, 0.40]),
+        lateral_offset=torch.tensor([0.0, 0.0, 0.0, 0.33, 0.0]),
+        half_width=torch.full((5,), 0.40),
+        heading_error=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.36]),
+        minimum_edge_distance=-0.05,
+        maximum_edge_distance=0.48,
+        lateral_margin=0.08,
+        maximum_heading_error=0.35,
+    )
+    assert ready.tolist() == [True, False, False, False, False]
 
 
 def test_balanced_stream_remains_exact_across_uneven_reset_batches() -> None:
@@ -213,7 +281,8 @@ def test_down_roll_transition_requires_visible_edge_motion_alignment_and_upright
         lateral_offset=torch.tensor([0.0, 0.0, 0.40, 0.0, 0.0, 0.0]),
         half_width=torch.full((6,), 0.40),
         command_forward_speed=torch.tensor([0.6, 0.6, 0.6, 0.0, 0.6, 0.6]),
-        heading_error=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.5, 0.0]),
+        command_heading_error=torch.zeros(6),
+        body_heading_error=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.5, 0.0]),
         gravity_xy_norm=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.5]),
         minimum_edge_distance=-0.05,
         maximum_edge_distance=0.48,
@@ -223,3 +292,22 @@ def test_down_roll_transition_requires_visible_edge_motion_alignment_and_upright
         maximum_gravity_xy_norm=0.35,
     )
     assert ready.tolist() == [True, False, False, False, False, False]
+
+
+def test_down_roll_transition_rejects_lateral_request_with_small_forward_projection() -> None:
+    ready = down_roll_transition_ready(
+        forward_edge_distance=torch.tensor([0.40]),
+        lateral_offset=torch.tensor([0.0]),
+        half_width=torch.tensor([0.40]),
+        command_forward_speed=torch.tensor([0.10]),
+        command_heading_error=torch.tensor([math.atan2(1.0, 0.1)]),
+        body_heading_error=torch.tensor([0.0]),
+        gravity_xy_norm=torch.tensor([0.0]),
+        minimum_edge_distance=-0.05,
+        maximum_edge_distance=0.48,
+        lateral_margin=0.08,
+        minimum_forward_speed=0.1,
+        maximum_heading_error=0.35,
+        maximum_gravity_xy_norm=0.35,
+    )
+    assert ready.tolist() == [False]

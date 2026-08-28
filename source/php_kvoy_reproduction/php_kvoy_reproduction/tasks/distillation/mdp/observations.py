@@ -63,7 +63,12 @@ def body_planar_command(env, command_name: str) -> torch.Tensor:
     heading = command.robot.data.heading_w
     cosine = torch.cos(heading)
     sine = torch.sin(heading)
-    velocity = command.world_command
+    # This is the latest deployment request, not the privileged
+    # locomotion-teacher command.  It may keep changing during a committed
+    # climb/down-roll and does not become zero during an internally scheduled
+    # settle, so the Actor must infer when to ignore it from vision and
+    # proprioceptive history just as it will on hardware.
+    velocity = command.requested_world_command
     return torch.stack(
         (
             cosine * velocity[:, 0] + sine * velocity[:, 1],

@@ -62,6 +62,7 @@ conda run -n mimic python scripts/convert_elf3_holosoma2wbt_npz.py \
 | `Tracking-Climb-ELF3-v0` | 固定 0.66 m 平台攀爬专家训练与评估 |
 | `Tracking-DownRoll-ELF3-v0` | 固定 0.66 m 平台下台翻滚专家训练与评估 |
 | `Tracking-Flat-ELF3-v0` | 平地动作跟踪 |
+| `Distillation-MultiSkill-ELF3-v0` | locomotion、climb 和 down-roll 三专家视觉蒸馏 |
 
 ## 训练
 
@@ -137,6 +138,263 @@ python scripts/rsl_rl/train.py \
 修改奖励函数或环境逻辑后，建议重新训练；若只想复用已有策略参数，使用 `--warm_start`，不要把旧实验当作严格续训。
 
 训练日志默认写入 `logs/rsl_rl/<experiment_name>/<时间>_<run_name>/`。
+
+## 视觉多专家蒸馏
+
+蒸馏任务将冻结的 locomotion、climb 和 down-roll 三个专家统一蒸馏到一个视觉 Student。Student Actor
+观测包含 8 帧本体历史、二维速度命令和 `87 x 58` 头部深度图，不直接观察专家编号或特权平台参数。
+当前头部 D435i 按水平向下 42 度固定，深度采集频率为 30 Hz；训练假设部署时将完整的
+`848 x 480` 深度图直接缩放到 `87 x 58`，再按照训练代码裁剪、归一化。
+
+### 构建教师 bundle
+
+每台训练机器第一次使用时，先从仓库内三个源模型生成带哈希、观测维度和动作契约校验的教师
+bundle。若 `data/expert_models/elf3/distillation_bundle_v1/` 已存在且三个 manifest 校验正常，无需重复生成。
+三个源 `.pt` 是 Git LFS 对象；新机器 clone/pull 代码后，必须先拉取真实权重，不能使用 LFS 指针文件：
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+git lfs pull
+git lfs checkout
+```
+
+确认下面三个文件均为 MB 量级后再构建 bundle：
+
+```bash
+ls -lh \
+  data/expert_models/elf3/source/locomotion/policy.pt \
+  data/expert_models/elf3/source/climb/model_36000.pt \
+  data/expert_models/elf3/source/down_roll/model_12000.pt
+```
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+python scripts/tools/build_teacher_artifacts.py \
+  --locomotion_source data/expert_models/elf3/source/locomotion/policy.pt \
+  --climb_checkpoint data/expert_models/elf3/source/climb/model_36000.pt \
+  --down_roll_checkpoint data/expert_models/elf3/source/down_roll/model_12000.pt \
+  --output_dir data/expert_models/elf3/distillation_bundle_v1
+```
+
+成功后应生成：
+
+```text
+data/expert_models/elf3/distillation_bundle_v1/
+├── locomotion_manifest.json
+├── climb_manifest.json
+├── down_roll_manifest.json
+├── locomotion_actor.pt
+├── climb_actor.pt
+├── down_roll_actor.pt
+├── elf3_action_contract.json
+├── elf3.urdf
+└── elf3.usd
+```
+
+源专家或机器人动作契约改变后，需要重新审计源模型并使用 `--overwrite` 重建；不要手工修改生成的
+manifest。
+
+### 训练前冒烟检查
+
+正式长训前先运行 4 环境、1 轮检查。该命令会实际加载三个专家、创建头部 RTX 深度相机，并校验
+教师观测、29-DoF 动作顺序、动作缩放和资产哈希。
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+python scripts/rsl_rl/train_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --training_stage atomic \
+  --num_envs 4 \
+  --max_iterations 1 \
+  --seed 42 \
+  --experiment_name elf3_multi_skill_distillation_smoke \
+  --run_name visual_student_smoke \
+  --logger tensorboard \
+  --device cuda:0 \
+  --headless
+```
+
+确认环境初始化完成、六个观测组维度正确、训练完成 `Iteration 0/0`，且没有 manifest、哈希、观测维度、
+动作契约或 CUDA 错误后，再开始正式训练。第一轮尚无完整 episode 时，reward 和 episode length 显示
+`nan` 是正常的；loss 或动作出现非有限值则不正常。
+
+### 三阶段正式训练
+
+必须按 `atomic -> transition -> full` 顺序训练。`atomic` 先在标准 0.66 m 平台、无深度噪声/延迟和无相机
+外参扰动的条件下学习三个完整独立技能；`transition` 保持标准平台，恢复部署侧深度噪声、延迟和相机外参
+扰动，并使用连续物理状态学习 locomotion、climb 和 down-roll 之间的切换；`full` 再加入完整平台几何
+随机化、独立/组合 episode 混合和锁定期遥控请求扰动。两个专家边界不做人工关节插值：approach 仍是正常
+响应 `(vx, vy)` 的 locomotion；入口/边缘
+settle、完整 climb/down-roll 和动作结束后的短暂安全释放属于 motion control lock。锁定期间内部 locomotion
+Teacher 可以使用零速度完成稳定，climb/down-roll Teacher 不接收速度命令；Student 仍始终观察遥控器最新
+请求，并通过深度图与本体历史隐式学会暂时忽略它。安全释放完成后，locomotion 立即恢复最新请求，而不是固定
+恢复平台前向速度。只有关节姿态、实际关节速度、躯干直立度、平台相对位置、朝向和待启动专家的运动学作用域
+全部满足时才切换 Teacher。
+
+外部二维速度请求及 `--vx/--vy` 使用世界坐标，Student Actor 接收该请求在机器人机体坐标系中的二维投影；
+请求必须满足 `sqrt(vx^2 + vy^2) <= 1.0 m/s`。down-roll 只会在请求方向与机器人朝向都对齐平台前向时
+触发；仅有很小前向分量的侧向命令不会误触发 down-roll。
+
+为避免一开始同时学习所有困难，atomic 和 full 阶段会在 motion control lock 内以 1--2 s 间隔改变仅 Actor
+可见的遥控请求，Teacher 动作和专家轨迹保持不变；transition 阶段关闭该扰动，先学习可靠的标准平台连续
+切换。climb/down-roll 因此不会被中途遥控命令打断，但结束后可以响应锁定期间收到的最后一条命令。
+
+下面以 RTX 4090、2048 环境为例。若显存不足，优先将 `--num_envs` 依次降为 1024 或 512；不要改变深度图
+尺寸、教师 manifest 或动作缩放来规避显存问题。
+
+第一阶段从头训练：
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+python scripts/rsl_rl/train_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --training_stage atomic \
+  --num_envs 2048 \
+  --max_iterations 20000 \
+  --seed 42 \
+  --experiment_name elf3_multi_skill_distillation \
+  --run_name elf3_visual_student_atomic \
+  --logger tensorboard \
+  --device cuda:0 \
+  --headless
+```
+
+确认 fixed-skill 的三个技能均能完整执行后，用第一阶段 checkpoint 启动新的 transition run（示例时间目录需
+改为实际值）：
+
+```bash
+python scripts/rsl_rl/train_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --training_stage transition \
+  --warm_start \
+  --load_run 2026-08-28_12-00-00_elf3_visual_student_atomic \
+  --checkpoint model_19999.pt \
+  --num_envs 2048 \
+  --max_iterations 20000 \
+  --seed 42 \
+  --experiment_name elf3_multi_skill_distillation \
+  --run_name elf3_visual_student_transition \
+  --logger tensorboard \
+  --device cuda:0 \
+  --headless
+```
+
+确认 composed 模式可以完成 climb、台上 locomotion，并在短台面进入 down-roll 后，再由 transition
+checkpoint warm-start 完整随机化阶段：
+
+```bash
+python scripts/rsl_rl/train_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --training_stage full \
+  --warm_start \
+  --load_run 2026-08-28_18-00-00_elf3_visual_student_transition \
+  --checkpoint model_19999.pt \
+  --num_envs 2048 \
+  --max_iterations 100000 \
+  --seed 42 \
+  --experiment_name elf3_multi_skill_distillation \
+  --run_name elf3_visual_student_full \
+  --logger tensorboard \
+  --device cuda:0 \
+  --headless
+```
+
+`--warm_start` 只继承 Student/normalizer 权重并为新阶段重置优化器和课程轮次；只允许 atomic checkpoint
+初始化 transition、transition checkpoint 初始化 full。`--resume` 仅用于同一阶段、同一环境语义的中断续训。
+checkpoint 会保存训练阶段、头部相机、FOV、深度裁剪、Actor 观测语义与动作契约指纹，训练和播放遇到不一致
+时会拒绝加载。当前命令语义是“实时遥控请求始终可见、motion lock 内忽略控制作用、释放后恢复最新请求”；
+采用旧命令语义或旧 checkpoint 格式的 run 不可作为本流程起点，必须从 `atomic` 重新训练。
+
+日志写入：
+
+```text
+logs/rsl_rl/elf3_multi_skill_distillation/<时间>_elf3_visual_student_<阶段>/
+```
+
+默认每 500 轮保存一次 checkpoint，并在训练结束时额外保存最后一轮。例如单阶段训练 20000 轮的最终文件名是
+`model_19999.pt`。TensorBoard 命令：
+
+```bash
+tensorboard --logdir logs/rsl_rl/elf3_multi_skill_distillation
+```
+
+### 播放视觉 Student
+
+固定技能模式用于分别检查三个技能。下面以 climb、动作 0 为例；可将 `--skill` 改成 `locomotion` 或
+`down_roll`。固定 climb/down-roll 中的 `--vx/--vy` 只是仍然提供给 Student 的遥控输入，不会中断或改变已选
+motion；固定 locomotion 才直接响应它。`--checkpoint_path` 必须指向视觉 Student checkpoint，而不是三个
+专家的 checkpoint。
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+python scripts/rsl_rl/play_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --checkpoint_path logs/rsl_rl/elf3_multi_skill_distillation/2026-08-28_12-00-00_elf3_visual_student_atomic/model_19999.pt \
+  --playback_mode fixed_skill \
+  --skill climb \
+  --motion_id 0 \
+  --vx 0.6 \
+  --vy 0.0 \
+  --num_envs 4 \
+  --device cuda:0
+```
+
+组合模式从攀爬开始，由实际平台长度和视觉输入决定在台面继续 locomotion，还是在接近远端时进入
+down-roll。组合模式不能同时指定 `--skill`：
+
+```bash
+cd ~/Desktop/php_kvoy_reproduction
+
+python scripts/rsl_rl/play_distillation.py \
+  --task Distillation-MultiSkill-ELF3-v0 \
+  --climb_motion_dir data/processed_motions/elf3/climb_50hz_default_start_v1 \
+  --down_roll_motion_dir data/processed_motions/elf3/down_roll_50hz_platform_0p66_v1 \
+  --locomotion_manifest data/expert_models/elf3/distillation_bundle_v1/locomotion_manifest.json \
+  --climb_manifest data/expert_models/elf3/distillation_bundle_v1/climb_manifest.json \
+  --down_roll_manifest data/expert_models/elf3/distillation_bundle_v1/down_roll_manifest.json \
+  --checkpoint_path logs/rsl_rl/elf3_multi_skill_distillation/2026-08-28_18-00-00_elf3_visual_student_transition/model_19999.pt \
+  --playback_mode composed \
+  --motion_id 0 \
+  --vx 0.6 \
+  --vy 0.0 \
+  --num_envs 4 \
+  --device cuda:0
+```
+
+交互播放默认持续运行；可加 `--max_steps 1000` 自动停止。播放在创建场景前读取 checkpoint 的
+`training_stage`，自动匹配 atomic/transition/full 的平台和视觉课程，并恢复 checkpoint 训练轮次，从而沿用
+训练时相同的终止阈值；reset 时会打印实际终止原因，只想看画面时可加 `--quiet_reset_log`。排除视觉噪声
+影响时可以临时加入 `--no_depth_noise`，它同时关闭深度像素噪声和相机外参随机化，不应用于最终鲁棒性验收。
 
 ## 播放策略
 

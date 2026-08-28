@@ -12,16 +12,18 @@ from pathlib import Path
 import statistics
 import time
 from typing import Any
+import warnings
 
 import torch
 
 from .dagger_ppo import DAggerPPO
 from .observation import BlockwiseObservationNormalizer, RunningMeanStd, VisionObservationLayout
 from .training_contract import contract_fingerprint
+from .training_stage import TrainingStage, expected_warm_start_source_stage
 from .vision_actor_critic import VisionActorCritic
 
 
-_CHECKPOINT_FORMAT = "php_multi_teacher_student_v2"
+_CHECKPOINT_FORMAT = "php_multi_teacher_student_v3"
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,8 @@ class DistillationRunner:
         log_dir: str | os.PathLike[str] | None = None,
         device: str | torch.device = "cpu",
         environment_contract: Mapping[str, Any] | None = None,
+        policy_input_contract: Mapping[str, Any] | None = None,
+        training_stage: TrainingStage | None = None,
     ) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size != 1:
@@ -124,10 +128,21 @@ class DistillationRunner:
         }
         if environment_contract is not None and not isinstance(environment_contract, Mapping):
             raise TypeError("environment_contract must be a mapping or None")
+        if policy_input_contract is not None and not isinstance(policy_input_contract, Mapping):
+            raise TypeError("policy_input_contract must be a mapping or None")
         self.resume_contract_fingerprints = {
             "runner": contract_fingerprint(runner_contract),
             "environment": contract_fingerprint(dict(environment_contract or {})),
         }
+        self.policy_input_contract_fingerprint = (
+            None
+            if policy_input_contract is None
+            else contract_fingerprint(dict(policy_input_contract))
+        )
+        if training_stage is not None and training_stage not in ("atomic", "transition", "full"):
+            raise ValueError(f"unknown distillation training stage {training_stage!r}")
+        self.training_stage = training_stage
+        self.loaded_training_stage: TrainingStage | None = None
         self.device = torch.device(device)
         self.env = env
         self.teacher_router = teacher_router
@@ -510,6 +525,8 @@ class DistillationRunner:
             "total_time": self.tot_time,
             "teacher_fingerprints": dict(self._teacher_fingerprints()),
             "resume_contract_fingerprints": dict(self.resume_contract_fingerprints),
+            "policy_input_contract_fingerprint": self.policy_input_contract_fingerprint,
+            "training_stage": self.training_stage,
             "torch_rng_state": torch.get_rng_state(),
             "infos": dict(infos or {}),
         }
@@ -517,8 +534,22 @@ class DistillationRunner:
             checkpoint["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
         torch.save(checkpoint, destination)
 
-    def load(self, path: str | os.PathLike[str], load_optimizer: bool = True) -> Mapping[str, Any]:
-        """Strictly resume a student checkpoint without resetting the PHP schedule."""
+    def load(
+        self,
+        path: str | os.PathLike[str],
+        load_optimizer: bool = True,
+        *,
+        restore_training_state: bool | None = None,
+    ) -> Mapping[str, Any]:
+        """Load a checkpoint for resume, warm-start, or inference.
+
+        ``load_optimizer=False`` historically meant warm-start and therefore
+        reset the absolute PHP curriculum to iteration zero.  Inference also
+        omits the optimizer, but must retain the checkpoint iteration because
+        environment termination tolerances are iteration-dependent.  The
+        explicit ``restore_training_state`` flag separates those contracts
+        while preserving the historical warm-start default.
+        """
 
         if self._rollout_state is not None:
             raise RuntimeError("Load a checkpoint before learn(); an active rollout cannot be replaced safely.")
@@ -526,6 +557,62 @@ class DistillationRunner:
         checkpoint = torch.load(source, map_location=self.device, weights_only=True)
         if checkpoint.get("format") != _CHECKPOINT_FORMAT:
             raise ValueError(f"Unsupported distillation checkpoint format in {source}.")
+        if restore_training_state is None:
+            restore_training_state = load_optimizer
+        if not isinstance(restore_training_state, bool):
+            raise TypeError("restore_training_state must be a boolean or None")
+        if load_optimizer and not restore_training_state:
+            raise ValueError("loading the optimizer requires restoring the absolute training state")
+
+        saved_training_stage = checkpoint.get("training_stage")
+        if saved_training_stage is not None and saved_training_stage not in (
+            "atomic",
+            "transition",
+            "full",
+        ):
+            raise ValueError(f"Checkpoint contains unknown training stage {saved_training_stage!r}.")
+        self.loaded_training_stage = saved_training_stage
+        if self.training_stage is not None:
+            if saved_training_stage is None:
+                raise ValueError(
+                    "Checkpoint does not record a curriculum stage; refusing an unverifiable "
+                    f"load into {self.training_stage!r}."
+                )
+            if load_optimizer or restore_training_state:
+                if saved_training_stage != self.training_stage:
+                    raise ValueError(
+                        "Strict resume requires the same curriculum stage: "
+                        f"saved={saved_training_stage!r}, current={self.training_stage!r}."
+                    )
+            else:
+                expected_source = expected_warm_start_source_stage(self.training_stage)
+                if saved_training_stage != expected_source:
+                    raise ValueError(
+                        "Warm-start must use the immediately preceding curriculum stage: "
+                        f"saved={saved_training_stage!r}, expected={expected_source!r}, "
+                        f"current={self.training_stage!r}."
+                    )
+        saved_policy_contract = checkpoint.get("policy_input_contract_fingerprint")
+        if saved_policy_contract is None:
+            if self.policy_input_contract_fingerprint is not None:
+                warnings.warn(
+                    "Checkpoint predates the Student policy-input contract fingerprint; "
+                    "camera, observation and action semantics cannot be verified. Re-save it "
+                    "only after an explicit compatibility check.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        elif self.policy_input_contract_fingerprint is None:
+            raise ValueError(
+                "Checkpoint contains a Student policy-input contract but the current runner "
+                "was constructed without one. Refusing an unverifiable load."
+            )
+        elif saved_policy_contract != self.policy_input_contract_fingerprint:
+            raise ValueError(
+                "Student camera, policy-observation or action semantics differ from the "
+                "checkpoint; refusing to load incompatible weights. "
+                f"saved={saved_policy_contract}, current={self.policy_input_contract_fingerprint}."
+            )
         saved_fingerprints = checkpoint.get("teacher_fingerprints")
         current_fingerprints = dict(self._teacher_fingerprints())
         if saved_fingerprints != current_fingerprints:
@@ -567,15 +654,22 @@ class DistillationRunner:
             # would therefore reset a previously adapted rate to the config
             # default on the first update after resume.
             self.alg.learning_rate = restored_learning_rate
-            self.current_learning_iteration = int(checkpoint["next_iteration"])
-            self.tot_timesteps = int(checkpoint.get("total_timesteps", 0))
-            self.tot_time = float(checkpoint.get("total_time", 0.0))
             torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
             if "cuda_rng_state_all" in checkpoint and torch.cuda.is_available():
                 # ``map_location=self.device`` also moves serialized RNG byte
                 # tensors to CUDA, while PyTorch's RNG API requires CPU
                 # ByteTensors even when restoring CUDA generators.
                 torch.cuda.set_rng_state_all(_cpu_cuda_rng_states(checkpoint["cuda_rng_state_all"]))
+        if restore_training_state:
+            self.current_learning_iteration = int(checkpoint["next_iteration"])
+            self.tot_timesteps = int(checkpoint.get("total_timesteps", 0))
+            self.tot_time = float(checkpoint.get("total_time", 0.0))
+            # A checkpoint named model_N contains the policy after iteration
+            # N and stores N+1 as the next optimizer iteration.  Publish the
+            # completed iteration before the first inference step so play
+            # uses the same relaxed termination boundary as training.
+            completed_iteration = max(0, self.current_learning_iteration - 1)
+            self._set_environment_training_iteration(completed_iteration)
         else:
             self.current_learning_iteration = 0
             self.tot_timesteps = 0
