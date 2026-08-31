@@ -1268,14 +1268,15 @@ class MultiSkillCommand(CommandTerm):
             self.metrics["settle_joint_position_rms"][settle_ids] = pose_rms
             self.metrics["settle_joint_speed_rms"][settle_ids] = speed_rms
             self.metrics["settle_gravity_xy_norm"][settle_ids] = gravity_norm
-            self.metrics["settle_geometry_ready"][settle_ids] = self._settle_geometry_ready(
-                settle_ids
+            geometry_ready = self._settle_geometry_ready(settle_ids)
+            self.metrics["settle_geometry_ready"][settle_ids] = geometry_ready.to(
+                dtype=self.metrics["settle_geometry_ready"].dtype
             )
             self.metrics["settle_kinematic_scope_valid"][settle_ids] = (
                 self.motion_kinematic_scope_valid(
                     settle_ids,
                     self.pending_motion_skill_ids[settle_ids],
-                )
+                ).to(dtype=self.metrics["settle_kinematic_scope_valid"].dtype)
             )
         locked = self.motion_control_locked
         requested_speed = torch.linalg.vector_norm(self.requested_world_command, dim=1)
@@ -1727,7 +1728,9 @@ class MultiSkillCommandCfg(CommandTermCfg):
     approach_lateral_tolerance: float = 0.20
     approach_maximum_overshoot: float = 0.20
     approach_timeout_s: float = 3.0
-    transition_settle_time_range_s: tuple[float, float] = (0.2, 0.5)
+    # No hidden random dwell: transitions occur as soon as the observable
+    # geometry, posture and kinematic entrance gates are simultaneously ready.
+    transition_settle_time_range_s: tuple[float, float] = (0.0, 0.0)
     transition_maximum_settle_time_s: float = 1.0
     # The checked-in four-clip datasets have at most about 0.289 rad RMS
     # between a default-like locomotion stance and a motion boundary pose.

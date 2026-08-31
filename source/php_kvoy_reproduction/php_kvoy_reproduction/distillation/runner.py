@@ -18,12 +18,16 @@ import torch
 
 from .dagger_ppo import DAggerPPO
 from .observation import BlockwiseObservationNormalizer, RunningMeanStd, VisionObservationLayout
+from .option_controller import (
+    OptionStateController,
+    linear_teacher_forcing_probability,
+)
 from .training_contract import contract_fingerprint
 from .training_stage import TrainingStage, expected_warm_start_source_stage
 from .vision_actor_critic import VisionActorCritic
 
 
-_CHECKPOINT_FORMAT = "php_multi_teacher_student_v3"
+_CHECKPOINT_FORMAT = "php_multi_teacher_hierarchical_student_v4"
 
 
 @dataclass(frozen=True)
@@ -52,7 +56,13 @@ class _RolloutState:
     observation_groups: Mapping[str, torch.Tensor]
 
 
-def _require_flat_group(groups: Mapping[str, Any], key: str, num_envs: int) -> torch.Tensor:
+def _require_flat_group(
+    groups: Mapping[str, Any],
+    key: str,
+    num_envs: int,
+    *,
+    require_finite: bool = True,
+) -> torch.Tensor:
     if key not in groups:
         raise KeyError(f"Environment did not provide required observation group {key!r}.")
     value = groups[key]
@@ -65,7 +75,7 @@ def _require_flat_group(groups: Mapping[str, Any], key: str, num_envs: int) -> t
             f"Observation group {key!r} must have shape [{num_envs}, features], "
             f"got {tuple(value.shape)}."
         )
-    if value.dtype.is_floating_point and not torch.isfinite(value).all():
+    if require_finite and value.dtype.is_floating_point and not torch.isfinite(value).all():
         raise ValueError(f"Observation group {key!r} contains NaN or infinity.")
     return value
 
@@ -119,6 +129,7 @@ class DistillationRunner:
             "num_steps_per_env",
             "observation_keys",
             "observation_layout",
+            "option_control",
             "policy",
         )
         runner_contract = {
@@ -215,6 +226,26 @@ class DistillationRunner:
             )
         self.alg = DAggerPPO(self.policy, device=self.device, **algorithm_cfg)
 
+        option_cfg = dict(self.cfg.get("option_control", {}))
+        self.teacher_forcing_start = float(
+            option_cfg.pop("teacher_forcing_start", 1.0)
+        )
+        self.teacher_forcing_end = float(option_cfg.pop("teacher_forcing_end", 0.0))
+        self.teacher_forcing_iterations = int(
+            option_cfg.pop("teacher_forcing_iterations", 10_000)
+        )
+        self.runtime_option_control_cfg = deepcopy(option_cfg)
+        self.runtime_option_control_fingerprint = contract_fingerprint(
+            self.runtime_option_control_cfg
+        )
+        # Validates all option thresholds and duration maps at construction.
+        self.option_controller = OptionStateController(
+            self.env.num_envs,
+            self.alg.skill_names,
+            device=self.device,
+            **option_cfg,
+        )
+
         self.num_steps_per_env = int(self.cfg["num_steps_per_env"])
         self.save_interval = int(self.cfg.get("save_interval", 1000))
         self.log_interval = int(self.cfg.get("log_interval", 1))
@@ -263,7 +294,9 @@ class DistillationRunner:
         if route.shape[1] != 1 or mask.shape[1] != 1:
             raise ValueError("teacher_route and distill_mask observation groups must each have one column.")
         for group_name in self.observation_keys.teacher_groups().values():
-            _require_flat_group(groups, group_name, self.env.num_envs)
+            _require_flat_group(
+                groups, group_name, self.env.num_envs, require_finite=False
+            )
 
     def _normalize_pack(
         self,
@@ -330,7 +363,12 @@ class DistillationRunner:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         skill_ids, environment_mask = self._route_and_mask(groups)
         teacher_observations = {
-            skill: _require_flat_group(groups, group_name, self.env.num_envs).to(self.device)
+            skill: _require_flat_group(
+                groups,
+                group_name,
+                self.env.num_envs,
+                require_finite=False,
+            ).to(self.device)
             for skill, group_name in self.observation_keys.teacher_groups().items()
         }
         labels = self.teacher_router.act(
@@ -355,6 +393,14 @@ class DistillationRunner:
         if torch.any((valid_mask > 0.0) & (environment_mask <= 0.0)):
             raise RuntimeError("Teacher router marked an environment valid outside the environment distill mask.")
         return actions, valid_mask, skill_ids
+
+    def _teacher_forcing_probability(self, iteration: int) -> float:
+        return linear_teacher_forcing_probability(
+            iteration,
+            start=self.teacher_forcing_start,
+            end=self.teacher_forcing_end,
+            curriculum_iterations=self.teacher_forcing_iterations,
+        )
 
     def _initialize_writer(self) -> None:
         if self.log_dir is None or self.writer is not None:
@@ -389,16 +435,26 @@ class DistillationRunner:
         end_iteration = start_iteration + num_learning_iterations
         for iteration in range(start_iteration, end_iteration):
             self._set_environment_training_iteration(iteration)
+            forcing_probability = self._teacher_forcing_probability(iteration)
             collection_start = time.perf_counter()
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     teacher_actions, dagger_mask, skill_ids = self._teacher_labels(state.observation_groups)
+                    actor_outputs = self.policy.actor_outputs(state.actor_observations)
+                    option_selection = self.option_controller.select(
+                        actor_outputs[1],
+                        oracle_skill_ids=skill_ids,
+                        teacher_forcing_probability=forcing_probability,
+                    )
                     student_actions = self.alg.act(
                         state.actor_observations,
                         state.critic_observations,
                         teacher_actions,
                         dagger_mask,
                         skill_ids,
+                        option_selection.active_skill_ids,
+                        option_selection.teacher_forcing_mask,
+                        actor_outputs=actor_outputs,
                     )
                     # This is the central online-DAgger invariant: only the
                     # sampled student action advances physics.
@@ -412,6 +468,10 @@ class DistillationRunner:
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
+                    self.option_controller.reset(
+                        dones,
+                        teacher_forcing_probability=forcing_probability,
+                    )
                     state = next_state
 
                     current_rewards += rewards.reshape(-1)
@@ -494,7 +554,11 @@ class DistillationRunner:
             f"Iteration {iteration}/{end_iteration - 1} | {fps} steps/s | "
             f"reward {mean_reward:.2f} | episode length {mean_length:.2f} | "
             f"DAgger {loss_metrics['dagger']:.6f} (w={loss_metrics['dagger_weight']:.3f}) | "
-            f"PPO {loss_metrics['ppo_total']:.6f} (w={loss_metrics['ppo_weight']:.3f})"
+            f"PPO {loss_metrics['ppo_total']:.6f} (w={loss_metrics['ppo_weight']:.3f}) | "
+            f"selector {loss_metrics['selector']:.4f} "
+            f"(acc={loss_metrics['selector_accuracy']:.3f}, "
+            f"route={loss_metrics['route_agreement']:.3f}, "
+            f"forced={loss_metrics['teacher_forcing_fraction']:.3f})"
         )
 
     def _teacher_fingerprints(self) -> Mapping[str, str]:
@@ -526,6 +590,7 @@ class DistillationRunner:
             "teacher_fingerprints": dict(self._teacher_fingerprints()),
             "resume_contract_fingerprints": dict(self.resume_contract_fingerprints),
             "policy_input_contract_fingerprint": self.policy_input_contract_fingerprint,
+            "runtime_option_control_fingerprint": self.runtime_option_control_fingerprint,
             "training_stage": self.training_stage,
             "torch_rng_state": torch.get_rng_state(),
             "infos": dict(infos or {}),
@@ -556,6 +621,12 @@ class DistillationRunner:
         source = Path(path).expanduser().resolve()
         checkpoint = torch.load(source, map_location=self.device, weights_only=True)
         if checkpoint.get("format") != _CHECKPOINT_FORMAT:
+            if checkpoint.get("format") == "php_multi_teacher_student_v3":
+                raise ValueError(
+                    "This checkpoint uses the retired single-action-head Student. "
+                    "It cannot be loaded into the hard-routed hierarchical policy; "
+                    "start a new atomic-stage run."
+                )
             raise ValueError(f"Unsupported distillation checkpoint format in {source}.")
         if restore_training_state is None:
             restore_training_state = load_optimizer
@@ -612,6 +683,13 @@ class DistillationRunner:
                 "Student camera, policy-observation or action semantics differ from the "
                 "checkpoint; refusing to load incompatible weights. "
                 f"saved={saved_policy_contract}, current={self.policy_input_contract_fingerprint}."
+            )
+        saved_option_contract = checkpoint.get("runtime_option_control_fingerprint")
+        if saved_option_contract != self.runtime_option_control_fingerprint:
+            raise ValueError(
+                "Deployment Option-controller semantics differ from the checkpoint; "
+                "activation, lock, release and cooldown thresholds must remain identical. "
+                f"saved={saved_option_contract}, current={self.runtime_option_control_fingerprint}."
             )
         saved_fingerprints = checkpoint.get("teacher_fingerprints")
         current_fingerprints = dict(self._teacher_fingerprints())
@@ -680,18 +758,42 @@ class DistillationRunner:
         return infos
 
     def get_inference_policy(self, device: str | torch.device | None = None):
-        """Return deterministic student inference with frozen actor moments."""
+        """Return deterministic autonomous inference with the training option lock."""
 
         inference_device = self.device if device is None else torch.device(device)
         self.policy.eval().to(inference_device)
         self.actor_normalizer.eval().to(inference_device)
 
-        def inference(raw_observations: torch.Tensor) -> torch.Tensor:
-            with torch.inference_mode():
-                normalized = self.actor_normalizer(raw_observations.to(inference_device))
-                return self.policy.act_inference(normalized)
+        controller = OptionStateController(
+            self.env.num_envs,
+            self.alg.skill_names,
+            device=inference_device,
+            **deepcopy(self.runtime_option_control_cfg),
+        )
 
-        return inference
+        class InferencePolicy:
+            def __call__(inner_self, raw_observations: torch.Tensor) -> torch.Tensor:
+                with torch.inference_mode():
+                    normalized = self.actor_normalizer(
+                        raw_observations.to(inference_device)
+                    )
+                    all_action_means, selector_logits = self.policy.actor_outputs(normalized)
+                    selection = controller.select(
+                        selector_logits,
+                        teacher_forcing_probability=0.0,
+                    )
+                    return self.policy.actor.select_action_means(
+                        all_action_means, selection.active_skill_ids
+                    )
+
+            def reset(inner_self, dones: torch.Tensor | None = None) -> None:
+                controller.reset(dones, teacher_forcing_probability=0.0)
+
+            @property
+            def active_skill_ids(inner_self) -> torch.Tensor:
+                return controller.active_skill_ids[:, None].clone()
+
+        return InferencePolicy()
 
     def close(self) -> None:
         """Flush and close the optional TensorBoard writer."""

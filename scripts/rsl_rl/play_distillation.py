@@ -241,6 +241,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             with torch.inference_mode():
                 actions = policy(observations)
                 observations, _, dones, extras = env.step(actions)
+                # Keep deployment option state aligned with Isaac Lab's
+                # automatic per-environment episode resets.
+                policy.reset(dones)
             if not args_cli.quiet_reset_log and torch.any(dones):
                 log = extras.get("log", extras.get("episode", {}))
                 reasons = []

@@ -121,6 +121,15 @@ def _train_cfg() -> dict:
         "save_interval": 10,
         "log_interval": 1,
         "logger": "tensorboard",
+        "option_control": {
+            "activation_confirmation_steps": 1,
+            "release_confirmation_steps": 1,
+            "minimum_skill_duration_steps": {"climb": 1, "down_roll": 1},
+            "maximum_skill_duration_steps": {"climb": 3, "down_roll": 3},
+            "teacher_forcing_start": 1.0,
+            "teacher_forcing_end": 1.0,
+            "teacher_forcing_iterations": 1,
+        },
         "observation_layout": {
             "proprio_frame_dim": 2,
             "proprio_history_length": 2,
@@ -142,6 +151,25 @@ def test_runner_advances_fake_environment_only_with_student_actions() -> None:
     assert runner.tot_timesteps == 6
     assert all(torch.isfinite(actions).all() for actions in env.stepped_actions)
     assert all(not torch.equal(actions, torch.full_like(actions, 5.0)) for actions in env.stepped_actions)
+
+
+def test_inference_uses_autonomous_selector_and_hard_action_head() -> None:
+    runner = DistillationRunner(
+        _FakeEnvironment(), _train_cfg(), _FakeTeacherRouter(), device="cpu"
+    )
+    with torch.no_grad():
+        runner.policy.actor.selector.weight.zero_()
+        runner.policy.actor.selector.bias.copy_(torch.tensor([0.0, 10.0, 0.0]))
+        for skill_id, head in enumerate(runner.policy.actor.action_heads):
+            head.weight.zero_()
+            head.bias.fill_(float(skill_id + 1))
+    inference = runner.get_inference_policy(device="cpu")
+    raw_observations, _ = runner.env.get_observations()
+    actions = inference(raw_observations)
+    assert actions.eq(2.0).all()
+    assert inference.active_skill_ids.eq(1).all()
+    inference.reset(torch.tensor([True, False, False]))
+    assert inference.active_skill_ids[:, 0].tolist() == [0, 1, 1]
 
 
 def test_checkpoint_restores_absolute_iteration_and_adapted_learning_rate(tmp_path) -> None:
@@ -341,6 +369,21 @@ def test_checkpoint_always_rejects_changed_policy_input_contract(tmp_path, load_
     )
     with pytest.raises(ValueError, match="Student camera"):
         target.load(checkpoint, **load_kwargs)
+
+
+def test_checkpoint_rejects_changed_deployment_option_semantics(tmp_path) -> None:
+    source = DistillationRunner(
+        _FakeEnvironment(), _train_cfg(), _FakeTeacherRouter(), device="cpu"
+    )
+    checkpoint = tmp_path / "model_0.pt"
+    source.save(checkpoint)
+    changed_cfg = _train_cfg()
+    changed_cfg["option_control"]["activation_confirmation_steps"] = 2
+    target = DistillationRunner(
+        _FakeEnvironment(), changed_cfg, _FakeTeacherRouter(), device="cpu"
+    )
+    with pytest.raises(ValueError, match="Option-controller semantics"):
+        target.load(checkpoint, load_optimizer=False)
 
 
 def test_legacy_checkpoint_without_policy_input_contract_warns(tmp_path) -> None:

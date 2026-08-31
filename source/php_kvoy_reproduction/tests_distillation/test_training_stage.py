@@ -17,6 +17,7 @@ def _configs():
             multi_skill=SimpleNamespace(
                 platform_size=(0.51, 0.80, 0.66),
                 composed_episode_fraction=0.5,
+                transition_settle_time_range_s=(0.2, 0.5),
             )
         ),
         events=SimpleNamespace(
@@ -44,7 +45,12 @@ def _configs():
         ),
     )
     agent = SimpleNamespace(
-        algorithm=SimpleNamespace(minimum_dagger_weight=0.1)
+        algorithm=SimpleNamespace(minimum_dagger_weight=0.1),
+        option_control={
+            "teacher_forcing_start": 1.0,
+            "teacher_forcing_end": 0.0,
+            "teacher_forcing_iterations": 20_000,
+        },
     )
     return env, agent
 
@@ -52,9 +58,9 @@ def _configs():
 @pytest.mark.parametrize(
     ("stage", "composed_fraction", "dagger_weight", "locked_resampling"),
     (
-        ("atomic", 0.0, 1.0, True),
-        ("transition", 1.0, 0.5, False),
-        ("full", 0.5, 0.1, True),
+        ("atomic", 0.0, 0.8, True),
+        ("transition", 1.0, 0.4, False),
+        ("full", 1.0, 0.1, True),
     ),
 )
 def test_training_stage_routing_and_dagger_schedule(
@@ -68,6 +74,20 @@ def test_training_stage_routing_and_dagger_schedule(
     assert env.commands.multi_skill.composed_episode_fraction == composed_fraction
     assert env.commands.multi_skill.locked_command_resampling_enabled is locked_resampling
     assert agent.algorithm.minimum_dagger_weight == dagger_weight
+    assert env.commands.multi_skill.transition_settle_time_range_s == (0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("stage", "forcing_start", "forcing_end"),
+    (("atomic", 1.0, 1.0), ("transition", 1.0, 0.25), ("full", 0.25, 0.0)),
+)
+def test_training_stage_route_teacher_forcing_schedule(
+    stage: str, forcing_start: float, forcing_end: float
+) -> None:
+    env, agent = _configs()
+    configure_training_stage(env, agent, stage)
+    assert agent.option_control["teacher_forcing_start"] == forcing_start
+    assert agent.option_control["teacher_forcing_end"] == forcing_end
 
 
 @pytest.mark.parametrize("stage", ("atomic", "transition"))

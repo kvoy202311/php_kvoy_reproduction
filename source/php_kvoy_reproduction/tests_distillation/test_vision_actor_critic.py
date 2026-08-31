@@ -103,14 +103,19 @@ def test_default_architecture_matches_the_configured_php_network() -> None:
     assert len(adaptive_pool) == 1
     assert adaptive_pool[0].output_size == (1, 1)
 
-    assert _linear_dimensions(policy.actor.mlp) == [
+    assert _linear_dimensions(policy.actor.trunk) == [
         (layout.proprio_dim + layout.command_dim + 32, 2048),
         (2048, 1024),
         (1024, 512),
         (512, 256),
         (256, 128),
-        (128, 29),
     ]
+    assert len(policy.actor.action_heads) == 3
+    assert all(
+        (head.in_features, head.out_features) == (128, 29)
+        for head in policy.actor.action_heads
+    )
+    assert (policy.actor.selector.in_features, policy.actor.selector.out_features) == (128, 3)
     assert _linear_dimensions(policy.critic) == [
         (101, 512),
         (512, 256),
@@ -133,6 +138,21 @@ def test_rsl_rl_surface_shapes_and_distribution_properties() -> None:
     assert policy.act_inference(actor_obs).shape == (4, 29)
     assert policy.evaluate(critic_obs).shape == (4, 1)
     assert torch.isfinite(actions).all()
+
+
+def test_hard_skill_routes_select_disjoint_action_heads() -> None:
+    policy = _small_policy()
+    with torch.no_grad():
+        for skill_id, head in enumerate(policy.actor.action_heads):
+            head.weight.zero_()
+            head.bias.fill_(float(skill_id + 1))
+    observations = torch.zeros(3, policy.num_actor_obs)
+    routes = torch.tensor([[0], [1], [2]])
+    actions = policy.act_inference(observations, skill_ids=routes)
+    torch.testing.assert_close(
+        actions[:, 0], torch.tensor([1.0, 2.0, 3.0])
+    )
+    assert policy.actor_outputs(observations)[0].shape == (3, 3, 29)
 
 
 def test_batch_size_one_is_preserved_without_squeezing() -> None:

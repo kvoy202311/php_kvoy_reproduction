@@ -77,6 +77,8 @@ def _transition(step: int, num_envs: int = 4) -> HybridTransition:
         teacher_actions=actions + 1_000.0,
         dagger_mask=torch.ones(num_envs, 1, dtype=torch.bool),
         skill_ids=(ids.long() % 3),
+        actor_skill_ids=((ids.long() + 1) % 3),
+        teacher_forcing_mask=torch.zeros(num_envs, 1, dtype=torch.bool),
     )
 
 
@@ -91,6 +93,7 @@ def test_hybrid_storage_shuffle_keeps_labels_routes_and_actions_aligned():
         assert torch.equal(batch.actions[:, 0], identity)
         assert torch.equal(batch.teacher_actions[:, 0], identity + 1_000.0)
         assert torch.equal(batch.skill_ids[:, 0], identity.long() % 3)
+        assert torch.equal(batch.actor_skill_ids[:, 0], (identity.long() + 1) % 3)
         seen += batch.observations.shape[0]
     assert seen == 8
 
@@ -210,18 +213,41 @@ class _TinyPolicy(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.actor = nn.Linear(3, 29)
+        self.actor = nn.Linear(3, 3 * 29)
+        self.selector = nn.Linear(3, 3)
         self.critic = nn.Linear(2, 1)
         self.log_std = nn.Parameter(torch.full((29,), -2.0))
         self.distribution = None
+        self._all_action_means = None
+        self._selector_logits = None
 
     def reset(self, dones=None):
         pass
 
-    def act(self, observations, **kwargs):
-        mean = self.actor(observations)
+    def update_distribution(self, observations, skill_ids=None):
+        self._all_action_means = self.actor(observations).reshape(-1, 3, 29)
+        self._selector_logits = self.selector(observations)
+        if skill_ids is None:
+            skill_ids = self._selector_logits.argmax(dim=-1)
+        route = skill_ids.reshape(-1)
+        mean = self._all_action_means[
+            torch.arange(observations.shape[0]), route
+        ]
         self.distribution = Normal(mean, self.log_std.exp().expand_as(mean))
+
+    def act(self, observations, **kwargs):
+        self.update_distribution(observations, kwargs.get("skill_ids"))
         return self.distribution.sample()
+
+    @property
+    def selector_logits(self):
+        return self._selector_logits
+
+    def action_mean_for_skill(self, skill_ids):
+        route = skill_ids.reshape(-1)
+        return self._all_action_means[
+            torch.arange(route.shape[0]), route
+        ]
 
     @property
     def action_mean(self):
@@ -262,6 +288,8 @@ def test_algorithm_uses_absolute_iteration_and_reports_each_skill():
             teacher,
             torch.ones(4, 1, dtype=torch.bool),
             torch.tensor([[0], [1], [2], [0]]),
+            torch.tensor([[0], [1], [2], [0]]),
+            torch.ones(4, 1, dtype=torch.bool),
         )
         assert actions.shape == (4, 29)
         algorithm.process_env_step(torch.ones(4), torch.zeros(4), {})
@@ -272,3 +300,4 @@ def test_algorithm_uses_absolute_iteration_and_reports_each_skill():
     assert metrics["dagger_valid_count/locomotion"] == 4
     assert metrics["dagger_valid_count/climb"] == 2
     assert metrics["dagger_valid_count/down_roll"] == 2
+    assert "selector_accuracy" in metrics

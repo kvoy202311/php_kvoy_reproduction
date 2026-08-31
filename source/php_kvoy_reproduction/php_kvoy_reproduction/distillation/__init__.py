@@ -8,6 +8,7 @@ with the current Isaac Lab environment.
 from .action_transform import CanonicalActionTransform
 from .action_contract import validate_runtime_action_contract
 from .observation import BlockwiseObservationNormalizer, VisionObservationLayout
+from .option_controller import OptionSelection, OptionStateController
 from .schedules import DistillationWeights, PhpLossSchedule
 from .teacher_manifest import TeacherManifest
 
@@ -15,6 +16,8 @@ __all__ = [
     "BlockwiseObservationNormalizer",
     "CanonicalActionTransform",
     "DistillationWeights",
+    "OptionSelection",
+    "OptionStateController",
     "PhpLossSchedule",
     "TeacherManifest",
     "VisionObservationLayout",

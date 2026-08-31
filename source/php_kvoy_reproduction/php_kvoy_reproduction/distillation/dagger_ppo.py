@@ -26,6 +26,21 @@ def _as_column(values: torch.Tensor, name: str, batch_size: int) -> torch.Tensor
     return result
 
 
+def _skill_id_column(
+    values: torch.Tensor,
+    name: str,
+    batch_size: int,
+    num_skills: int,
+) -> torch.Tensor:
+    result = _as_column(values, name, batch_size)
+    if result.dtype == torch.bool or result.is_floating_point() or result.is_complex():
+        raise TypeError(f"{name} must use an integer dtype")
+    result = result.to(dtype=torch.long)
+    if torch.any((result < 0) | (result >= num_skills)):
+        raise ValueError(f"{name} must lie in [0, {num_skills})")
+    return result
+
+
 def masked_dagger_losses(
     student_mean: torch.Tensor,
     teacher_actions: torch.Tensor,
@@ -51,20 +66,26 @@ def masked_dagger_losses(
             "dagger_weights must be "
             f"[{student_mean.shape[0]}, 1], got {tuple(dagger_weights.shape)}."
         )
-    if not (
-        torch.isfinite(student_mean).all()
-        and torch.isfinite(teacher_actions).all()
-        and torch.isfinite(dagger_weights).all()
-    ):
-        raise ValueError("Student actions, teacher actions, or DAgger weights contain NaN or infinity.")
+    if not torch.isfinite(student_mean).all() or not torch.isfinite(dagger_weights).all():
+        raise ValueError("Student actions or DAgger weights contain NaN or infinity.")
     if torch.any((dagger_weights < 0.0) | (dagger_weights > 1.0)):
         raise ValueError("dagger_weights must lie in [0, 1].")
 
     weights = dagger_weights.to(dtype=student_mean.dtype)
     effective_weight = weights.sum()
-    valid_count = torch.count_nonzero(weights).to(dtype=student_mean.dtype)
-    squared_error = (student_mean - teacher_actions).square()
-    squared_sum = (squared_error * weights).sum()
+    positive = weights[:, 0] > 0.0
+    valid_count = torch.count_nonzero(positive).to(dtype=student_mean.dtype)
+    if not torch.any(positive):
+        connected_zero = student_mean.sum() * 0.0
+        return connected_zero, connected_zero, effective_weight
+    valid_student = student_mean[positive]
+    valid_teacher = teacher_actions[positive]
+    valid_weights = weights[positive]
+    if not torch.isfinite(valid_teacher).all():
+        raise ValueError("A positive-confidence teacher label contains NaN or infinity.")
+    # Subset before subtraction: 0 * inf and 0 * huge values are not safe
+    # masks and can contaminate gradients even though their confidence is zero.
+    squared_sum = ((valid_student - valid_teacher).square() * valid_weights).sum()
     # Normalize by the number of labels, not by their summed confidence.
     # This preserves the historical binary-mask mean while ensuring that a
     # confidence of 0.1 contributes one tenth of a fully trusted label.
@@ -125,15 +146,44 @@ def skill_balanced_dagger_losses(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DAgger errors with equal skill weight and weighted samples per skill."""
 
-    _, _, effective_weight = masked_dagger_losses(student_mean, teacher_actions, dagger_weights)
-    squared = (student_mean - teacher_actions).square()
-    mean_per_dof = skill_balanced_mean(
-        squared.mean(dim=1), skill_ids, num_skills, dagger_weights
+    _, _, effective_weight = masked_dagger_losses(
+        student_mean, teacher_actions, dagger_weights
     )
-    sum_per_sample = skill_balanced_mean(
-        squared.sum(dim=1), skill_ids, num_skills, dagger_weights
+    route = skill_ids.reshape(-1)
+    weights = dagger_weights.reshape(-1).to(
+        device=student_mean.device, dtype=student_mean.dtype
     )
-    return mean_per_dof, sum_per_sample, effective_weight
+    if route.shape != weights.shape or route.shape[0] != student_mean.shape[0]:
+        raise ValueError("skill_ids and dagger_weights must contain one value per sample")
+    if route.dtype == torch.bool or route.is_floating_point() or route.is_complex():
+        raise TypeError("skill_ids must use an integer dtype")
+    if torch.any((route < 0) | (route >= num_skills)):
+        raise ValueError("skill_ids contains an out-of-range route")
+    group_mean_losses: list[torch.Tensor] = []
+    group_sum_losses: list[torch.Tensor] = []
+    for skill_id in range(num_skills):
+        positive = (route == skill_id) & (weights > 0.0)
+        count = torch.count_nonzero(positive)
+        if count == 0:
+            continue
+        difference = student_mean[positive] - teacher_actions[positive]
+        squared = difference.square()
+        sample_weights = weights[positive]
+        denominator = count.to(dtype=student_mean.dtype)
+        group_mean_losses.append(
+            (squared.mean(dim=1) * sample_weights).sum() / denominator
+        )
+        group_sum_losses.append(
+            (squared.sum(dim=1) * sample_weights).sum() / denominator
+        )
+    if not group_mean_losses:
+        connected_zero = student_mean.sum() * 0.0
+        return connected_zero, connected_zero, effective_weight
+    return (
+        torch.stack(group_mean_losses).mean(),
+        torch.stack(group_sum_losses).mean(),
+        effective_weight,
+    )
 
 
 class DAggerPPO:
@@ -161,11 +211,13 @@ class DAggerPPO:
         schedule: str = "adaptive",
         desired_kl: float | None = 0.01,
         dagger_base_coef: float = 10.0,
+        selector_loss_coef: float = 1.0,
         dagger_reduction: DAggerReduction = "sum_per_sample",
         curriculum_iterations: int = 10_000,
         minimum_dagger_weight: float = 0.1,
         adaptive_lr_minimum_ppo_weight: float = 0.1,
         balance_skill_losses: bool = True,
+        maximum_action_magnitude: float = 1_000.0,
         normalize_advantage_per_mini_batch: bool = False,
         skill_names: Sequence[str] = ("locomotion", "climb", "down_roll"),
         device: str | torch.device = "cpu",
@@ -188,12 +240,16 @@ class DAggerPPO:
             raise ValueError("desired_kl must be positive when provided.")
         if dagger_base_coef < 0.0:
             raise ValueError("dagger_base_coef must be non-negative.")
+        if not math.isfinite(selector_loss_coef) or selector_loss_coef < 0.0:
+            raise ValueError("selector_loss_coef must be finite and non-negative.")
         if dagger_reduction not in ("mean_per_dof", "sum_per_sample"):
             raise ValueError("dagger_reduction must be 'mean_per_dof' or 'sum_per_sample'.")
         if not skill_names or len(set(skill_names)) != len(skill_names):
             raise ValueError("skill_names must be non-empty and unique.")
         if not isinstance(balance_skill_losses, bool):
             raise TypeError("balance_skill_losses must be a boolean.")
+        if not math.isfinite(maximum_action_magnitude) or maximum_action_magnitude <= 0.0:
+            raise ValueError("maximum_action_magnitude must be finite and positive.")
 
         self.device = torch.device(device)
         self.policy = policy.to(self.device)
@@ -214,8 +270,10 @@ class DAggerPPO:
         self.schedule = schedule
         self.desired_kl = desired_kl
         self.dagger_base_coef = float(dagger_base_coef)
+        self.selector_loss_coef = float(selector_loss_coef)
         self.dagger_reduction = dagger_reduction
         self.balance_skill_losses = balance_skill_losses
+        self.maximum_action_magnitude = float(maximum_action_magnitude)
         self.normalize_advantage_per_mini_batch = bool(normalize_advantage_per_mini_batch)
         self.skill_names = tuple(str(name) for name in skill_names)
         self.loss_schedule = PhpLossSchedule(
@@ -254,6 +312,9 @@ class DAggerPPO:
         teacher_actions: torch.Tensor,
         dagger_mask: torch.Tensor,
         skill_ids: torch.Tensor,
+        actor_skill_ids: torch.Tensor,
+        teacher_forcing_mask: torch.Tensor,
+        actor_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Sample and record a student action for one vectorized step."""
 
@@ -275,7 +336,29 @@ class DAggerPPO:
                 f"got {tuple(teacher_actions.shape)}."
             )
 
-        actions = self.policy.act(actor_obs)
+        oracle_routes = _skill_id_column(
+            skill_ids, "skill_ids", batch_size, len(self.skill_names)
+        )
+        actor_routes = _skill_id_column(
+            actor_skill_ids,
+            "actor_skill_ids",
+            batch_size,
+            len(self.skill_names),
+        )
+        forcing = _as_column(
+            teacher_forcing_mask, "teacher_forcing_mask", batch_size
+        ).to(dtype=torch.bool)
+        if actor_outputs is None:
+            actions = self.policy.act(actor_obs, skill_ids=actor_routes)
+        else:
+            if not isinstance(actor_outputs, tuple) or len(actor_outputs) != 2:
+                raise TypeError("actor_outputs must be an (all_action_means, selector_logits) tuple")
+            self.policy.update_distribution_from_outputs(
+                actor_outputs[0], actor_outputs[1], skill_ids=actor_routes
+            )
+            actions = self.policy.distribution.sample()
+            if not torch.isfinite(actions).all():
+                raise FloatingPointError("Sampled actions contain NaN or infinity.")
         if actions.shape != teacher_actions.shape:
             raise ValueError(
                 f"Policy produced actions {tuple(actions.shape)} but teacher labels are "
@@ -285,6 +368,16 @@ class DAggerPPO:
         expected_values = (batch_size, 1)
         if values.shape != expected_values:
             raise ValueError(f"Policy critic must return {expected_values}, got {tuple(values.shape)}.")
+        dagger_column = _as_column(dagger_mask, "dagger_mask", batch_size)
+        positive_labels = dagger_column[:, 0] > 0.0
+        if torch.any(positive_labels):
+            valid_teacher = teacher_actions[positive_labels]
+            if not torch.isfinite(valid_teacher).all():
+                raise ValueError("Positive-confidence teacher actions contain NaN or infinity.")
+            if valid_teacher.abs().max() > self.maximum_action_magnitude:
+                raise FloatingPointError("Teacher action magnitude exceeds the configured safety bound.")
+        if actions.abs().max() > self.maximum_action_magnitude:
+            raise FloatingPointError("Student action magnitude exceeds the configured safety bound.")
 
         self.transition.actions = actions.detach()
         self.transition.values = values.detach()
@@ -294,8 +387,10 @@ class DAggerPPO:
         self.transition.observations = actor_obs.detach()
         self.transition.privileged_observations = critic_obs.detach()
         self.transition.teacher_actions = teacher_actions.detach()
-        self.transition.dagger_mask = _as_column(dagger_mask, "dagger_mask", batch_size).detach()
-        self.transition.skill_ids = _as_column(skill_ids, "skill_ids", batch_size).detach()
+        self.transition.dagger_mask = dagger_column.detach()
+        self.transition.skill_ids = oracle_routes.detach()
+        self.transition.actor_skill_ids = actor_routes.detach()
+        self.transition.teacher_forcing_mask = forcing.detach()
         return self.transition.actions
 
     def process_env_step(
@@ -350,7 +445,7 @@ class DAggerPPO:
                 dim=-1,
             )
             kl_mean = (
-                skill_balanced_mean(kl, batch.skill_ids, len(self.skill_names))
+                skill_balanced_mean(kl, batch.actor_skill_ids, len(self.skill_names))
                 if self.balance_skill_losses
                 else kl.mean()
             )
@@ -385,12 +480,22 @@ class DAggerPPO:
             "dagger": 0.0,
             "dagger_mse_mean_per_dof": 0.0,
             "dagger_mse_sum_per_sample": 0.0,
+            "selector": 0.0,
+            "selector_accuracy": 0.0,
+            "route_agreement": 0.0,
+            "teacher_forcing_fraction": 0.0,
             "total": 0.0,
             "kl": 0.0,
         }
         skill_error_sums = [0.0] * len(self.skill_names)
         skill_valid_counts = [0.0] * len(self.skill_names)
         skill_weight_sums = [0.0] * len(self.skill_names)
+        selector_correct_counts = [0.0] * len(self.skill_names)
+        selector_sample_counts = [0.0] * len(self.skill_names)
+        action_maxima = {
+            "student_action_max_abs": 0.0,
+            "teacher_action_max_abs": 0.0,
+        }
         update_count = 0
         kl_update_count = 0
 
@@ -400,17 +505,20 @@ class DAggerPPO:
             if self.normalize_advantage_per_mini_batch:
                 advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1.0e-8)
 
-            # Updating the distribution also exposes its differentiable mean,
-            # standard deviation, entropy, and sampled-action log probability.
-            self.policy.act(batch.observations)
+            # Rebuild exactly the hard-routed distribution that generated the
+            # rollout.  Oracle routes are used only by selector/DAgger losses.
+            self.policy.update_distribution(
+                batch.observations, skill_ids=batch.actor_skill_ids
+            )
             actions_log_prob = self.policy.get_actions_log_prob(batch.actions).reshape(-1, 1)
             values = self.policy.evaluate(batch.privileged_observations)
-            route = batch.skill_ids.squeeze(-1)
+            oracle_route = batch.skill_ids.squeeze(-1)
+            actor_route = batch.actor_skill_ids.squeeze(-1)
             if self.balance_skill_losses:
                 def reduce_samples(sample_values: torch.Tensor) -> torch.Tensor:
                     return skill_balanced_mean(
                         sample_values,
-                        route,
+                        actor_route,
                         len(self.skill_names),
                     )
             else:
@@ -441,9 +549,28 @@ class DAggerPPO:
                 value_loss = reduce_samples((batch.returns - values).square())
 
             ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+            oracle_action_mean = self.policy.action_mean_for_skill(batch.skill_ids)
+            if oracle_action_mean.abs().max() > self.maximum_action_magnitude:
+                raise FloatingPointError(
+                    "Student oracle-head action magnitude exceeds the configured safety bound."
+                )
+            selector_per_sample = nn.functional.cross_entropy(
+                self.policy.selector_logits,
+                oracle_route,
+                reduction="none",
+            )
+            selector_loss = (
+                skill_balanced_mean(
+                    selector_per_sample,
+                    oracle_route,
+                    len(self.skill_names),
+                )
+                if self.balance_skill_losses
+                else selector_per_sample.mean()
+            )
             if self.balance_skill_losses:
                 dagger_mean, dagger_sum, _ = skill_balanced_dagger_losses(
-                    self.policy.action_mean,
+                    oracle_action_mean,
                     batch.teacher_actions,
                     batch.dagger_mask,
                     batch.skill_ids,
@@ -451,12 +578,16 @@ class DAggerPPO:
                 )
             else:
                 dagger_mean, dagger_sum, _ = masked_dagger_losses(
-                    self.policy.action_mean,
+                    oracle_action_mean,
                     batch.teacher_actions,
                     batch.dagger_mask,
                 )
             dagger_loss = dagger_mean if self.dagger_reduction == "mean_per_dof" else dagger_sum
-            total_loss = weights.ppo * ppo_loss + self.dagger_base_coef * weights.dagger * dagger_loss
+            total_loss = (
+                weights.ppo * ppo_loss
+                + self.dagger_base_coef * weights.dagger * dagger_loss
+                + self.selector_loss_coef * selector_loss
+            )
             if not torch.isfinite(total_loss):
                 raise FloatingPointError("DAgger-PPO loss produced NaN or infinity.")
 
@@ -472,19 +603,53 @@ class DAggerPPO:
             metric_sums["dagger"] += float(dagger_loss.detach().item())
             metric_sums["dagger_mse_mean_per_dof"] += float(dagger_mean.detach().item())
             metric_sums["dagger_mse_sum_per_sample"] += float(dagger_sum.detach().item())
+            metric_sums["selector"] += float(selector_loss.detach().item())
+            predictions = torch.argmax(self.policy.selector_logits.detach(), dim=-1)
+            metric_sums["selector_accuracy"] += float(
+                (predictions == oracle_route).float().mean().item()
+            )
+            metric_sums["route_agreement"] += float(
+                (actor_route == oracle_route).float().mean().item()
+            )
+            metric_sums["teacher_forcing_fraction"] += float(
+                batch.teacher_forcing_mask.float().mean().item()
+            )
+            action_maxima["student_action_max_abs"] = max(
+                action_maxima["student_action_max_abs"],
+                float(self.policy.action_mean.detach().abs().max().item()),
+            )
+            valid_teacher_mask = batch.dagger_mask[:, 0] > 0.0
+            teacher_max = (
+                float(batch.teacher_actions[valid_teacher_mask].abs().max().item())
+                if torch.any(valid_teacher_mask)
+                else 0.0
+            )
+            action_maxima["teacher_action_max_abs"] = max(
+                action_maxima["teacher_action_max_abs"], teacher_max
+            )
             metric_sums["total"] += float(total_loss.detach().item())
 
-            squared_per_sample = (self.policy.action_mean.detach() - batch.teacher_actions).square().mean(dim=-1)
             sample_weights = batch.dagger_mask.squeeze(-1)
             valid = sample_weights > 0.0
             for skill_id in range(len(self.skill_names)):
-                selected = valid & (route == skill_id)
+                selector_selected = oracle_route == skill_id
+                selector_count = int(selector_selected.sum().item())
+                if selector_count:
+                    selector_correct_counts[skill_id] += float(
+                        (predictions[selector_selected] == skill_id).sum().item()
+                    )
+                    selector_sample_counts[skill_id] += selector_count
+                selected = valid & (oracle_route == skill_id)
                 count = int(selected.sum().item())
                 if count:
                     weights_for_skill = sample_weights[selected]
                     weight_sum = float(weights_for_skill.sum().item())
+                    squared_per_sample = (
+                        oracle_action_mean.detach()[selected]
+                        - batch.teacher_actions[selected]
+                    ).square().mean(dim=-1)
                     skill_error_sums[skill_id] += float(
-                        (squared_per_sample[selected] * weights_for_skill).sum().item()
+                        (squared_per_sample * weights_for_skill).sum().item()
                     )
                     skill_valid_counts[skill_id] += count
                     skill_weight_sums[skill_id] += weight_sum
@@ -498,6 +663,7 @@ class DAggerPPO:
 
         storage.clear()
         metrics = {name: total / update_count for name, total in metric_sums.items()}
+        metrics.update(action_maxima)
         if kl_update_count == 0:
             metrics["kl"] = 0.0
         else:
@@ -515,6 +681,12 @@ class DAggerPPO:
             metrics[f"dagger_mse/{skill_name}"] = (
                 skill_error_sums[skill_id] / effective_weight
                 if effective_weight > 0.0
+                else 0.0
+            )
+            selector_count = selector_sample_counts[skill_id]
+            metrics[f"selector_accuracy/{skill_name}"] = (
+                selector_correct_counts[skill_id] / selector_count
+                if selector_count > 0.0
                 else 0.0
             )
         if not all(math.isfinite(value) for value in metrics.values()):

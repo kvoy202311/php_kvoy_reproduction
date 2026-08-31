@@ -11,6 +11,7 @@ class ELF3VisionStudentCfg(RslRlPpoActorCriticCfg):
     # A log parameter preserves positivity throughout optimization while the
     # resulting initial standard deviation remains exactly 0.01.
     noise_std_type = "log"
+    num_skills = 3
     actor_hidden_dims = [2048, 1024, 512, 256, 128]
     critic_hidden_dims = [512, 256, 128]
     activation = "elu"
@@ -34,6 +35,7 @@ class ELF3DAggerPPOCfg(RslRlPpoAlgorithmCfg):
     normalize_advantage_per_mini_batch = False
 
     dagger_base_coef = 10.0
+    selector_loss_coef = 1.0
     # PHP uses the per-sample sum across the fixed 29-DoF action vector.
     # Keeping coefficient 10 with a per-DoF mean would weaken imitation by 29x.
     dagger_reduction = "sum_per_sample"
@@ -41,6 +43,7 @@ class ELF3DAggerPPOCfg(RslRlPpoAlgorithmCfg):
     minimum_dagger_weight = 0.1
     adaptive_lr_minimum_ppo_weight = 0.1
     balance_skill_losses = True
+    maximum_action_magnitude = 1000.0
     skill_names = ("locomotion", "climb", "down_roll")
 
     # Unsupported upstream extensions must stay absent from this independent
@@ -88,6 +91,22 @@ class ELF3MultiSkillDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
         "teacher_down_roll": "motion_teacher",
     }
     environment_iteration_command = "multi_skill"
+    option_control = {
+        # The selector must remain confident for several frames before a
+        # discrete option changes.  Motion options cannot switch directly to
+        # one another and remain committed for at least two seconds.
+        "activation_probability": 0.60,
+        "release_probability": 0.55,
+        "activation_confirmation_steps": 3,
+        "release_confirmation_steps": 5,
+        "post_release_cooldown_steps": 25,
+        "minimum_skill_duration_steps": {"climb": 100, "down_roll": 100},
+        "maximum_skill_duration_steps": {"climb": 400, "down_roll": 400},
+        # Stage configuration overwrites these three schedule values.
+        "teacher_forcing_start": 1.0,
+        "teacher_forcing_end": 0.0,
+        "teacher_forcing_iterations": 20_000,
+    }
 
 
 __all__ = [

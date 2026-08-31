@@ -135,9 +135,23 @@ def test_missing_observations_wrong_dimensions_and_nan_are_rejected() -> None:
         router.act(wrong, routes)
 
     invalid = observations(3)
-    invalid["down_roll"][0, 0] = float("nan")
+    invalid["down_roll"][2, 0] = float("nan")
     with pytest.raises(ValueError, match="non-finite"):
         router.act(invalid, routes)
+
+
+def test_zero_confidence_rows_never_enter_the_teacher() -> None:
+    router, teachers = make_router()
+    obs = observations(3)
+    obs["down_roll"][2, 0] = float("nan")
+    result = router.act(
+        obs,
+        torch.tensor([0, 1, 2]),
+        validity_mask=torch.tensor([1.0, 1.0, 0.0]),
+    )
+    assert result.actions[2].eq(0.0).all()
+    assert result.valid_mask[2].item() == 0.0
+    assert teachers["down_roll"].received == []
 
 
 def test_invalid_validity_contract_is_rejected() -> None:

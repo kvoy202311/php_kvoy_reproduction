@@ -30,7 +30,12 @@ class HybridTransition:
     action_sigma: torch.Tensor | None = None
     teacher_actions: torch.Tensor | None = None
     dagger_mask: torch.Tensor | None = None
+    # Oracle route labels supervise the selector and the corresponding action
+    # head.  actor_skill_ids record the sticky route that actually generated
+    # the rollout action and are therefore the only valid PPO route.
     skill_ids: torch.Tensor | None = None
+    actor_skill_ids: torch.Tensor | None = None
+    teacher_forcing_mask: torch.Tensor | None = None
 
     def clear(self) -> None:
         """Release references to environment tensors after insertion."""
@@ -55,6 +60,8 @@ class HybridBatch:
     teacher_actions: torch.Tensor
     dagger_mask: torch.Tensor
     skill_ids: torch.Tensor
+    actor_skill_ids: torch.Tensor
+    teacher_forcing_mask: torch.Tensor
 
 
 def _shape_tuple(shape: Sequence[int], name: str) -> tuple[int, ...]:
@@ -118,6 +125,10 @@ class HybridRolloutStorage:
         # label; intermediate values retain a verified but weaker prior.
         self.dagger_mask = torch.zeros(*leading, 1, device=self.device)
         self.skill_ids = torch.zeros(*leading, 1, dtype=torch.long, device=self.device)
+        self.actor_skill_ids = torch.zeros(*leading, 1, dtype=torch.long, device=self.device)
+        self.teacher_forcing_mask = torch.zeros(
+            *leading, 1, dtype=torch.bool, device=self.device
+        )
 
     @property
     def is_full(self) -> bool:
@@ -174,10 +185,24 @@ class HybridRolloutStorage:
         dones = self._require("dones", transition.dones).reshape(-1, 1)
         dagger_mask = self._require("dagger_mask", transition.dagger_mask).reshape(-1, 1)
         skill_ids = self._require("skill_ids", transition.skill_ids).reshape(-1, 1)
+        actor_skill_ids = self._require(
+            "actor_skill_ids", transition.actor_skill_ids
+        ).reshape(-1, 1)
+        teacher_forcing_mask = self._require(
+            "teacher_forcing_mask", transition.teacher_forcing_mask
+        ).reshape(-1, 1)
         self._copy_exact(self.rewards[index], rewards, "rewards")
         self._copy_exact(self.dones[index], dones, "dones")
         self._copy_exact(self.dagger_mask[index], dagger_mask, "dagger_mask")
         self._copy_exact(self.skill_ids[index], skill_ids, "skill_ids")
+        self._copy_exact(
+            self.actor_skill_ids[index], actor_skill_ids, "actor_skill_ids"
+        )
+        self._copy_exact(
+            self.teacher_forcing_mask[index],
+            teacher_forcing_mask,
+            "teacher_forcing_mask",
+        )
 
         if torch.any((self.dagger_mask[index] < 0.0) | (self.dagger_mask[index] > 1.0)):
             raise ValueError("dagger_mask confidence weights must lie in [0, 1].")
@@ -188,6 +213,18 @@ class HybridRolloutStorage:
             ]
             raise ValueError(
                 f"skill_ids must lie in [0, {self.num_skills}), got "
+                f"{invalid.unique().tolist()}."
+            )
+        if (
+            (self.actor_skill_ids[index] < 0)
+            | (self.actor_skill_ids[index] >= self.num_skills)
+        ).any():
+            invalid = self.actor_skill_ids[index][
+                (self.actor_skill_ids[index] < 0)
+                | (self.actor_skill_ids[index] >= self.num_skills)
+            ]
+            raise ValueError(
+                f"actor_skill_ids must lie in [0, {self.num_skills}), got "
                 f"{invalid.unique().tolist()}."
             )
         if (self.sigma[index] <= 0.0).any():
@@ -265,6 +302,8 @@ class HybridRolloutStorage:
             "teacher_actions": self.teacher_actions.flatten(0, 1),
             "dagger_mask": self.dagger_mask.flatten(0, 1),
             "skill_ids": self.skill_ids.flatten(0, 1),
+            "actor_skill_ids": self.actor_skill_ids.flatten(0, 1),
+            "teacher_forcing_mask": self.teacher_forcing_mask.flatten(0, 1),
         }
 
         for _ in range(num_epochs):

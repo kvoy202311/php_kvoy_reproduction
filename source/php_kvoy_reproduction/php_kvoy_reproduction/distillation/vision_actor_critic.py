@@ -1,9 +1,9 @@
-"""Feed-forward visuomotor actor-critic for PHP-style distillation.
+"""Feed-forward hierarchical visuomotor actor-critic.
 
-The public surface intentionally matches the feed-forward ``ActorCritic`` in
-RSL-RL 2.3.x.  Unlike the upstream flat MLP, the actor decodes the explicit
-student-observation layout and embeds depth before applying its policy MLP.
-The critic remains a flat MLP over privileged observations.
+The visual actor owns a learned skill selector and one hard-routed action head
+per frozen teacher.  Different expert actions are therefore never averaged by
+one multi-modal regression output.  The critic remains a flat MLP over
+privileged observations.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from .observation import VisionObservationLayout
 _DEPTH_FEATURE_DIM = 32
 _MINIMUM_DEPTH_SIDE = 15
 _SUPPORTED_ACTION_DIM = 29
+_DEFAULT_NUM_SKILLS = 3
 
 
 def _positive_dimension(value: int, name: str) -> int:
@@ -75,6 +76,20 @@ def _make_mlp(
         layers.append(activation_factory())
         previous_dim = hidden_dim
     layers.append(nn.Linear(previous_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
+def _make_feature_trunk(
+    input_dim: int,
+    hidden_dims: Sequence[int],
+    activation_factory: Callable[[], nn.Module],
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    previous_dim = input_dim
+    for hidden_dim in hidden_dims:
+        layers.append(nn.Linear(previous_dim, hidden_dim))
+        layers.append(activation_factory())
+        previous_dim = hidden_dim
     return nn.Sequential(*layers)
 
 
@@ -167,35 +182,82 @@ class DepthEncoder(nn.Module):
 
 
 class VisionActor(nn.Module):
-    """Actor that owns the complete flat-observation-to-action mapping."""
+    """Shared visual trunk with a selector and disjoint skill action heads."""
 
     def __init__(
         self,
         layout: VisionObservationLayout,
         num_actions: int,
+        num_skills: int,
         hidden_dims: Sequence[int],
         activation_factory: Callable[[], nn.Module],
     ) -> None:
         super().__init__()
         self.layout = layout
         self.num_actions = num_actions
+        self.num_skills = num_skills
         self.depth_encoder = DepthEncoder(layout.depth_height, layout.depth_width)
         actor_input_dim = layout.proprio_dim + layout.command_dim + self.depth_encoder.output_dim
-        self.mlp = _make_mlp(actor_input_dim, hidden_dims, num_actions, activation_factory)
+        self.trunk = _make_feature_trunk(actor_input_dim, hidden_dims, activation_factory)
+        feature_dim = hidden_dims[-1]
+        self.action_heads = nn.ModuleList(
+            nn.Linear(feature_dim, num_actions) for _ in range(num_skills)
+        )
+        self.selector = nn.Linear(feature_dim, num_skills)
 
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def select_action_means(
+        all_action_means: torch.Tensor,
+        skill_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if all_action_means.ndim != 3:
+            raise ValueError("all_action_means must have shape [batch, skills, actions]")
+        batch_size, num_skills, _ = all_action_means.shape
+        if not isinstance(skill_ids, torch.Tensor):
+            raise TypeError("skill_ids must be a torch.Tensor")
+        route = skill_ids.reshape(-1).to(device=all_action_means.device)
+        if route.shape != (batch_size,):
+            raise ValueError("skill_ids must contain one route per observation")
+        if route.dtype == torch.bool or route.is_floating_point() or route.is_complex():
+            raise TypeError("skill_ids must use an integer dtype")
+        route = route.to(dtype=torch.long)
+        if torch.any((route < 0) | (route >= num_skills)):
+            raise ValueError(f"skill_ids must lie in [0, {num_skills})")
+        batch_indices = torch.arange(batch_size, device=all_action_means.device)
+        selected = all_action_means[batch_indices, route]
+        _require_finite(selected, "Selected action mean")
+        return selected
+
+    def outputs(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return every action head and selector logits from one visual pass."""
+
         _validate_matrix(
             observations,
             name="Actor observations",
             feature_dim=self.layout.actor_obs_dim,
             reference_module=self,
         )
-        # ``split`` is the single source of truth for offsets and depth shape.
         proprio, command, depth = self.layout.split(observations)
         depth_features = self.depth_encoder(depth)
-        action_mean = self.mlp(torch.cat((proprio, command, depth_features), dim=-1))
-        _require_finite(action_mean, "Actor action mean")
-        return action_mean
+        features = self.trunk(torch.cat((proprio, command, depth_features), dim=-1))
+        _require_finite(features, "Actor features")
+        all_action_means = torch.stack(
+            tuple(head(features) for head in self.action_heads), dim=1
+        )
+        selector_logits = self.selector(features)
+        _require_finite(all_action_means, "Actor action heads")
+        _require_finite(selector_logits, "Skill selector logits")
+        return all_action_means, selector_logits
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        skill_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        all_action_means, selector_logits = self.outputs(observations)
+        if skill_ids is None:
+            skill_ids = torch.argmax(selector_logits, dim=-1)
+        return self.select_action_means(all_action_means, skill_ids)
 
 
 class VisionActorCritic(nn.Module):
@@ -209,6 +271,7 @@ class VisionActorCritic(nn.Module):
         num_critic_obs: int,
         num_actions: int,
         layout: VisionObservationLayout | None = None,
+        num_skills: int = _DEFAULT_NUM_SKILLS,
         actor_hidden_dims: Sequence[int] = (2048, 1024, 512, 256, 128),
         critic_hidden_dims: Sequence[int] = (512, 256, 128),
         activation: str = "elu",
@@ -226,6 +289,7 @@ class VisionActorCritic(nn.Module):
         num_actor_obs = _positive_dimension(num_actor_obs, "num_actor_obs")
         num_critic_obs = _positive_dimension(num_critic_obs, "num_critic_obs")
         num_actions = _positive_dimension(num_actions, "num_actions")
+        num_skills = _positive_dimension(num_skills, "num_skills")
         if num_actions != _SUPPORTED_ACTION_DIM:
             raise ValueError(
                 f"ELF3 policies require {_SUPPORTED_ACTION_DIM} actions, got {num_actions}."
@@ -260,9 +324,16 @@ class VisionActorCritic(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
+        self.num_skills = num_skills
         self.layout = layout
         self.noise_std_type = noise_std_type
-        self.actor = VisionActor(layout, num_actions, actor_hidden_dims, activation_factory)
+        self.actor = VisionActor(
+            layout,
+            num_actions,
+            num_skills,
+            actor_hidden_dims,
+            activation_factory,
+        )
         self.critic = _make_mlp(
             num_critic_obs,
             critic_hidden_dims,
@@ -277,6 +348,8 @@ class VisionActorCritic(nn.Module):
             self.log_std = nn.Parameter(initial_std.log())
 
         self.distribution: Normal | None = None
+        self._all_action_means: torch.Tensor | None = None
+        self._selector_logits: torch.Tensor | None = None
 
     @staticmethod
     def init_weights(sequential: nn.Sequential, scales: Sequence[float]) -> None:
@@ -300,6 +373,8 @@ class VisionActorCritic(nn.Module):
         # retain tensors on the old device/dtype after ``to``/``double``.
         result = super()._apply(fn)
         self.distribution = None
+        self._all_action_means = None
+        self._selector_logits = None
         return result
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
@@ -328,8 +403,70 @@ class VisionActorCritic(nn.Module):
         _require_finite(entropy, "Action entropy")
         return entropy
 
-    def update_distribution(self, observations: torch.Tensor) -> None:
-        mean = self.actor(observations)
+    @property
+    def selector_logits(self) -> torch.Tensor:
+        if self._selector_logits is None:
+            raise RuntimeError("Skill selector logits are unavailable; call act() first.")
+        _require_finite(self._selector_logits, "Skill selector logits")
+        return self._selector_logits
+
+    @property
+    def all_action_means(self) -> torch.Tensor:
+        if self._all_action_means is None:
+            raise RuntimeError("Action heads are unavailable; call act() first.")
+        _require_finite(self._all_action_means, "Actor action heads")
+        return self._all_action_means
+
+    def actor_outputs(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute all hard-route candidates and selector logits once."""
+
+        return self.actor.outputs(observations)
+
+    def action_mean_for_skill(self, skill_ids: torch.Tensor) -> torch.Tensor:
+        """Select oracle action heads from the most recently computed batch."""
+
+        return self.actor.select_action_means(self.all_action_means, skill_ids)
+
+    def update_distribution(
+        self,
+        observations: torch.Tensor,
+        skill_ids: torch.Tensor | None = None,
+    ) -> None:
+        all_action_means, selector_logits = self.actor.outputs(observations)
+        self.update_distribution_from_outputs(
+            all_action_means,
+            selector_logits,
+            skill_ids=skill_ids,
+        )
+
+    def update_distribution_from_outputs(
+        self,
+        all_action_means: torch.Tensor,
+        selector_logits: torch.Tensor,
+        *,
+        skill_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Build a distribution from one already-computed visual forward pass."""
+
+        expected_actions = (
+            all_action_means.shape[0] if all_action_means.ndim == 3 else -1,
+            self.num_skills,
+            self.num_actions,
+        )
+        if all_action_means.ndim != 3 or tuple(all_action_means.shape) != expected_actions:
+            raise ValueError(
+                "all_action_means must have shape "
+                f"[batch, {self.num_skills}, {self.num_actions}]"
+            )
+        if selector_logits.shape != (all_action_means.shape[0], self.num_skills):
+            raise ValueError(
+                f"selector_logits must have shape [batch, {self.num_skills}]"
+            )
+        _require_finite(all_action_means, "Actor action heads")
+        _require_finite(selector_logits, "Skill selector logits")
+        if skill_ids is None:
+            skill_ids = torch.argmax(selector_logits, dim=-1)
+        mean = self.actor.select_action_means(all_action_means, skill_ids)
         if self.noise_std_type == "scalar":
             std_parameter = self.std
         else:
@@ -339,9 +476,14 @@ class VisionActorCritic(nn.Module):
             raise FloatingPointError("Action standard deviation must remain strictly positive.")
         std = std_parameter.expand_as(mean)
         self.distribution = Normal(mean, std, validate_args=False)
+        self._all_action_means = all_action_means
+        self._selector_logits = selector_logits
 
     def act(self, observations: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        self.update_distribution(observations)
+        skill_ids = kwargs.pop("skill_ids", None)
+        if kwargs:
+            raise TypeError(f"Unsupported act() keys: {sorted(kwargs)}")
+        self.update_distribution(observations, skill_ids=skill_ids)
         actions = self._require_distribution().sample()
         _require_finite(actions, "Sampled actions")
         return actions
@@ -363,8 +505,12 @@ class VisionActorCritic(nn.Module):
         _require_finite(log_probability, "Action log probability")
         return log_probability
 
-    def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.actor(observations)
+    def act_inference(
+        self,
+        observations: torch.Tensor,
+        skill_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.actor(observations, skill_ids=skill_ids)
 
     def evaluate(self, critic_observations: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         _validate_matrix(
@@ -392,6 +538,8 @@ class VisionActorCritic(nn.Module):
                     raise ValueError(f"State tensor {name!r} contains NaN or infinity.")
         super().load_state_dict(state_dict, strict=strict)
         self.distribution = None
+        self._all_action_means = None
+        self._selector_logits = None
         return True
 
 

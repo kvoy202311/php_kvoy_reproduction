@@ -143,6 +143,13 @@ python scripts/rsl_rl/train.py \
 
 蒸馏任务将冻结的 locomotion、climb 和 down-roll 三个专家统一蒸馏到一个视觉 Student。Student Actor
 观测包含 8 帧本体历史、二维速度命令和 `87 x 58` 头部深度图，不直接观察专家编号或特权平台参数。
+网络使用共享视觉编码器、三分类技能选择器和三个互相独立的动作头；选择器只做硬路由，不对不同专家动作
+加权平均。部署接口不接收 `skill_id`，而是由 Student 从视觉、本体历史和速度请求自主选择。climb/down-roll
+一旦启动会经过迟滞确认并锁定执行，不能直接互相跳转，完成后再恢复 locomotion。
+当前 50 Hz 控制配置要求 motion 概率至少为 `0.60` 并连续确认 3 帧后才启动；启动后至少锁定 100 帧
+（2.0 s），超过最短时长后需 locomotion 概率至少为 `0.55` 并连续确认 5 帧才释放。单次 motion 的安全
+上限为 400 帧（8.0 s），释放后有 25 帧（0.5 s）重触发冷却。训练 checkpoint 会校验这些部署状态机
+参数，不能在训练、播放或后续部署时静默改成另一套数值。
 当前头部 D435i 按水平向下 42 度固定，深度采集频率为 30 Hz；训练假设部署时将完整的
 `848 x 480` 深度图直接缩放到 `87 x 58`，再按照训练代码裁剪、归一化。
 
@@ -231,13 +238,19 @@ python scripts/rsl_rl/train_distillation.py \
 必须按 `atomic -> transition -> full` 顺序训练。`atomic` 先在标准 0.66 m 平台、无深度噪声/延迟和无相机
 外参扰动的条件下学习三个完整独立技能；`transition` 保持标准平台，恢复部署侧深度噪声、延迟和相机外参
 扰动，并使用连续物理状态学习 locomotion、climb 和 down-roll 之间的切换；`full` 再加入完整平台几何
-随机化、独立/组合 episode 混合和锁定期遥控请求扰动。两个专家边界不做人工关节插值：approach 仍是正常
+随机化、完整组合 episode 和锁定期遥控请求扰动。atomic 的随机相位只用于学习独立动作头；transition/full
+的自主路由 episode 都从部署可复现的 locomotion 状态开始，不向 Student 泄露重置技能。两个专家边界不做人工关节插值：approach 仍是正常
 响应 `(vx, vy)` 的 locomotion；入口/边缘
 settle、完整 climb/down-roll 和动作结束后的短暂安全释放属于 motion control lock。锁定期间内部 locomotion
 Teacher 可以使用零速度完成稳定，climb/down-roll Teacher 不接收速度命令；Student 仍始终观察遥控器最新
 请求，并通过深度图与本体历史隐式学会暂时忽略它。安全释放完成后，locomotion 立即恢复最新请求，而不是固定
 恢复平台前向速度。只有关节姿态、实际关节速度、躯干直立度、平台相对位置、朝向和待启动专家的运动学作用域
-全部满足时才切换 Teacher。
+全部满足时才切换 Teacher。settle 不再使用随机等待时长；切换只由上述可观测门控决定。
+
+路由训练采用按 episode 采样的 teacher forcing，而不是逐帧随机切换：atomic 始终使用 oracle 路由来先学稳
+三个动作头；transition 在前 20000 轮从 `100%` 线性降到 `25%`；full 从 `25%` 线性降到 `0%`。无论实际
+执行路由是否由 oracle 提供，选择器始终使用 oracle 分类标签训练；PPO 只重算 rollout 当时真正执行的动作头，
+DAgger 只监督 oracle 对应动作头。
 
 外部二维速度请求及 `--vx/--vy` 使用世界坐标，Student Actor 接收该请求在机器人机体坐标系中的二维投影；
 请求必须满足 `sqrt(vx^2 + vy^2) <= 1.0 m/s`。down-roll 只会在请求方向与机器人朝向都对齐平台前向时
@@ -327,7 +340,8 @@ python scripts/rsl_rl/train_distillation.py \
 初始化 transition、transition checkpoint 初始化 full。`--resume` 仅用于同一阶段、同一环境语义的中断续训。
 checkpoint 会保存训练阶段、头部相机、FOV、深度裁剪、Actor 观测语义与动作契约指纹，训练和播放遇到不一致
 时会拒绝加载。当前命令语义是“实时遥控请求始终可见、motion lock 内忽略控制作用、释放后恢复最新请求”；
-采用旧命令语义或旧 checkpoint 格式的 run 不可作为本流程起点，必须从 `atomic` 重新训练。
+采用旧命令语义或旧 checkpoint 格式的 run 不可作为本流程起点，必须从 `atomic` 重新训练。尤其是
+`php_multi_teacher_student_v3` 单动作头 checkpoint 与当前分层硬路由网络结构不兼容。
 
 日志写入：
 
@@ -342,11 +356,23 @@ logs/rsl_rl/elf3_multi_skill_distillation/<时间>_elf3_visual_student_<阶段>/
 tensorboard --logdir logs/rsl_rl/elf3_multi_skill_distillation
 ```
 
+终端会直接显示 `selector` 损失、`acc`（选择器相对 oracle 的准确率）、`route`（实际执行路由与 oracle 的
+一致率）和 `forced`（当前 batch 的路由 teacher-forcing 比例）。TensorBoard 还记录
+`Loss/selector_accuracy/<skill>`、`Loss/dagger_mse/<skill>`、Student/Teacher 动作最大绝对值等细分指标。
+
+不要只根据总 reward 或训练轮数切换阶段。atomic 结束前应分别播放 locomotion、climb、down-roll，确认三个
+动作头都能完整执行；transition 结束前应使用 composed 播放确认可以自主完成
+`locomotion -> climb -> 台上 locomotion`，并在短平台接近远端时进入 down-roll；full 阶段则需在训练的完整
+平台尺寸、深度噪声和相机外参随机化范围内重复验证。随着 teacher forcing 降低，应同时确认 `acc` 保持较高、
+`route` 没有持续下降、三个 `Loss/dagger_mse/<skill>` 均稳定，并且实际播放没有提前触发、反复切换或 motion
+中途退出。指标与画面必须共同通过，不能用单一 loss 代替真实成功率。
+
 ### 播放视觉 Student
 
 固定技能模式用于分别检查三个技能。下面以 climb、动作 0 为例；可将 `--skill` 改成 `locomotion` 或
-`down_roll`。固定 climb/down-roll 中的 `--vx/--vy` 只是仍然提供给 Student 的遥控输入，不会中断或改变已选
-motion；固定 locomotion 才直接响应它。`--checkpoint_path` 必须指向视觉 Student checkpoint，而不是三个
+`down_roll`。固定 climb/down-roll 中的 `--vx/--vy` 只是仍然提供给 Student 的遥控输入；Student 仍需自主
+识别当前技能，技能一旦经连续帧确认启动就不会被中途命令打断。固定 locomotion 才直接响应速度请求。
+`--checkpoint_path` 必须指向视觉 Student checkpoint，而不是三个
 专家的 checkpoint。
 
 ```bash

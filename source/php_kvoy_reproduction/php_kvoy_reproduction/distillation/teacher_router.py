@@ -23,6 +23,8 @@ class TeacherBatch:
     def __post_init__(self) -> None:
         if self.actions.ndim != 2 or self.actions.shape[1] != NUM_CANONICAL_JOINTS:
             raise ValueError(f"actions must have shape [N, {NUM_CANONICAL_JOINTS}]")
+        if not self.actions.is_floating_point() or not torch.isfinite(self.actions).all():
+            raise ValueError("actions must be a finite floating-point tensor")
         expected_column = (self.actions.shape[0], 1)
         if self.valid_mask.shape != expected_column or not self.valid_mask.is_floating_point():
             raise ValueError("valid_mask must be a floating-point confidence tensor with shape [N, 1]")
@@ -240,40 +242,11 @@ class TeacherRouter(nn.Module):
                     f"teacher observations for {name!r} have dimension {observations.shape[1]}, "
                     f"expected {expected_dim}"
                 )
-            if not bool(torch.isfinite(observations).all()):
-                raise ValueError(f"teacher observations for {name!r} contain a non-finite value")
-
             observation_indices = route_indices.to(device=observations.device)
-            subset = observations.index_select(0, observation_indices)
-            raw_actions = teacher(subset)
-            if not isinstance(raw_actions, torch.Tensor):
-                raise TypeError(f"teacher {name!r} must return a torch.Tensor")
-            expected_shape = (route_indices.numel(), NUM_CANONICAL_JOINTS)
-            if raw_actions.shape != expected_shape:
-                raise ValueError(
-                    f"teacher {name!r} returned shape {tuple(raw_actions.shape)}, expected {expected_shape}"
-                )
-            if not raw_actions.is_floating_point() or not bool(torch.isfinite(raw_actions).all()):
-                raise ValueError(f"teacher {name!r} returned invalid actions")
-
-            if transform is None:
-                canonical_actions = raw_actions
-            else:
-                transformed = transform(raw_actions)
-                if not isinstance(transformed, ActionTransformResult):
-                    raise TypeError(f"action transform for {name!r} returned an invalid result")
-                canonical_actions = transformed.actions
-
-            if output_device is None:
-                output_device = canonical_actions.device
-                output_dtype = canonical_actions.dtype
-            elif canonical_actions.device != output_device or canonical_actions.dtype != output_dtype:
-                raise ValueError("all teacher actions must share a device and dtype")
-
             if global_validity is not None:
                 subset_validity = global_validity.index_select(
                     0, route_indices.to(device=global_validity.device)
-                ).to(device=canonical_actions.device, dtype=canonical_actions.dtype)
+                ).to(device=observations.device, dtype=observations.dtype)
             elif per_skill_validity is not None:
                 if name not in per_skill_validity:
                     raise ValueError(f"per-skill validity is missing routed skill {name!r}")
@@ -282,11 +255,70 @@ class TeacherRouter(nn.Module):
                 )
                 subset_validity = skill_validity.index_select(
                     0, route_indices.to(device=skill_validity.device)
-                ).to(device=canonical_actions.device, dtype=canonical_actions.dtype)
+                ).to(device=observations.device, dtype=observations.dtype)
             else:
                 subset_validity = torch.ones(
-                    route_indices.numel(), dtype=canonical_actions.dtype, device=canonical_actions.device
+                    route_indices.numel(), dtype=observations.dtype, device=observations.device
                 )
+            positive = subset_validity > 0.0
+            active_observation_indices = observation_indices[positive]
+            active_observations = observations.index_select(0, active_observation_indices)
+            if active_observations.numel() > 0 and not bool(
+                torch.isfinite(active_observations).all()
+            ):
+                raise ValueError(
+                    f"positive-validity teacher observations for {name!r} contain a non-finite value"
+                )
+
+            # Zero-confidence rows never enter a frozen teacher.  This is
+            # essential for randomized geometry where a teacher observation
+            # can be outside its verified numerical scope.
+            if torch.any(positive):
+                raw_actions = teacher(active_observations)
+                if not isinstance(raw_actions, torch.Tensor):
+                    raise TypeError(f"teacher {name!r} must return a torch.Tensor")
+                expected_shape = (int(positive.sum().item()), NUM_CANONICAL_JOINTS)
+                if raw_actions.shape != expected_shape:
+                    raise ValueError(
+                        f"teacher {name!r} returned shape {tuple(raw_actions.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                if not raw_actions.is_floating_point() or not bool(
+                    torch.isfinite(raw_actions).all()
+                ):
+                    raise ValueError(f"teacher {name!r} returned invalid actions")
+                if transform is None:
+                    active_actions = raw_actions
+                else:
+                    transformed = transform(raw_actions)
+                    if not isinstance(transformed, ActionTransformResult):
+                        raise TypeError(
+                            f"action transform for {name!r} returned an invalid result"
+                        )
+                    active_actions = transformed.actions
+                canonical_actions = torch.zeros(
+                    route_indices.numel(),
+                    NUM_CANONICAL_JOINTS,
+                    device=active_actions.device,
+                    dtype=active_actions.dtype,
+                )
+                canonical_actions[positive.to(device=active_actions.device)] = active_actions
+                subset_validity = subset_validity.to(
+                    device=active_actions.device, dtype=active_actions.dtype
+                )
+            else:
+                canonical_actions = torch.zeros(
+                    route_indices.numel(),
+                    NUM_CANONICAL_JOINTS,
+                    device=observations.device,
+                    dtype=observations.dtype,
+                )
+
+            if output_device is None:
+                output_device = canonical_actions.device
+                output_dtype = canonical_actions.dtype
+            elif canonical_actions.device != output_device or canonical_actions.dtype != output_dtype:
+                raise ValueError("all teacher actions must share a device and dtype")
             pieces.append((route_indices, canonical_actions, subset_validity))
 
         if output_device is None or output_dtype is None:
