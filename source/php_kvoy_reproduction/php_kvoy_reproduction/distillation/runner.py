@@ -757,10 +757,28 @@ class DistillationRunner:
             raise TypeError("Checkpoint infos must be a mapping.")
         return infos
 
-    def get_inference_policy(self, device: str | torch.device | None = None):
-        """Return deterministic autonomous inference with the training option lock."""
+    def get_inference_policy(
+        self,
+        device: str | torch.device | None = None,
+        *,
+        fixed_skill_id: int | None = None,
+    ):
+        """Return deterministic inference with the training option controller.
+
+        ``fixed_skill_id`` reproduces the route-teacher-forced execution used
+        by atomic training: the requested Student action head owns control
+        from the first post-reset step.  Leaving it unset preserves autonomous
+        deployment routing for composed transition/full evaluation.
+        """
 
         inference_device = self.device if device is None else torch.device(device)
+        if fixed_skill_id is not None:
+            if isinstance(fixed_skill_id, bool) or not isinstance(fixed_skill_id, int):
+                raise TypeError("fixed_skill_id must be an integer or None")
+            if not 0 <= fixed_skill_id < len(self.alg.skill_names):
+                raise ValueError(
+                    f"fixed_skill_id must lie in [0, {len(self.alg.skill_names)})"
+                )
         self.policy.eval().to(inference_device)
         self.actor_normalizer.eval().to(inference_device)
 
@@ -770,6 +788,17 @@ class DistillationRunner:
             device=inference_device,
             **deepcopy(self.runtime_option_control_cfg),
         )
+        fixed_oracle_skill_ids = (
+            None
+            if fixed_skill_id is None
+            else torch.full(
+                (self.env.num_envs, 1),
+                fixed_skill_id,
+                device=inference_device,
+                dtype=torch.long,
+            )
+        )
+        forcing_probability = 0.0 if fixed_oracle_skill_ids is None else 1.0
 
         class InferencePolicy:
             def __call__(inner_self, raw_observations: torch.Tensor) -> torch.Tensor:
@@ -780,14 +809,18 @@ class DistillationRunner:
                     all_action_means, selector_logits = self.policy.actor_outputs(normalized)
                     selection = controller.select(
                         selector_logits,
-                        teacher_forcing_probability=0.0,
+                        oracle_skill_ids=fixed_oracle_skill_ids,
+                        teacher_forcing_probability=forcing_probability,
                     )
                     return self.policy.actor.select_action_means(
                         all_action_means, selection.active_skill_ids
                     )
 
             def reset(inner_self, dones: torch.Tensor | None = None) -> None:
-                controller.reset(dones, teacher_forcing_probability=0.0)
+                controller.reset(
+                    dones,
+                    teacher_forcing_probability=forcing_probability,
+                )
 
             @property
             def active_skill_ids(inner_self) -> torch.Tensor:

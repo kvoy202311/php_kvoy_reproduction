@@ -370,8 +370,10 @@ tensorboard --logdir logs/rsl_rl/elf3_multi_skill_distillation
 ### 播放视觉 Student
 
 固定技能模式用于分别检查三个技能。下面以 climb、动作 0 为例；可将 `--skill` 改成 `locomotion` 或
-`down_roll`。固定 climb/down-roll 中的 `--vx/--vy` 只是仍然提供给 Student 的遥控输入；Student 仍需自主
-识别当前技能，技能一旦经连续帧确认启动就不会被中途命令打断。固定 locomotion 才直接响应速度请求。
+`down_roll`。该模式同时固定环境 oracle 技能和 Student 动作头，并通过训练使用的 Option Controller 从第一帧
+执行对应动作头，因此与 atomic 的路由 teacher forcing 对齐；它只验收独立动作头，不代表部署时向 Student
+输入技能 ID。固定 climb/down-roll 中的 `--vx/--vy` 仍作为 Actor 可见的遥控输入，用于验证 motion lock 内
+动作不被命令打断；固定 locomotion 才直接响应速度请求。
 `--checkpoint_path` 必须指向视觉 Student checkpoint，而不是三个
 专家的 checkpoint。
 
@@ -395,8 +397,9 @@ python scripts/rsl_rl/play_distillation.py \
   --device cuda:0
 ```
 
-组合模式从攀爬开始，由实际平台长度和视觉输入决定在台面继续 locomotion，还是在接近远端时进入
-down-roll。组合模式不能同时指定 `--skill`：
+组合模式不固定 Student 动作头，使用与部署相同的自主 Option Controller；由实际平台长度和视觉输入决定何时
+从 locomotion 切换至 climb、在台面继续 locomotion，或在接近远端时进入 down-roll。它用于验收
+transition/full checkpoint，不能同时指定 `--skill`，也不应使用 atomic checkpoint 判断自主切换能力：
 
 ```bash
 cd ~/Desktop/php_kvoy_reproduction

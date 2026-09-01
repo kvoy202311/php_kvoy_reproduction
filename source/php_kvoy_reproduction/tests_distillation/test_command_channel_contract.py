@@ -80,3 +80,57 @@ def test_playback_configures_checkpoint_stage_before_scene_creation() -> None:
     path = _REPOSITORY / "scripts" / "rsl_rl" / "play_distillation.py"
     source = path.read_text(encoding="utf-8")
     assert source.index("configure_training_stage(env_cfg") < source.index("gym.make(args_cli.task")
+
+
+def test_fixed_skill_playback_routes_environment_and_student_to_the_same_head() -> None:
+    path = _REPOSITORY / "scripts" / "rsl_rl" / "play_distillation.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    main = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    assignments = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "forced_skill_id"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 2
+    assert any(
+        isinstance(node.value, ast.Name)
+        and node.value.id == "fixed_student_skill_id"
+        for node in assignments
+    )
+    inference_calls = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_inference_policy"
+    ]
+    assert len(inference_calls) == 1
+    fixed_keywords = [
+        keyword
+        for keyword in inference_calls[0].keywords
+        if keyword.arg == "fixed_skill_id"
+    ]
+    assert len(fixed_keywords) == 1
+    assert isinstance(fixed_keywords[0].value, ast.Name)
+    assert fixed_keywords[0].value.id == "fixed_student_skill_id"
+
+
+def test_playback_rejects_composed_evaluation_of_atomic_checkpoint() -> None:
+    path = _REPOSITORY / "scripts" / "rsl_rl" / "play_distillation.py"
+    source = path.read_text(encoding="utf-8")
+    assert 'args_cli.playback_mode == "composed" and checkpoint_stage == "atomic"' in source
+    guard = source.index(
+        'args_cli.playback_mode == "composed" and checkpoint_stage == "atomic"'
+    )
+    configure = source.index("configure_training_stage(env_cfg")
+    scene = source.index("gym.make(args_cli.task")
+    assert guard < configure < scene

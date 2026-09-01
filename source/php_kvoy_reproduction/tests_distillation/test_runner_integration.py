@@ -172,6 +172,40 @@ def test_inference_uses_autonomous_selector_and_hard_action_head() -> None:
     assert inference.active_skill_ids[:, 0].tolist() == [0, 1, 1]
 
 
+def test_inference_fixed_skill_matches_atomic_teacher_forced_route_from_first_step() -> None:
+    runner = DistillationRunner(
+        _FakeEnvironment(), _train_cfg(), _FakeTeacherRouter(), device="cpu"
+    )
+    with torch.no_grad():
+        # Deliberately make the autonomous selector disagree with the fixed
+        # climb route.  Atomic-aligned inference must still execute climb from
+        # the first step, including immediately after a partial episode reset.
+        runner.policy.actor.selector.weight.zero_()
+        runner.policy.actor.selector.bias.copy_(torch.tensor([10.0, 0.0, 0.0]))
+        for skill_id, head in enumerate(runner.policy.actor.action_heads):
+            head.weight.zero_()
+            head.bias.fill_(float(skill_id + 1))
+
+    inference = runner.get_inference_policy(device="cpu", fixed_skill_id=1)
+    raw_observations, _ = runner.env.get_observations()
+    assert inference(raw_observations).eq(2.0).all()
+    assert inference.active_skill_ids.eq(1).all()
+
+    inference.reset(torch.tensor([True, False, False]))
+    assert inference(raw_observations).eq(2.0).all()
+    assert inference.active_skill_ids.eq(1).all()
+
+
+@pytest.mark.parametrize("fixed_skill_id", [True, -1, 3])
+def test_inference_rejects_invalid_fixed_skill_id(fixed_skill_id) -> None:
+    runner = DistillationRunner(
+        _FakeEnvironment(), _train_cfg(), _FakeTeacherRouter(), device="cpu"
+    )
+    expected_error = TypeError if isinstance(fixed_skill_id, bool) else ValueError
+    with pytest.raises(expected_error):
+        runner.get_inference_policy(device="cpu", fixed_skill_id=fixed_skill_id)
+
+
 def test_checkpoint_restores_absolute_iteration_and_adapted_learning_rate(tmp_path) -> None:
     train_cfg = _train_cfg()
     train_cfg["algorithm"]["schedule"] = "adaptive"

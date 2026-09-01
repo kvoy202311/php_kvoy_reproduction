@@ -26,7 +26,10 @@ parser.add_argument(
     "--playback_mode",
     choices=("fixed_skill", "composed"),
     default="fixed_skill",
-    help="Play one nominal-geometry skill or the visual climb/top-walk/down-roll composition.",
+    help=(
+        "Evaluate one training-aligned, fixed Student action head or the autonomous "
+        "visual climb/top-walk/down-roll composition."
+    ),
 )
 parser.add_argument("--skill", choices=("locomotion", "climb", "down_roll"), default=None)
 parser.add_argument("--motion_id", type=int, default=0)
@@ -157,6 +160,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             "Distillation playback requires a checkpoint with one verified "
             f"training_stage, got {checkpoint_stage!r}."
         )
+    if args_cli.playback_mode == "composed" and checkpoint_stage == "atomic":
+        raise ValueError(
+            "Atomic checkpoints contain no composed episodes and cannot be evaluated "
+            "with --playback_mode composed; first warm-start and train the transition stage."
+        )
     configure_training_stage(env_cfg, agent_cfg, checkpoint_stage)
 
     command = env_cfg.commands.multi_skill
@@ -167,8 +175,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
     command.motion_sampling_mode = "fixed"
     command.fixed_motion_id = args_cli.motion_id
     command.start_at_motion_beginning = True
+    fixed_student_skill_id = None
     if args_cli.playback_mode == "fixed_skill":
-        command.forced_skill_id = {"locomotion": 0, "climb": 1, "down_roll": 2}[args_cli.skill]
+        fixed_student_skill_id = {"locomotion": 0, "climb": 1, "down_roll": 2}[args_cli.skill]
+        command.forced_skill_id = fixed_student_skill_id
         command.composed_episode_fraction = 0.0
         # Non-nominal geometry is deliberately composed during training.  A
         # fixed-skill inspection must therefore also make every platform
@@ -232,7 +242,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             "end_effector_z="
             f"{command_term.cfg.teacher_end_effector_z_threshold * termination_scale:.4f})"
         )
-        policy = runner.get_inference_policy(device=agent_cfg.device)
+        policy = runner.get_inference_policy(
+            device=agent_cfg.device,
+            fixed_skill_id=fixed_student_skill_id,
+        )
+        execution_route = (
+            f"training-aligned fixed Student head ({args_cli.skill})"
+            if fixed_student_skill_id is not None
+            else "autonomous Option controller"
+        )
+        print(f"[INFO] Playback execution route: {execution_route}")
         observations, _ = env.get_observations()
         step_count = 0
         while simulation_app.is_running() and (
