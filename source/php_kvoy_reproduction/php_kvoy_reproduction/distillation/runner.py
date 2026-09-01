@@ -12,7 +12,6 @@ from pathlib import Path
 import statistics
 import time
 from typing import Any
-import warnings
 
 import torch
 
@@ -341,6 +340,25 @@ class DistillationRunner:
             )
         setter(iteration)
 
+    def _set_environment_student_active_skill_ids(self, skill_ids: torch.Tensor) -> None:
+        """Publish the hard action route before its physics interval."""
+
+        if self.environment_iteration_command is None:
+            return
+        raw_env = getattr(self.env, "unwrapped", None)
+        manager = getattr(raw_env, "command_manager", None)
+        if manager is None:
+            raise RuntimeError(
+                "environment_iteration_command is configured but the environment exposes no command manager"
+            )
+        command = manager.get_term(self.environment_iteration_command)
+        setter = getattr(command, "set_student_active_skill_ids", None)
+        if not callable(setter):
+            raise RuntimeError(
+                f"command {self.environment_iteration_command!r} cannot receive the active Student route"
+            )
+        setter(skill_ids)
+
     def _route_and_mask(self, groups: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         route_raw = _require_flat_group(groups, self.observation_keys.route, self.env.num_envs).to(self.device)
         rounded = route_raw.round()
@@ -455,6 +473,9 @@ class DistillationRunner:
                         option_selection.active_skill_ids,
                         option_selection.teacher_forcing_mask,
                         actor_outputs=actor_outputs,
+                    )
+                    self._set_environment_student_active_skill_ids(
+                        option_selection.active_skill_ids
                     )
                     # This is the central online-DAgger invariant: only the
                     # sampled student action advances physics.
@@ -666,12 +687,10 @@ class DistillationRunner:
         saved_policy_contract = checkpoint.get("policy_input_contract_fingerprint")
         if saved_policy_contract is None:
             if self.policy_input_contract_fingerprint is not None:
-                warnings.warn(
-                    "Checkpoint predates the Student policy-input contract fingerprint; "
-                    "camera, observation and action semantics cannot be verified. Re-save it "
-                    "only after an explicit compatibility check.",
-                    RuntimeWarning,
-                    stacklevel=2,
+                raise ValueError(
+                    "Checkpoint does not contain a Student policy-input contract fingerprint; "
+                    "camera, observation, action, command, and motion-execution semantics "
+                    "cannot be verified. Refusing to load an unverifiable checkpoint."
                 )
         elif self.policy_input_contract_fingerprint is None:
             raise ValueError(
@@ -680,8 +699,8 @@ class DistillationRunner:
             )
         elif saved_policy_contract != self.policy_input_contract_fingerprint:
             raise ValueError(
-                "Student camera, policy-observation or action semantics differ from the "
-                "checkpoint; refusing to load incompatible weights. "
+                "Student camera, policy-observation, action, command, or motion-execution "
+                "semantics differ from the checkpoint; refusing to load incompatible weights. "
                 f"saved={saved_policy_contract}, current={self.policy_input_contract_fingerprint}."
             )
         saved_option_contract = checkpoint.get("runtime_option_control_fingerprint")
@@ -811,6 +830,9 @@ class DistillationRunner:
                         selector_logits,
                         oracle_skill_ids=fixed_oracle_skill_ids,
                         teacher_forcing_probability=forcing_probability,
+                    )
+                    self._set_environment_student_active_skill_ids(
+                        selection.active_skill_ids
                     )
                     return self.policy.actor.select_action_means(
                         all_action_means, selection.active_skill_ids

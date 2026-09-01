@@ -238,8 +238,14 @@ python scripts/rsl_rl/train_distillation.py \
 必须按 `atomic -> transition -> full` 顺序训练。`atomic` 先在标准 0.66 m 平台、无深度噪声/延迟和无相机
 外参扰动的条件下学习三个完整独立技能；`transition` 保持标准平台，恢复部署侧深度噪声、延迟和相机外参
 扰动，并使用连续物理状态学习 locomotion、climb 和 down-roll 之间的切换；`full` 再加入完整平台几何
-随机化、完整组合 episode 和锁定期遥控请求扰动。atomic 的随机相位只用于学习独立动作头；transition/full
-的自主路由 episode 都从部署可复现的 locomotion 状态开始，不向 Student 泄露重置技能。两个专家边界不做人工关节插值：approach 仍是正常
+随机化、完整组合 episode 和锁定期遥控请求扰动。climb/down-roll 的原始动作文件可以保留转换器生成的静止
+前缀，但蒸馏环境会从关节/刚体姿态与速度中自动检测第一帧物理活动，并将它作为统一执行起点；物理入口使用
+该帧姿态和零速度，Teacher 从该帧立即给出启动动作。episode 内部 reset 的同一步不会推进参考，因此首个活动
+帧始终完整对应一个 Student 控制周期。atomic 只使用完整顺序起步，不使用会伪造本体历史的随机中间相位
+reset；fixed-skill 播放和 transition/full 也复用同一入口语义。Runner 会在每个物理步前向环境发布实际执行的
+Student 动作头；Option controller 尚在确认切换时，motion reference 保持首个活动帧，只有对应动作头真正取得
+控制权后参考时钟才开始推进。transition/full 的自主路由
+episode 都从部署可复现的 locomotion 状态开始，不向 Student 泄露参考 phase 或关节目标。两个专家边界不做人工关节插值：approach 仍是正常
 响应 `(vx, vy)` 的 locomotion；入口/边缘
 settle、完整 climb/down-roll 和动作结束后的短暂安全释放属于 motion control lock。锁定期间内部 locomotion
 Teacher 可以使用零速度完成稳定，climb/down-roll Teacher 不接收速度命令；Student 仍始终观察遥控器最新
@@ -340,7 +346,10 @@ python scripts/rsl_rl/train_distillation.py \
 初始化 transition、transition checkpoint 初始化 full。`--resume` 仅用于同一阶段、同一环境语义的中断续训。
 checkpoint 会保存训练阶段、头部相机、FOV、深度裁剪、Actor 观测语义与动作契约指纹，训练和播放遇到不一致
 时会拒绝加载。当前命令语义是“实时遥控请求始终可见、motion lock 内忽略控制作用、释放后恢复最新请求”；
-采用旧命令语义或旧 checkpoint 格式的 run 不可作为本流程起点，必须从 `atomic` 重新训练。尤其是
+当前动作入口语义是“自动跳过不可观测静止前缀、从首个活动参考帧以零速度物理边界启动，并由实际 Student
+动作头同步参考时钟”。采用旧命令语义、
+旧动作入口语义或旧 checkpoint 格式的 run 不可作为本流程起点，必须从 `atomic` 重新训练；旧模型会因
+policy-input/动作语义指纹不匹配而被明确拒绝，不能 `--resume` 或 warm-start。尤其是
 `php_multi_teacher_student_v3` 单动作头 checkpoint 与当前分层硬路由网络结构不兼容。
 
 日志写入：

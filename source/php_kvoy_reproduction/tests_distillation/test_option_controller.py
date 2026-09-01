@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from php_kvoy_reproduction.distillation.motion_boundary import (
+    motion_reference_advance_mask,
+)
 from php_kvoy_reproduction.distillation.option_controller import (
     OptionStateController,
     linear_teacher_forcing_probability,
@@ -31,6 +34,34 @@ def test_motion_activation_requires_confident_consecutive_frames() -> None:
     second = controller.select(climb)
     assert second.active_skill_ids.item() == 1
     assert second.switched.item()
+
+
+def test_motion_clock_waits_for_the_confirmed_action_head() -> None:
+    controller = OptionStateController(
+        1,
+        ("locomotion", "climb", "down_roll"),
+        activation_probability=0.6,
+        release_probability=0.55,
+        activation_confirmation_steps=3,
+        release_confirmation_steps=2,
+        post_release_cooldown_steps=2,
+        minimum_skill_duration_steps={"climb": 2, "down_roll": 2},
+        maximum_skill_duration_steps={"climb": 6, "down_roll": 6},
+    )
+    climb = torch.tensor([[0.0, 3.0, 0.0]])
+    advance_decisions = []
+    for _ in range(3):
+        selection = controller.select(climb)
+        advance = motion_reference_advance_mask(
+            torch.tensor([True]),
+            torch.tensor([False]),
+            torch.tensor([1], dtype=torch.long),
+            selection.active_skill_ids[:, 0],
+            torch.tensor([False]),
+        )
+        advance_decisions.append(bool(advance.item()))
+
+    assert advance_decisions == [False, False, True]
 
 
 def test_committed_motion_cannot_switch_directly_to_another_motion() -> None:

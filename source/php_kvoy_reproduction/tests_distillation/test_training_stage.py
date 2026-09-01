@@ -17,6 +17,7 @@ def _configs():
             multi_skill=SimpleNamespace(
                 platform_size=(0.51, 0.80, 0.66),
                 composed_episode_fraction=0.5,
+                atomic_motion_start_at_beginning_fraction=0.5,
                 transition_settle_time_range_s=(0.2, 0.5),
             )
         ),
@@ -108,6 +109,12 @@ def test_atomic_stage_disables_visual_augmentation() -> None:
     assert env.observations.policy.depth.params["delay_range_s"] == (0.0, 0.0)
     assert env.events.camera_extrinsics.params["translation_range_m"] == (0.0, 0.0)
     assert env.events.camera_extrinsics.params["rotation_range_rad"] == (0.0, 0.0)
+
+
+def test_atomic_stage_uses_only_complete_observable_motion_starts() -> None:
+    env, agent = _configs()
+    configure_training_stage(env, agent, "atomic")
+    assert env.commands.multi_skill.atomic_motion_start_at_beginning_fraction == 1.0
 
 
 def test_full_stage_preserves_default_geometry_and_augmentation() -> None:

@@ -72,6 +72,10 @@ def configure_training_stage(env_cfg, agent_cfg, stage: TrainingStage) -> None:
 
     if stage == "atomic":
         command.composed_episode_fraction = 0.0
+        # A phase-free feed-forward Student cannot reconstruct real history
+        # from a random middle-frame reset.  Every atomic motion therefore
+        # starts at its automatically detected physical execution boundary.
+        command.atomic_motion_start_at_beginning_fraction = 1.0
         # Atomic motion clips terminate before returning to locomotion.  Varying
         # the still-visible joystick request is therefore a safe way to teach
         # climb/down-roll command invariance from the first stage.

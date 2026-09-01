@@ -22,6 +22,10 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from php_kvoy_reproduction.distillation.motion_boundary import (
+    detect_motion_execution_starts,
+    motion_reference_advance_mask,
+)
 from php_kvoy_reproduction.distillation.skill_routing import (
     CLIMB_SKILL_ID,
     DOWN_ROLL_SKILL_ID,
@@ -93,6 +97,15 @@ class _CombinedMotionDataset:
             ),
             dim=0,
         )
+        self.motion_execution_start_idx = detect_motion_execution_starts(
+            {field: getattr(self, field) for field in self._FRAME_FIELDS},
+            self.motion_start_idx,
+            self.motion_end_idx,
+        )
+        if torch.any(self.motion_execution_start_idx >= self.motion_random_start_end_idx):
+            raise ValueError(
+                "a motion execution start reaches its excluded terminal reset range"
+            )
         self.climb_motion_ids = torch.arange(self.climb_motion_count, device=self.joint_pos.device)
         self.down_roll_motion_ids = torch.arange(
             self.climb_motion_count,
@@ -316,6 +329,13 @@ class MultiSkillCommand(CommandTerm):
             raise ValueError("routed motion joint order does not exactly match the articulation")
         if self.motion.body_names is not None and self.motion.body_names != tuple(self.robot.body_names):
             raise ValueError("routed motion body order does not exactly match the articulation")
+        execution_offsets = self.motion.motion_execution_start_idx - self.motion.motion_start_idx
+        climb_offsets = execution_offsets[self.motion.climb_motion_ids].tolist()
+        down_roll_offsets = execution_offsets[self.motion.down_roll_motion_ids].tolist()
+        print(
+            "[INFO] Distillation motion execution offsets: "
+            f"climb={climb_offsets}, down_roll={down_roll_offsets}"
+        )
 
         # Episode families are assigned exactly once and remain balanced even
         # though locomotion episodes are much longer than atomic motion clips.
@@ -323,6 +343,15 @@ class MultiSkillCommand(CommandTerm):
             (self.num_envs,), -1, device=self.device, dtype=torch.long
         )
         self.skill_ids = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        # The runner publishes the hard Student head that owns each physical
+        # action interval.  Keeping it separate from the privileged reference
+        # route lets the reference clock wait through Option confirmation.
+        self.student_active_skill_ids = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.student_route_published = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self.motion_ids = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.time_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.motion_finished = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -415,6 +444,8 @@ class MultiSkillCommand(CommandTerm):
             "episode_completed_climb",
             "episode_reached_top_locomotion",
             "episode_started_down_roll",
+            "student_route_matches_reference",
+            "motion_reference_waiting_for_student",
         ):
             self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
 
@@ -464,6 +495,22 @@ class MultiSkillCommand(CommandTerm):
         if isinstance(skill, bool) or not isinstance(skill, int) or not 0 <= skill < NUM_SKILLS:
             raise ValueError(f"skill must identify one of {self.cfg.skill_names}")
         return self.skill_ids == skill
+
+    def set_student_active_skill_ids(self, skill_ids: torch.Tensor) -> None:
+        """Publish the Student action head applied during the next physics step."""
+
+        if not isinstance(skill_ids, torch.Tensor):
+            raise TypeError("student active skill IDs must be a torch.Tensor")
+        values = skill_ids.reshape(-1).to(device=self.device)
+        if values.shape != (self.num_envs,):
+            raise ValueError("student active skill IDs must contain one value per environment")
+        if values.dtype == torch.bool or values.is_floating_point() or values.is_complex():
+            raise TypeError("student active skill IDs must use an integer dtype")
+        values = values.to(dtype=torch.long)
+        if torch.any((values < 0) | (values >= NUM_SKILLS)):
+            raise ValueError(f"student active skill IDs must lie in [0, {NUM_SKILLS})")
+        self.student_active_skill_ids[:] = values
+        self.student_route_published[:] = True
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         return super().reset(env_ids)
@@ -551,6 +598,10 @@ class MultiSkillCommand(CommandTerm):
                     self._begin_climb_approach(composed_ids)
                 else:
                     self._begin_down_roll_settle(composed_ids)
+        # A reset invalidates the route published for the preceding episode.
+        # The runner must publish the new hard route before the next action.
+        self.student_active_skill_ids[ids] = self.skill_ids[ids]
+        self.student_route_published[ids] = False
         self._refresh_relative_reference()
         motion_ids = ids[self.motion_mask[ids]]
         if motion_ids.numel() > 0:
@@ -609,12 +660,15 @@ class MultiSkillCommand(CommandTerm):
         return self.motion.climb_motion_ids if skill_id == CLIMB_SKILL_ID else self.motion.down_roll_motion_ids
 
     def _reset_atomic_motion(self, env_ids: torch.Tensor, skill_id: int) -> None:
-        """Mix full-clip starts with uniform phase coverage for atomic skills."""
+        """Start an atomic skill at a deployment-observable execution boundary."""
 
         self.episode_reached_motion[env_ids] = True
         if skill_id == DOWN_ROLL_SKILL_ID:
             self.episode_started_down_roll[env_ids] = True
-        if self.cfg.start_at_motion_beginning:
+        if (
+            self.cfg.start_at_motion_beginning
+            or self.cfg.atomic_motion_start_at_beginning_fraction == 1.0
+        ):
             self._reset_motion_skill(env_ids, skill_id, start_at_beginning=True)
         else:
             full_start = torch.rand(env_ids.numel(), device=self.device) < (
@@ -785,7 +839,7 @@ class MultiSkillCommand(CommandTerm):
         else:
             raise ValueError("motion_sampling_mode must be 'random', 'fixed', or 'round_robin'")
 
-        starts = self.motion.motion_start_idx[motion_ids]
+        starts = self.motion.motion_execution_start_idx[motion_ids]
         if start_at_beginning is None:
             start_at_beginning = self.cfg.start_at_motion_beginning
         if start_at_beginning:
@@ -814,6 +868,16 @@ class MultiSkillCommand(CommandTerm):
                 root_pos[:, 2] += self.platform_sizes[env_ids, 2] - self.cfg.platform_height
             joint_pos = self.motion.joint_pos[time_steps]
             joint_vel = self.motion.joint_vel[time_steps]
+            if start_at_beginning:
+                # The first active reference frame carries the velocity target
+                # that tells the frozen Teacher to initiate the skill.  The
+                # physical Student boundary must nevertheless be stationary,
+                # exactly as it is after a real approach/settle transition.
+                # Writing source velocities here would leak phase through the
+                # reset state and reintroduce an atomic/composed mismatch.
+                root_lin_vel = torch.zeros_like(root_lin_vel)
+                root_ang_vel = torch.zeros_like(root_ang_vel)
+                joint_vel = torch.zeros_like(joint_vel)
             limits = self.robot.data.soft_joint_pos_limits[env_ids]
             joint_pos = torch.clamp(joint_pos, limits[..., 0], limits[..., 1])
             self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
@@ -1298,6 +1362,11 @@ class MultiSkillCommand(CommandTerm):
         self.metrics["episode_completed_climb"][:] = self.episode_completed_climb
         self.metrics["episode_reached_top_locomotion"][:] = self.episode_reached_top_locomotion
         self.metrics["episode_started_down_roll"][:] = self.episode_started_down_roll
+        route_matches = self.student_active_skill_ids == self.skill_ids
+        self.metrics["student_route_matches_reference"][:] = route_matches
+        self.metrics["motion_reference_waiting_for_student"][:] = (
+            self.motion_mask & ~route_matches
+        )
         top_ids = torch.where(
             self.locomotion_mask & (self.last_motion_skill_ids == CLIMB_SKILL_ID)
         )[0]
@@ -1330,7 +1399,25 @@ class MultiSkillCommand(CommandTerm):
         # Capture the motion set before any stage transition.  A freshly
         # activated motion must expose its first frame for one full action
         # interval rather than being advanced immediately in this update.
-        motion_ids_to_advance = torch.where(self.motion_mask & ~self.motion_finished)[0]
+        reset_this_step = self._env.termination_manager.dones.to(
+            device=self.device, dtype=torch.bool
+        )
+        if reset_this_step.shape != (self.num_envs,):
+            raise RuntimeError("termination mask must contain one value per environment")
+        missing_route = ~reset_this_step & ~self.student_route_published
+        if torch.any(missing_route):
+            raise RuntimeError(
+                "the active Student route must be published before every physics step"
+            )
+        advance_mask = motion_reference_advance_mask(
+            self.motion_mask,
+            self.motion_finished,
+            self.skill_ids,
+            self.student_active_skill_ids,
+            reset_this_step,
+        )
+        motion_ids_to_advance = torch.where(advance_mask)[0]
+        self.student_route_published[~reset_this_step] = False
 
         approach_ids = torch.where(
             self.composed_episode & (self.transition_stage == _APPROACH_STAGE)
@@ -1691,9 +1778,10 @@ class MultiSkillCommandCfg(CommandTermCfg):
     motion_sampling_mode: Literal["random", "fixed", "round_robin"] = "random"
     fixed_motion_id: int = 0
     start_at_motion_beginning: bool = False
-    # Within direct atomic episodes, explicitly train complete execution from
-    # frame zero while retaining random-phase recovery coverage.
-    atomic_motion_start_at_beginning_fraction: float = 0.5
+    # Direct atomic episodes use complete, physically continuous execution.
+    # Random middle-phase resets synthesize an invalid history for a
+    # phase-free Student and are reserved for explicit recovery experiments.
+    atomic_motion_start_at_beginning_fraction: float = 1.0
     motion_world_command: tuple[float, float] = (0.6, 0.0)
 
     platform_size: tuple[float, float, float] = (0.51, 0.80, 0.66)

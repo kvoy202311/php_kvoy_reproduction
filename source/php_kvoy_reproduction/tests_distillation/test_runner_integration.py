@@ -74,9 +74,15 @@ class _FakeTeacherRouter:
 class _FakeIterationCommand:
     def __init__(self) -> None:
         self.iterations: list[int] = []
+        self.active_skill_updates: list[torch.Tensor] = []
 
     def set_training_iteration(self, iteration: int) -> None:
         self.iterations.append(iteration)
+
+    def set_student_active_skill_ids(self, skill_ids: torch.Tensor) -> None:
+        values = skill_ids.reshape(-1).detach().clone()
+        assert values.shape == (3,)
+        self.active_skill_updates.append(values)
 
 
 class _FakeCommandManager:
@@ -94,6 +100,10 @@ class _FakeEnvironmentWithIteration(_FakeEnvironment):
         self.iteration_command = _FakeIterationCommand()
         self.command_manager = _FakeCommandManager(self.iteration_command)
         self.unwrapped = self
+
+    def step(self, actions: torch.Tensor):
+        assert len(self.iteration_command.active_skill_updates) == self.step_count + 1
+        return super().step(actions)
 
 
 def _train_cfg() -> dict:
@@ -153,6 +163,20 @@ def test_runner_advances_fake_environment_only_with_student_actions() -> None:
     assert all(not torch.equal(actions, torch.full_like(actions, 5.0)) for actions in env.stepped_actions)
 
 
+def test_runner_publishes_applied_student_head_before_every_physics_step() -> None:
+    torch.manual_seed(3)
+    env = _FakeEnvironmentWithIteration()
+    cfg = _train_cfg()
+    cfg["environment_iteration_command"] = "multi_skill"
+    runner = DistillationRunner(env, cfg, _FakeTeacherRouter(), device="cpu")
+
+    runner.learn(1)
+
+    assert len(env.iteration_command.active_skill_updates) == 2
+    assert env.iteration_command.active_skill_updates[0].tolist() == [0, 1, 2]
+    assert env.iteration_command.active_skill_updates[1].tolist() == [0, 1, 2]
+
+
 def test_inference_uses_autonomous_selector_and_hard_action_head() -> None:
     runner = DistillationRunner(
         _FakeEnvironment(), _train_cfg(), _FakeTeacherRouter(), device="cpu"
@@ -194,6 +218,22 @@ def test_inference_fixed_skill_matches_atomic_teacher_forced_route_from_first_st
     inference.reset(torch.tensor([True, False, False]))
     assert inference(raw_observations).eq(2.0).all()
     assert inference.active_skill_ids.eq(1).all()
+
+
+def test_inference_publishes_the_same_hard_route_that_selects_actions() -> None:
+    env = _FakeEnvironmentWithIteration()
+    cfg = _train_cfg()
+    cfg["environment_iteration_command"] = "multi_skill"
+    runner = DistillationRunner(env, cfg, _FakeTeacherRouter(), device="cpu")
+    with torch.no_grad():
+        runner.policy.actor.selector.weight.zero_()
+        runner.policy.actor.selector.bias.copy_(torch.tensor([0.0, 10.0, 0.0]))
+    inference = runner.get_inference_policy(device="cpu")
+    raw_observations, _ = env.get_observations()
+
+    inference(raw_observations)
+
+    assert env.iteration_command.active_skill_updates[-1].tolist() == [1, 1, 1]
 
 
 @pytest.mark.parametrize("fixed_skill_id", [True, -1, 3])
@@ -420,7 +460,11 @@ def test_checkpoint_rejects_changed_deployment_option_semantics(tmp_path) -> Non
         target.load(checkpoint, load_optimizer=False)
 
 
-def test_legacy_checkpoint_without_policy_input_contract_warns(tmp_path) -> None:
+@pytest.mark.parametrize("remove_fingerprint_key", [False, True])
+def test_checkpoint_without_policy_input_contract_is_rejected(
+    tmp_path,
+    remove_fingerprint_key: bool,
+) -> None:
     source = DistillationRunner(
         _FakeEnvironment(),
         _train_cfg(),
@@ -431,7 +475,10 @@ def test_legacy_checkpoint_without_policy_input_contract_warns(tmp_path) -> None
     checkpoint = tmp_path / "legacy.pt"
     source.save(checkpoint)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    payload.pop("policy_input_contract_fingerprint")
+    if remove_fingerprint_key:
+        payload.pop("policy_input_contract_fingerprint")
+    else:
+        payload["policy_input_contract_fingerprint"] = None
     torch.save(payload, checkpoint)
 
     target = DistillationRunner(
@@ -441,7 +488,7 @@ def test_legacy_checkpoint_without_policy_input_contract_warns(tmp_path) -> None
         device="cpu",
         policy_input_contract={"camera_parent": "head"},
     )
-    with pytest.warns(RuntimeWarning, match="predates"):
+    with pytest.raises(ValueError, match="does not contain a Student policy-input contract"):
         target.load(checkpoint, load_optimizer=False)
 
 

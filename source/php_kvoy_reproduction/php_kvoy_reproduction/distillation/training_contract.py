@@ -160,6 +160,9 @@ def student_policy_input_contract(env_cfg: Any, *, task: str) -> dict[str, Any]:
         "actor_command_semantics": (
             "bounded_live_requested_world_velocity_body_frame_motion_lock_v4"
         ),
+        "motion_execution_semantics": (
+            "auto_static_prefix_trim_stationary_boundary_reset_safe_student_head_clock_v2"
+        ),
         "control_dt": sim_dt * decimation,
         "depth_camera": _config_dict(camera, name="env_cfg.scene.depth_camera"),
         "policy_observations": _strip_policy_augmentation_fields(

@@ -134,3 +134,59 @@ def test_playback_rejects_composed_evaluation_of_atomic_checkpoint() -> None:
     configure = source.index("configure_training_stage(env_cfg")
     scene = source.index("gym.make(args_cli.task")
     assert guard < configure < scene
+
+
+def test_motion_reset_uses_detected_execution_start_and_stationary_boundary() -> None:
+    path = _PACKAGE / "commands.py"
+    reset = _function(path, "_reset_motion_skill")
+    attributes = _attribute_names(reset)
+    assert "motion_execution_start_idx" in attributes
+    stationary_branches = [
+        node
+        for node in ast.walk(reset)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "start_at_beginning"
+    ]
+    zeroed_targets = {
+        target.id
+        for branch in stationary_branches
+        for assignment in branch.body
+        if isinstance(assignment, ast.Assign)
+        and isinstance(assignment.value, ast.Call)
+        and isinstance(assignment.value.func, ast.Attribute)
+        and assignment.value.func.attr == "zeros_like"
+        for target in assignment.targets
+        if isinstance(target, ast.Name)
+    }
+    assert zeroed_targets == {"root_lin_vel", "root_ang_vel", "joint_vel"}
+
+
+def test_fixed_playback_requests_the_same_detected_motion_start() -> None:
+    path = _REPOSITORY / "scripts" / "rsl_rl" / "play_distillation.py"
+    source = path.read_text(encoding="utf-8")
+    start = source.index("command.start_at_motion_beginning = True")
+    scene = source.index("gym.make(args_cli.task")
+    assert start < scene
+
+
+def test_motion_clock_uses_applied_student_route_and_termination_mask() -> None:
+    path = _PACKAGE / "commands.py"
+    update = _function(path, "_update_command")
+    attributes = _attribute_names(update)
+    assert "student_active_skill_ids" in attributes
+    assert "termination_manager" in attributes
+    calls = {
+        node.func.id
+        for node in ast.walk(update)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "motion_reference_advance_mask" in calls
+
+
+def test_command_accepts_one_explicit_student_route_per_environment() -> None:
+    setter = _function(_PACKAGE / "commands.py", "set_student_active_skill_ids")
+    attributes = _attribute_names(setter)
+    assert "student_active_skill_ids" in attributes
+    assert "student_route_published" in attributes
+    assert "num_envs" in attributes
